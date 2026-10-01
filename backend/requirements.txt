@@ -4,3 +4,6 @@ playwright
 groq
 python-dotenv
 asyncpg
+httpx
+pytest
+pytest-asyncio

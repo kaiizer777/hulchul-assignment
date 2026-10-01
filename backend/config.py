@@ -30,4 +30,9 @@ class Settings:
     DB_POOL_MAX_INACTIVE_LIFETIME: float = float(os.getenv("DB_POOL_MAX_INACTIVE_LIFETIME", "180.0"))
 
 
+    # Agent & LLM settings
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    MAX_AGENT_ITERATIONS: int = int(os.getenv("MAX_AGENT_ITERATIONS", "30"))
+    DEFAULT_APPROVAL_THRESHOLD: float = float(os.getenv("DEFAULT_APPROVAL_THRESHOLD", "50000.0"))
+
 settings = Settings()

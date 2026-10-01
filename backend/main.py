@@ -106,7 +106,7 @@ async def root() -> RootResponse:
     return RootResponse(
         message="Hulchul Backend API is running",
         version="0.2.0",
-        phase="Phase 2.1, 2.2 & 2.3 Complete",
+        phase="Phase 2.1, 2.2, 2.3 & 2.4 Complete",
     )
 
 
@@ -136,6 +136,19 @@ async def browser_health_check() -> BrowserHealthResponse:
     )
 
 
+@app.get("/health/redis")
+async def redis_health_check() -> Dict[str, Any]:
+    """Diagnostic probe verifying connectivity to Upstash Redis."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    is_ok = await redis.ping()
+    return {
+        "connected": is_ok,
+        "configured": redis.is_configured,
+        "status": "healthy" if is_ok else "degraded",
+    }
+
+
 @app.get("/tools", response_model=ToolsResponse)
 async def list_tools() -> ToolsResponse:
     """List available LLM agent tool definitions with parameters and schemas."""
@@ -158,4 +171,179 @@ async def check_exists_endpoint(payload: CheckExistsRequest) -> CheckExistsRespo
         record=res.get("record"),
         error=res.get("error"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.4 Agent Execution & Orchestration Schemas & Endpoints
+# ---------------------------------------------------------------------------
+
+class AgentRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    goal: str
+    run_id: Optional[str] = None
+
+
+class AgentRunResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    status: str
+    iterations: int
+    goal: str
+    threshold: float
+    summary: Optional[str] = None
+
+
+class PauseResumeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    paused: bool
+    message: str
+
+
+class ApprovalDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decision: str
+
+
+class ApprovalDecisionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    decision: str
+    recorded: bool
+
+
+class AgentRunDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    goal: str
+    status: str
+    created_at: str
+    steps: list[Dict[str, Any]]
+
+
+class AgentSessionStateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    state: Optional[Dict[str, Any]] = None
+
+
+@app.post("/agent/run", response_model=AgentRunResponse)
+async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
+    """Execute the ReAct agent loop for a given goal."""
+    from backend.browser import get_browser_session
+    from backend.tools import PlaywrightTools
+    from backend.agent import ReActAgent
+
+    async with get_browser_session() as session:
+        tools = PlaywrightTools(page=session.page, run_id=payload.run_id)
+        agent = ReActAgent(run_id=payload.run_id, tools=tools)
+        result = await agent.run(goal=payload.goal)
+
+    return AgentRunResponse(
+        run_id=result["run_id"],
+        status=result["status"],
+        iterations=result["iterations"],
+        goal=result["goal"],
+        threshold=result["threshold"],
+        summary=result["summary"],
+    )
+
+
+@app.get("/agent/runs/{run_id}", response_model=AgentRunDetailResponse)
+async def get_agent_run(run_id: str) -> AgentRunDetailResponse:
+    """Fetch run details and step history from Neon database."""
+    import uuid
+    from backend.db import get_db_pool
+    pool = await get_db_pool()
+    run_uuid = uuid.UUID(run_id)
+
+    async with pool.acquire() as conn:
+        run_row = await conn.fetchrow(
+            "SELECT run_id, goal, status, created_at FROM agent_runs WHERE run_id = $1;",
+            run_uuid,
+        )
+        if not run_row:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+
+        step_rows = await conn.fetch(
+            """
+            SELECT step_id, action, result, screenshot_b64, timestamp
+            FROM agent_steps
+            WHERE run_id = $1
+            ORDER BY timestamp ASC;
+            """,
+            run_uuid,
+        )
+
+        steps = [
+            {
+                "step_id": str(r["step_id"]),
+                "action": r["action"],
+                "result": r["result"],
+                "has_screenshot": bool(r["screenshot_b64"]),
+                "timestamp": r["timestamp"].isoformat(),
+            }
+            for r in step_rows
+        ]
+
+        return AgentRunDetailResponse(
+            run_id=str(run_row["run_id"]),
+            goal=run_row["goal"],
+            status=run_row["status"],
+            created_at=run_row["created_at"].isoformat(),
+            steps=steps,
+        )
+
+
+@app.post("/agent/runs/{run_id}/pause", response_model=PauseResumeResponse)
+async def pause_agent_run(run_id: str) -> PauseResumeResponse:
+    """Set pause flag in Redis for an active agent run."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    await redis.set_pause_flag(run_id, paused=True)
+    return PauseResumeResponse(
+        run_id=run_id,
+        paused=True,
+        message="Agent run pause flag set to paused",
+    )
+
+
+@app.post("/agent/runs/{run_id}/resume", response_model=PauseResumeResponse)
+async def resume_agent_run(run_id: str) -> PauseResumeResponse:
+    """Clear pause flag in Redis for an active agent run."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    await redis.set_pause_flag(run_id, paused=False)
+    return PauseResumeResponse(
+        run_id=run_id,
+        paused=False,
+        message="Agent run resumed",
+    )
+
+
+@app.post("/agent/runs/{run_id}/approval", response_model=ApprovalDecisionResponse)
+async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
+    """Record human approval decision ('approved' or 'rejected') in Redis."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    ok = await redis.set_approval_decision(run_id, payload.decision)
+    return ApprovalDecisionResponse(
+        run_id=run_id,
+        decision=payload.decision,
+        recorded=ok,
+    )
+
+
+@app.get("/agent/runs/{run_id}/state", response_model=AgentSessionStateResponse)
+async def get_agent_state(run_id: str) -> AgentSessionStateResponse:
+    """Fetch active session state from Redis."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    state = await redis.get_session_state(run_id)
+    return AgentSessionStateResponse(
+        run_id=run_id,
+        state=state,
+    )
+
 

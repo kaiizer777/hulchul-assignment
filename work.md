@@ -65,7 +65,7 @@ Control UI (SSE live log, Pause, Approval modal)
   - `take_screenshot()` — capture buffer → store as base64 in Neon `agent_steps` (only on failure or decision point)
   - `check_exists(entity_type, identifier)` — idempotency check before any create
 
-- [ ] **2.4** Build ReAct loop:
+- [x] **2.4** Build ReAct loop:
   - Build a system prompt that defines the agent's role, the available tools, the approval threshold (extracted from the goal), and the rule that it must call `check_exists` before any create action
   - On each iteration: call `read_page()` to get the current accessibility tree snapshot, then send `[system prompt + goal + full conversation history + current snapshot]` to Groq (`openai/gpt-oss-120b`) with tool definitions
   - Parse the tool call from the response — if no tool call is returned and the model says `done`, exit the loop
@@ -87,9 +87,9 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ### Tests 2
 - [x] Unit test: each tool function (navigate, fill, click, check_exists) returns correct shape
-- [ ] Unit test: ReAct loop parses Groq tool call response correctly
+- [x] Unit test: ReAct loop parses Groq tool call response correctly
 - [x] Unit test: idempotency check returns `exists: true` for duplicate, `exists: false` for new
-- [ ] Integration test: agent completes a 3-step mock task end to end
+- [x] Integration test: agent completes a 3-step mock task end to end
 
 
 ---
