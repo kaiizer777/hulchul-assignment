@@ -665,7 +665,18 @@ class ReActAgent:
                             elem_text = (await elem.inner_text() or "").lower()
                             aria_label = (await elem.get_attribute("aria-label") or "").lower()
                             combined_text = f"{elem_type} {elem_text} {aria_label}"
-                            if elem_type == "submit" or any(k in combined_text for k in ("submit", "create invoice", "save invoice")):
+                            is_implicit_submit = await elem.evaluate(
+                                """el => el.tagName && el.tagName.toLowerCase() === "button" &&
+                                el.form !== null &&
+                                !["button", "reset"].includes(
+                                    (el.getAttribute("type") || "submit").toLowerCase()
+                                )"""
+                            )
+                            if (
+                                elem_type == "submit"
+                                or is_implicit_submit
+                                or any(k in combined_text for k in ("submit", "create invoice", "save invoice", "save"))
+                            ):
                                 is_submit_action = True
                     except Exception as elem_err:
                         logger.debug(f"Could not inspect element attributes for '{selector}': {elem_err}")

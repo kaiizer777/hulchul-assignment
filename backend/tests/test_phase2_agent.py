@@ -136,6 +136,18 @@ class TestPhase24Unit(unittest.TestCase):
         self.assertEqual(parse_amount(""), 0.0)
         self.assertEqual(parse_amount("invalid"), 0.0)
 
+    def test_06_pause_unconfigured_redis_returns_503(self):
+        """Verify that pausing or resuming when Redis is unconfigured returns 503."""
+        from fastapi.testclient import TestClient
+        client = TestClient(app)
+        mock_redis = MagicMock()
+        mock_redis.set_pause_flag = AsyncMock(return_value=False)
+        with patch("backend.redis_client.get_redis_client", return_value=mock_redis):
+            res_pause = client.post("/agent/runs/any-run-id/pause")
+            self.assertEqual(res_pause.status_code, 503)
+            res_resume = client.post("/agent/runs/any-run-id/resume")
+            self.assertEqual(res_resume.status_code, 503)
+
 
 @unittest.skipUnless(
     bool(settings.DATABASE_URL and settings.UPSTASH_REDIS_REST_URL),
