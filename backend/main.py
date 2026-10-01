@@ -1,4 +1,5 @@
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
 from fastapi import FastAPI, Depends, status
@@ -180,7 +181,7 @@ async def check_exists_endpoint(payload: CheckExistsRequest) -> CheckExistsRespo
 class AgentRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     goal: str
-    run_id: Optional[str] = None
+    run_id: Optional[uuid.UUID] = None
 
 
 class AgentRunResponse(BaseModel):
@@ -203,6 +204,7 @@ class PauseResumeResponse(BaseModel):
 class ApprovalDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decision: str
+    nonce: Optional[str] = None
 
 
 class ApprovalDecisionResponse(BaseModel):
@@ -234,9 +236,10 @@ async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
     from backend.tools import PlaywrightTools
     from backend.agent import ReActAgent
 
+    run_id_str = str(payload.run_id) if payload.run_id else None
     async with get_browser_session() as session:
-        tools = PlaywrightTools(page=session.page, run_id=payload.run_id)
-        agent = ReActAgent(run_id=payload.run_id, tools=tools)
+        tools = PlaywrightTools(page=session.page, run_id=run_id_str)
+        agent = ReActAgent(run_id=run_id_str, tools=tools)
         result = await agent.run(goal=payload.goal)
 
     return AgentRunResponse(
@@ -250,12 +253,12 @@ async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
 
 
 @app.get("/agent/runs/{run_id}", response_model=AgentRunDetailResponse)
-async def get_agent_run(run_id: str) -> AgentRunDetailResponse:
+async def get_agent_run(run_id: uuid.UUID) -> AgentRunDetailResponse:
     """Fetch run details and step history from Neon database."""
-    import uuid
+    from fastapi import HTTPException
     from backend.db import get_db_pool
     pool = await get_db_pool()
-    run_uuid = uuid.UUID(run_id)
+    run_uuid = run_id
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
@@ -324,10 +327,28 @@ async def resume_agent_run(run_id: str) -> PauseResumeResponse:
 
 @app.post("/agent/runs/{run_id}/approval", response_model=ApprovalDecisionResponse)
 async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
-    """Record human approval decision ('approved' or 'rejected') in Redis."""
+    """Record human approval decision ('approved' or 'rejected') in Redis with active request and nonce check."""
+    from fastapi import HTTPException
     from backend.redis_client import get_redis_client
     redis = get_redis_client()
-    ok = await redis.set_approval_decision(run_id, payload.decision)
+
+    # Require an active pending approval request
+    pending = await redis.get_approval_pending(run_id)
+    if not pending or pending.get("status") != "awaiting_approval":
+        raise HTTPException(
+            status_code=400,
+            detail=f"No active pending approval request for run '{run_id}'",
+        )
+
+    # Validate per-request nonce if provided or expected
+    pending_nonce = pending.get("nonce")
+    if payload.nonce is not None and pending_nonce and payload.nonce != pending_nonce:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid approval nonce for the current pending request",
+        )
+
+    ok = await redis.set_approval_decision(run_id, payload.decision, nonce=pending_nonce)
     return ApprovalDecisionResponse(
         run_id=run_id,
         decision=payload.decision,

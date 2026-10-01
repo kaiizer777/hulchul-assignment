@@ -26,6 +26,7 @@ class UpstashRedisClient:
         token: Optional[str] = None,
         http_client: Optional[httpx.AsyncClient] = None,
     ):
+        """Initialize the Upstash Redis client with credentials and HTTP client."""
         self.url = (url or settings.UPSTASH_REDIS_REST_URL).rstrip("/")
         self.token = token or settings.UPSTASH_REDIS_REST_TOKEN
         self._external_client = http_client is not None
@@ -34,9 +35,11 @@ class UpstashRedisClient:
 
     @property
     def is_configured(self) -> bool:
+        """Check if Upstash Redis credentials (URL and token) are provided."""
         return bool(self.url and self.token)
 
     async def _get_client(self) -> httpx.AsyncClient:
+        """Get or initialize the underlying httpx AsyncClient tied to the active event loop."""
         if self._external_client and self._client:
             return self._client
         try:
@@ -157,22 +160,52 @@ class UpstashRedisClient:
         except Exception:
             return None
 
-    async def set_approval_decision(self, run_id: str, decision: str) -> bool:
-        """Record human decision ('approved' or 'rejected') for an awaiting run."""
+    async def set_approval_decision(self, run_id: str, decision: str, nonce: Optional[str] = None) -> bool:
+        """Record human decision ('approved' or 'rejected') for an awaiting run with optional request nonce."""
         norm_decision = decision.strip().lower()
         if norm_decision not in ("approved", "rejected"):
             raise ValueError(f"Decision must be 'approved' or 'rejected', got '{decision}'")
 
         key = f"hulchul:decision:{run_id}"
-        res = await self.execute_command("SET", key, norm_decision, "EX", 86400)
+        if nonce:
+            payload = json.dumps({"decision": norm_decision, "nonce": nonce})
+            res = await self.execute_command("SET", key, payload, "EX", 86400)
+        else:
+            res = await self.execute_command("SET", key, norm_decision, "EX", 86400)
         return res == "OK"
 
     async def get_approval_decision(self, run_id: str) -> Optional[str]:
         """Poll for human approval decision ('approved', 'rejected', or None)."""
         key = f"hulchul:decision:{run_id}"
         res = await self.execute_command("GET", key)
-        if res in ("approved", "rejected"):
-            return res
+        if not res:
+            return None
+        if isinstance(res, str):
+            try:
+                parsed = json.loads(res)
+                if isinstance(parsed, dict) and "decision" in parsed:
+                    return parsed["decision"]
+            except Exception:
+                pass
+            if res in ("approved", "rejected"):
+                return res
+        return None
+
+    async def get_approval_decision_record(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve detailed approval decision record with nonce."""
+        key = f"hulchul:decision:{run_id}"
+        res = await self.execute_command("GET", key)
+        if not res:
+            return None
+        if isinstance(res, str):
+            try:
+                parsed = json.loads(res)
+                if isinstance(parsed, dict) and "decision" in parsed:
+                    return parsed
+            except Exception:
+                pass
+            if res in ("approved", "rejected"):
+                return {"decision": res, "nonce": None}
         return None
 
     async def clear_approval(self, run_id: str) -> bool:
@@ -194,6 +227,7 @@ _global_redis_client: Optional[UpstashRedisClient] = None
 
 
 def get_redis_client() -> UpstashRedisClient:
+    """Retrieve or create the global singleton UpstashRedisClient instance."""
     global _global_redis_client
     if _global_redis_client is None:
         _global_redis_client = UpstashRedisClient()

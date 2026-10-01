@@ -16,6 +16,7 @@ from backend.agent import (
     extract_approval_threshold,
     extract_vendor_filter,
     build_system_prompt,
+    parse_amount,
     parse_tool_call,
     is_goal_done,
     ReActAgent,
@@ -24,19 +25,9 @@ from backend.agent import (
 from backend.main import app
 
 
-class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        await init_db_pool()
-        self.pool = await get_db_pool()
-        self.redis = UpstashRedisClient()
+class TestPhase24Unit(unittest.TestCase):
+    """Pure unit tests for goal extraction, system prompt construction, and tool call parsing."""
 
-    async def asyncTearDown(self):
-        await self.redis.close()
-        await close_db_pool()
-
-    # -----------------------------------------------------------------------
-    # 1. Goal Extraction Tests
-    # -----------------------------------------------------------------------
     def test_01_extract_approval_threshold(self):
         """Verify dynamic extraction of monetary threshold from goals."""
         self.assertEqual(
@@ -76,9 +67,6 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(extract_vendor_filter("Process all invoices across all vendors"))
 
-    # -----------------------------------------------------------------------
-    # 2. System Prompt & LLM Parsing Tests
-    # -----------------------------------------------------------------------
     def test_03_build_system_prompt(self):
         """Verify system prompt includes role, all tools, threshold, and idempotency rules."""
         prompt = build_system_prompt(
@@ -134,6 +122,53 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         msg_not_done = MagicMock()
         msg_not_done.content = "Now clicking on the Create Invoice button..."
         self.assertFalse(is_goal_done(msg_not_done))
+
+    def test_05_parse_amount(self):
+        """Verify parse_amount handles raw numbers, currency prefixes, and commas properly."""
+        self.assertEqual(parse_amount(50000), 50000.0)
+        self.assertEqual(parse_amount(50000.75), 50000.75)
+        self.assertEqual(parse_amount("50000"), 50000.0)
+        self.assertEqual(parse_amount("₹25,000.50"), 25000.5)
+        self.assertEqual(parse_amount("Rs. 65,000"), 65000.0)
+        self.assertEqual(parse_amount("INR 100,000"), 100000.0)
+        self.assertEqual(parse_amount("$45,500.25"), 45500.25)
+        self.assertEqual(parse_amount(None), 0.0)
+        self.assertEqual(parse_amount(""), 0.0)
+        self.assertEqual(parse_amount("invalid"), 0.0)
+
+
+@unittest.skipUnless(
+    bool(settings.DATABASE_URL and settings.UPSTASH_REDIS_REST_URL),
+    "Live Neon DB or Upstash Redis not configured",
+)
+class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
+    """Integration test suite against live Neon Postgres and Upstash Redis."""
+
+    async def asyncSetUp(self):
+        await init_db_pool()
+        self.pool = await get_db_pool()
+        self.redis = UpstashRedisClient()
+        self.created_run_ids: List[str] = []
+
+    async def asyncTearDown(self):
+        # Clean up all created test runs and steps from Neon database
+        if hasattr(self, "created_run_ids") and self.created_run_ids and self.pool:
+            try:
+                valid_uuids = []
+                for r in self.created_run_ids:
+                    try:
+                        valid_uuids.append(uuid.UUID(str(r)))
+                    except (ValueError, TypeError):
+                        pass
+                if valid_uuids:
+                    async with self.pool.acquire() as conn:
+                        await conn.execute("DELETE FROM agent_steps WHERE run_id = ANY($1::uuid[]);", valid_uuids)
+                        await conn.execute("DELETE FROM agent_runs WHERE run_id = ANY($1::uuid[]);", valid_uuids)
+            except Exception as e:
+                pass
+
+        await self.redis.close()
+        await close_db_pool()
 
     # -----------------------------------------------------------------------
     # 3. Redis Session State & Pause/Resume Tests
@@ -197,6 +232,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
     async def test_06_neon_agent_runs_and_steps_persistence(self):
         """Verify agent_runs and agent_steps persistence to Neon with foreign keys."""
         test_run_id = str(uuid.uuid4())
+        self.created_run_ids.append(test_run_id)
         mock_tools = PlaywrightTools(run_id=test_run_id, pool=self.pool)
         agent = ReActAgent(run_id=test_run_id, tools=mock_tools, pool=self.pool)
 
@@ -247,6 +283,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         Iteration 3: model says 'done' -> agent exits with completed status
         """
         test_run_id = str(uuid.uuid4())
+        self.created_run_ids.append(test_run_id)
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.run_id = test_run_id
         mock_tools.set_run_id = MagicMock()
@@ -344,6 +381,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
     async def test_08_hard_cap_iteration_limit(self):
         """Verify that reaching max iterations marks the run as stalled."""
         test_run_id = str(uuid.uuid4())
+        self.created_run_ids.append(test_run_id)
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.run_id = test_run_id
         mock_tools.set_run_id = MagicMock()
@@ -393,6 +431,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
     async def test_09_recovery_on_tool_failure(self):
         """Verify tool execution failure logs step as failed and captures screenshot."""
         test_run_id = str(uuid.uuid4())
+        self.created_run_ids.append(test_run_id)
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.run_id = test_run_id
         mock_tools.set_run_id = MagicMock()
@@ -456,6 +495,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
     async def test_10_approval_gate_resolution(self):
         """Verify that handle_approval_gate polls Redis and returns decision."""
         test_run_id = str(uuid.uuid4())
+        self.created_run_ids.append(test_run_id)
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.run_id = test_run_id
         mock_tools.set_run_id = MagicMock()
@@ -487,7 +527,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
     # 9. FastAPI Phase 2.4 Control & Status Endpoints
     # -----------------------------------------------------------------------
     async def test_11_fastapi_control_endpoints(self):
-        """Verify /health/redis, /agent/runs/{run_id}/pause, resume, and approval endpoints."""
+        """Verify /health/redis, /agent/runs/{run_id}/pause, resume, UUID validation, and approval endpoints."""
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             # 1. Redis health
@@ -497,24 +537,52 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(data_redis["connected"])
             self.assertEqual(data_redis["status"], "healthy")
 
-            # 2. Pause endpoint
+            # 2. Path parameter validation: malformed UUID must return 422
+            res_bad_uuid = await client.get("/agent/runs/not-a-valid-uuid")
+            self.assertEqual(res_bad_uuid.status_code, 422)
+
+            # 3. Pause endpoint
             test_run_id = f"test-pause-{uuid.uuid4().hex[:6]}"
             res_pause = await client.post(f"/agent/runs/{test_run_id}/pause")
             self.assertEqual(res_pause.status_code, 200)
             self.assertTrue(res_pause.json()["paused"])
 
-            # 3. Resume endpoint
+            # 4. Resume endpoint
             res_resume = await client.post(f"/agent/runs/{test_run_id}/resume")
             self.assertEqual(res_resume.status_code, 200)
             self.assertFalse(res_resume.json()["paused"])
 
-            # 4. Approval submission endpoint
-            res_app = await client.post(
+            # 5. Approval submission endpoint without active pending request -> 400
+            res_no_pending = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "approved"},
             )
+            self.assertEqual(res_no_pending.status_code, 400)
+
+            # 6. Set pending approval request with nonce
+            test_nonce = f"nonce-{uuid.uuid4().hex[:8]}"
+            await self.redis.set_approval_pending(
+                test_run_id,
+                {"status": "awaiting_approval", "nonce": test_nonce},
+            )
+
+            # 7. Submitting with wrong nonce -> 400
+            res_wrong_nonce = await client.post(
+                f"/agent/runs/{test_run_id}/approval",
+                json={"decision": "approved", "nonce": "invalid-nonce-val"},
+            )
+            self.assertEqual(res_wrong_nonce.status_code, 400)
+
+            # 8. Submitting with matching nonce -> 200 OK
+            res_app = await client.post(
+                f"/agent/runs/{test_run_id}/approval",
+                json={"decision": "approved", "nonce": test_nonce},
+            )
             self.assertEqual(res_app.status_code, 200)
             self.assertTrue(res_app.json()["recorded"])
+
+            # Clean up Redis keys
+            await self.redis.clear_approval(test_run_id)
 
 
 if __name__ == "__main__":

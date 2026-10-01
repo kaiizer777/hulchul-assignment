@@ -34,5 +34,7 @@ class Settings:
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     MAX_AGENT_ITERATIONS: int = int(os.getenv("MAX_AGENT_ITERATIONS", "30"))
     DEFAULT_APPROVAL_THRESHOLD: float = float(os.getenv("DEFAULT_APPROVAL_THRESHOLD", "50000.0"))
+    APPROVAL_TIMEOUT_SECONDS: float = float(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120.0"))
+    PAUSE_TIMEOUT_SECONDS: float = float(os.getenv("PAUSE_TIMEOUT_SECONDS", "300.0"))
 
 settings = Settings()

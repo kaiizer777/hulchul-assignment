@@ -81,6 +81,22 @@ def extract_vendor_filter(goal: str) -> Optional[str]:
     return None
 
 
+def parse_amount(amount: Union[float, int, str, None]) -> float:
+    """
+    Extracts the numeric monetary value from a float, int, or currency-prefixed string.
+    Correctly ignores punctuation in currency prefixes (e.g. 'Rs. 65,000' -> 65000.0).
+    """
+    if amount is None:
+        return 0.0
+    if isinstance(amount, (int, float)):
+        return float(amount)
+    try:
+        m = re.search(r"\d[\d,]*(?:\.\d+)?", str(amount))
+        return float(m.group(0).replace(",", "")) if m else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # ReAct System Prompt Builder
 # ---------------------------------------------------------------------------
@@ -206,6 +222,7 @@ class ReActAgent:
         max_iterations: int = settings.MAX_AGENT_ITERATIONS,
         on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ):
+        """Initialize ReAct loop agent with tools, database pool, Groq LLM, and Redis clients."""
         self.run_id = str(run_id or uuid.uuid4())
         self.tools = tools or PlaywrightTools(run_id=self.run_id, pool=pool)
         self.pool = pool
@@ -222,16 +239,19 @@ class ReActAgent:
         self._active_form_state: Dict[str, Any] = {}
 
     async def get_groq_client(self) -> AsyncGroq:
+        """Get or initialize the asynchronous Groq API client."""
         if self._groq_client is None:
             self._groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
         return self._groq_client
 
     async def get_redis(self) -> UpstashRedisClient:
+        """Get or initialize the Upstash Redis client."""
         if self._redis_client is None:
             self._redis_client = get_redis_client()
         return self._redis_client
 
     async def get_db(self) -> asyncpg.Pool:
+        """Get or initialize the Neon PostgreSQL asyncpg connection pool."""
         if self.pool is None:
             self.pool = await get_db_pool()
         return self.pool
@@ -325,11 +345,7 @@ class ReActAgent:
     def check_amount_exceeds_threshold(self, amount: Union[float, int, str], threshold: float) -> bool:
         """Check if an invoice amount strictly exceeds the approval threshold."""
         try:
-            if isinstance(amount, str):
-                cleaned = re.sub(r"[^\d\.]", "", amount)
-                val = float(cleaned) if cleaned else 0.0
-            else:
-                val = float(amount)
+            val = parse_amount(amount)
             return val > threshold
         except Exception:
             return False
@@ -343,12 +359,25 @@ class ReActAgent:
     ) -> bool:
         """
         Pauses the agent loop and waits for human approval via Upstash Redis.
-        Returns True if approved, False if rejected.
+        Returns True if approved, False if rejected or timed out.
         """
         logger.info(f"Agent {self.run_id}: Triggering approval gate for invoice {invoice_id or po_number} (Amount: {amount})")
 
+        redis = await self.get_redis()
+        # Fail fast if Redis is not configured
+        if not redis.is_configured:
+            logger.error(f"Agent {self.run_id}: Cannot trigger approval gate because Upstash Redis is not configured.")
+            await self.update_run_status("stalled")
+            await self.emit_event("approval_failed", {"run_id": self.run_id, "error": "Redis not configured"})
+            return False
+
+        # Drop any stale decision before creating the next approval request
+        await redis.execute_command("DEL", f"hulchul:decision:{self.run_id}")
+
+        request_nonce = uuid.uuid4().hex[:12]
         approval_data = {
             "run_id": self.run_id,
+            "nonce": request_nonce,
             "status": "awaiting_approval",
             "invoice_id": invoice_id or f"inv-{uuid.uuid4().hex[:6]}",
             "vendor": vendor,
@@ -361,21 +390,44 @@ class ReActAgent:
         await self.update_run_status("awaiting_approval")
 
         # 2. Persist approval request to Upstash Redis
-        redis = await self.get_redis()
         await redis.set_approval_pending(self.run_id, approval_data)
 
         # 3. Emit SSE event
         await self.emit_event("needs_approval", approval_data)
 
-        # 4. Polling loop: poll Redis every 2 seconds for an approved or rejected flag
-        logger.info(f"Agent {self.run_id}: Pausing ReAct loop, waiting for approval decision...")
+        # 4. Polling loop: poll Redis every 2 seconds with configurable deadline
+        logger.info(f"Agent {self.run_id}: Pausing ReAct loop, waiting for approval decision (timeout: {settings.APPROVAL_TIMEOUT_SECONDS}s)...")
         decision: Optional[str] = None
+        deadline = asyncio.get_running_loop().time() + settings.APPROVAL_TIMEOUT_SECONDS
 
-        while True:
+        while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(2.0)
-            decision = await redis.get_approval_decision(self.run_id)
-            if decision in ("approved", "rejected"):
-                break
+            try:
+                dec_record = await redis.get_approval_decision_record(self.run_id)
+            except Exception as poll_err:
+                logger.warning(f"Agent {self.run_id}: Error polling approval decision from Redis: {poll_err}")
+                continue
+
+            if dec_record:
+                dec_nonce = dec_record.get("nonce")
+                # If a nonce was attached, ensure it matches current request
+                if dec_nonce and dec_nonce != request_nonce:
+                    logger.warning(f"Agent {self.run_id}: Stale decision nonce {dec_nonce} != {request_nonce}; ignoring.")
+                    continue
+                dec_str = dec_record.get("decision")
+                if dec_str in ("approved", "rejected"):
+                    decision = dec_str
+                    break
+
+        if decision not in ("approved", "rejected"):
+            logger.warning(f"Agent {self.run_id}: Approval gate timed out after {settings.APPROVAL_TIMEOUT_SECONDS}s.")
+            await redis.clear_approval(self.run_id)
+            await self.update_run_status("stalled")
+            await self.emit_event(
+                "approval_timeout",
+                {"run_id": self.run_id, "invoice_id": approval_data["invoice_id"]},
+            )
+            return False
 
         logger.info(f"Agent {self.run_id}: Received approval decision: '{decision}'")
 
@@ -483,16 +535,30 @@ class ReActAgent:
             logger.info(f"Agent {self.run_id}: Iteration {iteration}/{self.max_iterations}")
 
             # Check pause flag in Redis (Phase 2.9 & Phase 3)
-            is_paused = await redis.get_pause_flag(self.run_id)
-            if is_paused:
-                logger.info(f"Agent {self.run_id} is paused. Waiting for resume...")
-                await self.update_run_status("paused")
-                await self.emit_event("paused", {"step": iteration})
-                while await redis.get_pause_flag(self.run_id):
-                    await asyncio.sleep(1.0)
-                logger.info(f"Agent {self.run_id} resumed.")
-                await self.update_run_status("running")
-                await self.emit_event("resumed", {"step": iteration})
+            if redis.is_configured:
+                is_paused = await redis.get_pause_flag(self.run_id)
+                if is_paused:
+                    logger.info(f"Agent {self.run_id} is paused. Waiting for resume...")
+                    await self.update_run_status("paused")
+                    await self.emit_event("paused", {"step": iteration})
+                    pause_deadline = asyncio.get_running_loop().time() + settings.PAUSE_TIMEOUT_SECONDS
+                    while await redis.get_pause_flag(self.run_id):
+                        if asyncio.get_running_loop().time() > pause_deadline:
+                            logger.warning(f"Agent {self.run_id}: Pause wait timed out after {settings.PAUSE_TIMEOUT_SECONDS}s. Stalling run.")
+                            await self.update_run_status("stalled")
+                            await self.emit_event("stalled", {"step": iteration, "reason": "pause_timeout"})
+                            return {
+                                "run_id": self.run_id,
+                                "status": "stalled",
+                                "iterations": iteration,
+                                "goal": clean_goal,
+                                "threshold": threshold,
+                                "summary": f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
+                            }
+                        await asyncio.sleep(1.0)
+                    logger.info(f"Agent {self.run_id} resumed.")
+                    await self.update_run_status("running")
+                    await self.emit_event("resumed", {"step": iteration})
 
             # Step 1: OBSERVE - call read_page() to capture accessibility tree snapshot
             snapshot_res = await self.tools.read_page()
@@ -595,7 +661,7 @@ class ReActAgent:
                         logger.info(f"Detected submission of invoice exceeding threshold ({active_amount} > {threshold})")
                         approved = await self.handle_approval_gate(
                             vendor=self._active_form_state.get("vendor", "Unknown Vendor"),
-                            amount=float(re.sub(r"[^\d\.]", "", str(active_amount)) or 0.0),
+                            amount=parse_amount(active_amount),
                             po_number=self._active_form_state.get("po_number"),
                         )
                         if not approved:
@@ -642,21 +708,26 @@ class ReActAgent:
                 tool_success = False
 
             if not tool_success:
-                # Capture diagnostic screenshot on failure (Phase 2.8)
-                try:
-                    sc = await self.tools.take_screenshot(
-                        action=tool_name,
-                        result=f"failed: {tool_result.get('error')}",
-                    )
-                    screenshot_on_fail = sc.get("screenshot_b64")
-                except Exception:
-                    pass
-
-                await self.persist_step(
+                # Capture diagnostic screenshot on failure without creating duplicate rows (Phase 2.8)
+                failed_step_id = await self.persist_step(
                     action=tool_name,
                     result=f"failed: {tool_result.get('error')}",
-                    screenshot_b64=screenshot_on_fail,
                 )
+                try:
+                    sc = await self.tools.take_screenshot(
+                        step_id=failed_step_id,
+                        action=tool_name,
+                    )
+                    if sc and sc.get("screenshot_b64") and not sc.get("persisted"):
+                        async with (await self.get_db()).acquire() as conn:
+                            await conn.execute(
+                                "UPDATE agent_steps SET screenshot_b64 = $1 WHERE step_id = $2;",
+                                sc["screenshot_b64"],
+                                uuid.UUID(failed_step_id),
+                            )
+                except Exception as sc_err:
+                    logger.warning(f"Failure screenshot not captured: {sc_err}")
+
                 await self.emit_event(
                     "step_failed",
                     {
