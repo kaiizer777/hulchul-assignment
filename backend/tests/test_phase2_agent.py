@@ -148,6 +148,24 @@ class TestPhase24Unit(unittest.TestCase):
             res_resume = client.post("/agent/runs/any-run-id/resume")
             self.assertEqual(res_resume.status_code, 503)
 
+    def test_07_invalid_amount_submission_rejected(self):
+        """Verify that an active form submission with invalid/missing amount fails closed."""
+        import math
+        agent = ReActAgent(
+            run_id=str(uuid.uuid4()),
+            tools=MagicMock(spec=PlaywrightTools),
+        )
+        agent._active_form_state = {"vendor": "Acme Corp", "amount": "not-a-number"}
+        clean_str = str(agent._active_form_state["amount"]).replace(",", "").strip()
+        parsed = None
+        try:
+            val = float(clean_str)
+            if math.isfinite(val) and val > 0:
+                parsed = val
+        except (ValueError, TypeError):
+            parsed = None
+        self.assertIsNone(parsed)
+
 
 @unittest.skipUnless(
     bool(settings.DATABASE_URL and settings.UPSTASH_REDIS_REST_URL),

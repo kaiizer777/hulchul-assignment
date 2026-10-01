@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import re
 import uuid
 from datetime import datetime, timezone
@@ -681,14 +682,66 @@ class ReActAgent:
                     except Exception as elem_err:
                         logger.debug(f"Could not inspect element attributes for '{selector}': {elem_err}")
 
-                active_amount = self._active_form_state.get("amount")
+                if is_submit_action and bool(self._active_form_state):
+                    active_amount = self._active_form_state.get("amount")
+                    if active_amount is None and getattr(self.tools, "page", None):
+                        try:
+                            amt_elem = self.tools.page.locator('input[name*="amount" i], input[id*="amount" i], input[type="number"]').first
+                            if amt_elem:
+                                val = await amt_elem.input_value()
+                                if val:
+                                    active_amount = val
+                                    self._active_form_state["amount"] = val
+                        except Exception:
+                            pass
 
-                if is_submit_action and active_amount is not None:
-                    if self.check_amount_exceeds_threshold(active_amount, threshold):
-                        logger.info(f"Detected submission of invoice exceeding threshold ({active_amount} > {threshold})")
+                    parsed_amt = None
+                    if active_amount is not None:
+                        try:
+                            clean_str = str(active_amount).replace(",", "").replace("$", "").replace("₹", "").replace("INR", "").replace("Rs.", "").strip()
+                            val = float(clean_str)
+                            if math.isfinite(val) and val > 0:
+                                parsed_amt = val
+                        except (ValueError, TypeError):
+                            parsed_amt = None
+
+                    if active_amount is None or parsed_amt is None:
+                        logger.warning(f"Agent {self.run_id}: Invoice submission blocked due to missing or invalid amount: '{active_amount}'")
+                        tool_result = {
+                            "success": False,
+                            "rejected": True,
+                            "message": f"Invoice submission rejected: invalid or missing amount '{active_amount}'. Invoice submission requires a valid numeric amount.",
+                        }
+                        await self.persist_step(
+                            action="approval_gate",
+                            result="rejected_invalid_amount",
+                        )
+                        self._active_form_state.clear()
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": parsed_call.id,
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": json.dumps(tool_args)},
+                                }
+                            ],
+                        })
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": parsed_call.id,
+                            "name": tool_name,
+                            "content": json.dumps(tool_result),
+                        })
+                        iteration += 1
+                        continue
+
+                    if self.check_amount_exceeds_threshold(parsed_amt, threshold):
+                        logger.info(f"Detected submission of invoice exceeding threshold ({parsed_amt} > {threshold})")
                         gate_outcome = await self.handle_approval_gate(
                             vendor=self._active_form_state.get("vendor", "Unknown Vendor"),
-                            amount=parse_amount(active_amount),
+                            amount=parsed_amt,
                             po_number=self._active_form_state.get("po_number"),
                         )
                         if gate_outcome == "stalled":
