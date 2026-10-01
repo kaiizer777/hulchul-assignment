@@ -511,17 +511,19 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         # Simulate async background approval decision injection after 0.5s
         async def background_approver():
             await asyncio.sleep(0.5)
-            await self.redis.set_approval_decision(test_run_id, "approved")
+            pending = await self.redis.get_approval_pending(test_run_id)
+            nonce = pending.get("nonce") if pending else None
+            await self.redis.set_approval_decision(test_run_id, "approved", nonce=nonce)
 
         asyncio.create_task(background_approver())
 
-        approved = await agent.handle_approval_gate(
+        outcome = await agent.handle_approval_gate(
             vendor="High Value Vendor",
             amount=75000.0,
             invoice_id="inv-high-val",
             po_number="PO-2001",
         )
-        self.assertTrue(approved, "Should return True when decision is approved")
+        self.assertEqual(outcome, "approved", "Should return 'approved' when decision is approved")
 
     # -----------------------------------------------------------------------
     # 9. FastAPI Phase 2.4 Control & Status Endpoints

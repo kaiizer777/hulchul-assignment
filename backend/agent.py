@@ -356,10 +356,10 @@ class ReActAgent:
         amount: float,
         invoice_id: Optional[str] = None,
         po_number: Optional[str] = None,
-    ) -> bool:
+    ) -> str:
         """
         Pauses the agent loop and waits for human approval via Upstash Redis.
-        Returns True if approved, False if rejected or timed out.
+        Returns 'approved', 'rejected', or 'stalled'.
         """
         logger.info(f"Agent {self.run_id}: Triggering approval gate for invoice {invoice_id or po_number} (Amount: {amount})")
 
@@ -369,7 +369,7 @@ class ReActAgent:
             logger.error(f"Agent {self.run_id}: Cannot trigger approval gate because Upstash Redis is not configured.")
             await self.update_run_status("stalled")
             await self.emit_event("approval_failed", {"run_id": self.run_id, "error": "Redis not configured"})
-            return False
+            return "stalled"
 
         # Drop any stale decision before creating the next approval request
         await redis.execute_command("DEL", f"hulchul:decision:{self.run_id}")
@@ -427,7 +427,7 @@ class ReActAgent:
                 "approval_timeout",
                 {"run_id": self.run_id, "invoice_id": approval_data["invoice_id"]},
             )
-            return False
+            return "stalled"
 
         logger.info(f"Agent {self.run_id}: Received approval decision: '{decision}'")
 
@@ -450,7 +450,7 @@ class ReActAgent:
         )
 
         if decision == "approved":
-            return True
+            return "approved"
         else:
             # If rejected, mark invoice as skipped in Neon if invoice exists
             if invoice_id:
@@ -470,7 +470,7 @@ class ReActAgent:
                             )
                 except Exception as dbe:
                     logger.warning(f"Could not mark invoice as skipped in Neon: {dbe}")
-            return False
+            return "rejected"
 
     async def run(
         self,
@@ -659,12 +659,22 @@ class ReActAgent:
                 if is_submit_action and active_amount is not None:
                     if self.check_amount_exceeds_threshold(active_amount, threshold):
                         logger.info(f"Detected submission of invoice exceeding threshold ({active_amount} > {threshold})")
-                        approved = await self.handle_approval_gate(
+                        gate_outcome = await self.handle_approval_gate(
                             vendor=self._active_form_state.get("vendor", "Unknown Vendor"),
                             amount=parse_amount(active_amount),
                             po_number=self._active_form_state.get("po_number"),
                         )
-                        if not approved:
+                        if gate_outcome == "stalled":
+                            logger.warning(f"Agent {self.run_id}: Run stalled at approval gate.")
+                            return {
+                                "run_id": self.run_id,
+                                "status": "stalled",
+                                "iterations": iteration,
+                                "goal": clean_goal,
+                                "threshold": threshold,
+                                "summary": "Approval gate did not receive a decision or timed out.",
+                            }
+                        if gate_outcome != "approved":
                             # Rejection: skip submission, reset active form, inform LLM
                             tool_result = {
                                 "success": False,
