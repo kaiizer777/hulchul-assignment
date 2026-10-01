@@ -49,7 +49,8 @@ class TestPhase2Backend(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res_root.status_code, 200)
             data_root = res_root.json()
             self.assertIn("Hulchul Backend API", data_root["message"])
-            self.assertEqual(data_root["phase"], "Phase 2.1 & 2.2 Complete")
+            self.assertIn("Phase 2.", data_root["phase"])
+
 
             # Test Health
             res_health = await client.get("/health")

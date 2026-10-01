@@ -56,7 +56,7 @@ Control UI (SSE live log, Pause, Approval modal)
 
 - [x] **2.1** Set up FastAPI in `/backend` with `uvicorn`, `python-dotenv`, `asyncpg`
 - [x] **2.2** Connect to **Browserless/Steel.dev** over CDP — do NOT run Playwright locally on Lambda. Use `playwright.connect_over_cdp(BROWSER_WS_ENDPOINT)` where `BROWSER_WS_ENDPOINT` is the WebSocket URL from your Browserless/Steel.dev account. This keeps Lambda's container small (no browser binary) and offloads browser lifecycle management to the remote service. The CDP connection must be re-established on each Lambda invocation since Lambda is stateless.
-- [ ] **2.3** Build Playwright tool set (each is a function the LLM can call):
+- [x] **2.3** Build Playwright tool set (each is a function the LLM can call):
   - `navigate(url)` — go to a URL
   - `read_page()` — dump accessibility tree snapshot (~2–5 KB)
   - `click(selector)` — click an element by accessibility label
@@ -64,6 +64,7 @@ Control UI (SSE live log, Pause, Approval modal)
   - `select(selector, value)` — select a dropdown option
   - `take_screenshot()` — capture buffer → store as base64 in Neon `agent_steps` (only on failure or decision point)
   - `check_exists(entity_type, identifier)` — idempotency check before any create
+
 - [ ] **2.4** Build ReAct loop:
   - Build a system prompt that defines the agent's role, the available tools, the approval threshold (extracted from the goal), and the rule that it must call `check_exists` before any create action
   - On each iteration: call `read_page()` to get the current accessibility tree snapshot, then send `[system prompt + goal + full conversation history + current snapshot]` to Groq (`openai/gpt-oss-120b`) with tool definitions
@@ -85,10 +86,11 @@ Control UI (SSE live log, Pause, Approval modal)
 - [ ] All steps persisted to Neon with correct timestamps
 
 ### Tests 2
-- [ ] Unit test: each tool function (navigate, fill, click, check_exists) returns correct shape
+- [x] Unit test: each tool function (navigate, fill, click, check_exists) returns correct shape
 - [ ] Unit test: ReAct loop parses Groq tool call response correctly
-- [ ] Unit test: idempotency check returns `exists: true` for duplicate, `exists: false` for new
+- [x] Unit test: idempotency check returns `exists: true` for duplicate, `exists: false` for new
 - [ ] Integration test: agent completes a 3-step mock task end to end
+
 
 ---
 

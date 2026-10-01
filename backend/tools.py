@@ -218,7 +218,7 @@ async def resolve_locator(
 ) -> Locator:
     """
     Intelligently resolves an element locator from an accessibility label,
-    placeholder, role name, or CSS/XPath selector.
+    placeholder, role name, or CSS/XPath selector without throwing on special characters.
     """
     clean = selector.strip()
     is_explicit_selector = (
@@ -228,69 +228,87 @@ async def resolve_locator(
         or clean.startswith("xpath=")
         or clean.startswith("css=")
         or clean.startswith("text=")
-        or "[" in clean
-        or ">" in clean
+        or ("[" in clean and "]" in clean)
     )
 
     if is_explicit_selector:
-        loc = page.locator(clean)
-        if await loc.count() > 0:
-            return loc.first
+        try:
+            loc = page.locator(clean)
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
 
-    # Remove trailing asterisks or parenthetical hints like '(optional)'
-    base_label = re.sub(r"[\*\(\)]", "", clean).strip()
-    regex_pattern = re.compile(re.escape(base_label), re.IGNORECASE)
+    # Clean off trailing asterisks or hints
+    clean_no_star = re.sub(r"[\*]+$", "", clean).strip()
+    base_word = clean_no_star.split()[0] if clean_no_star.split() else clean_no_star
 
     # 1. Actionable Click Elements (buttons, links)
     if target_type in ("button", "link", "any"):
-        btn_loc = page.get_by_role("button", name=regex_pattern)
-        if await btn_loc.count() > 0:
-            return btn_loc.first
+        for candidate in (clean, clean_no_star):
+            btn_loc = page.get_by_role("button", name=candidate, exact=False)
+            if await btn_loc.count() > 0:
+                return btn_loc.first
 
-        link_loc = page.get_by_role("link", name=regex_pattern)
-        if await link_loc.count() > 0:
-            return link_loc.first
+            link_loc = page.get_by_role("link", name=candidate, exact=False)
+            if await link_loc.count() > 0:
+                return link_loc.first
 
     # 2. Form Input Elements (textboxes, spinbuttons, inputs)
     if target_type in ("input", "any"):
-        lbl_loc = page.get_by_label(regex_pattern)
-        if await lbl_loc.count() > 0:
-            return lbl_loc.first
+        for candidate in (clean, clean_no_star, base_word):
+            lbl_loc = page.get_by_label(candidate, exact=False)
+            if await lbl_loc.count() > 0:
+                return lbl_loc.first
 
-        ph_loc = page.get_by_placeholder(regex_pattern)
-        if await ph_loc.count() > 0:
-            return ph_loc.first
+            ph_loc = page.get_by_placeholder(candidate, exact=False)
+            if await ph_loc.count() > 0:
+                return ph_loc.first
 
-        tb_loc = page.get_by_role("textbox", name=regex_pattern)
-        if await tb_loc.count() > 0:
-            return tb_loc.first
+            tb_loc = page.get_by_role("textbox", name=candidate, exact=False)
+            if await tb_loc.count() > 0:
+                return tb_loc.first
 
-        sb_loc = page.get_by_role("spinbutton", name=regex_pattern)
-        if await sb_loc.count() > 0:
-            return sb_loc.first
+            sb_loc = page.get_by_role("spinbutton", name=candidate, exact=False)
+            if await sb_loc.count() > 0:
+                return sb_loc.first
 
     # 3. Dropdowns (comboboxes / selects)
     if target_type in ("select", "any"):
-        sel_lbl = page.get_by_label(regex_pattern)
-        if await sel_lbl.count() > 0:
-            return sel_lbl.first
+        for candidate in (clean, clean_no_star, base_word):
+            sel_lbl = page.get_by_label(candidate, exact=False)
+            if await sel_lbl.count() > 0:
+                return sel_lbl.first
 
-        combo_loc = page.get_by_role("combobox", name=regex_pattern)
-        if await combo_loc.count() > 0:
-            return combo_loc.first
+            combo_loc = page.get_by_role("combobox", name=candidate, exact=False)
+            if await combo_loc.count() > 0:
+                return combo_loc.first
 
     # 4. Text Content Matching
-    txt_loc = page.get_by_text(regex_pattern)
-    if await txt_loc.count() > 0:
-        return txt_loc.first
+    for candidate in (clean, clean_no_star):
+        txt_loc = page.get_by_text(candidate, exact=False)
+        if await txt_loc.count() > 0:
+            return txt_loc.first
 
-    # 5. ID / Name / Attribute match fallback
-    attr_loc = page.locator(f"#{base_label}, [name='{base_label}'], [id*='{base_label}']")
-    if await attr_loc.count() > 0:
-        return attr_loc.first
+    # 5. ID / Name match fallback
+    safe_id = re.sub(r"[^\w\-]", "", base_word)
+    if safe_id:
+        try:
+            attr_loc = page.locator(f"#{safe_id}, [name='{safe_id}'], [id*='{safe_id}']")
+            if await attr_loc.count() > 0:
+                return attr_loc.first
+        except Exception:
+            pass
 
-    # Default fallback to page.locator
-    return page.locator(clean).first
+    # 6. Fallback: try page.locator with clean, or get_by_text
+    try:
+        loc = page.locator(clean)
+        if await loc.count() > 0:
+            return loc.first
+    except Exception:
+        pass
+
+    return page.get_by_text(clean).first
 
 
 # ---------------------------------------------------------------------------
@@ -362,10 +380,9 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
     try:
         logger.info(f"Tool click: resolving selector '{selector}'")
         locator = await resolve_locator(page, selector, target_type="button")
-        await locator.scroll_into_view_if_needed(timeout=5000)
         await locator.click(timeout=10000)
         # Small settle delay for DOM transitions
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
         return {
             "success": True,
@@ -391,7 +408,6 @@ async def fill(page: Page, selector: str, value: Union[str, int, float]) -> Dict
         val_str = str(value)
         logger.info(f"Tool fill: locating field '{selector}' with value '{val_str}'")
         locator = await resolve_locator(page, selector, target_type="input")
-        await locator.scroll_into_view_if_needed(timeout=5000)
         await locator.fill(val_str, timeout=10000)
 
         return {
@@ -417,13 +433,15 @@ async def select(page: Page, selector: str, value: str) -> Dict[str, Any]:
         val_str = str(value).strip()
         logger.info(f"Tool select: locating dropdown '{selector}' with option '{val_str}'")
         locator = await resolve_locator(page, selector, target_type="select")
-        await locator.scroll_into_view_if_needed(timeout=5000)
 
-        # Attempt selection by visible label first, fallback to value attribute
+        # Attempt selection by visible label first, fallback to value attribute or text
         try:
             await locator.select_option(label=val_str, timeout=5000)
         except Exception:
-            await locator.select_option(value=val_str, timeout=5000)
+            try:
+                await locator.select_option(value=val_str, timeout=5000)
+            except Exception:
+                await locator.select_option(val_str, timeout=5000)
 
         return {
             "success": True,
@@ -438,6 +456,7 @@ async def select(page: Page, selector: str, value: str) -> Dict[str, Any]:
             "selected": None,
             "error": str(e),
         }
+
 
 
 async def take_screenshot(
