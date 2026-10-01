@@ -146,26 +146,26 @@ class TestPhase23Tools(unittest.IsolatedAsyncioTestCase):
 
             # 3. Test select (select dropdown option by label)
             res_select = await select(page, "Vendor", "Acme Corp")
-            self.assertTrue(res_select["success"])
+            self.assertTrue(res_select["success"], f"select failed: {res_select.get('error')}")
             self.assertEqual(res_select["selected"], "Acme Corp")
             selected_val = await page.locator("#vendor").input_value()
             self.assertEqual(selected_val, "Acme Corp")
 
             # 4. Test fill (form fields)
             res_fill_amount = await fill(page, "Amount (USD)", 42000)
-            self.assertTrue(res_fill_amount["success"])
+            self.assertTrue(res_fill_amount["success"], f"fill amount failed: {res_fill_amount.get('error')}")
             self.assertEqual(res_fill_amount["value"], "42000")
             amt_val = await page.locator("#amount").input_value()
             self.assertEqual(amt_val, "42000")
 
             res_fill_po = await fill(page, "PO Number", "PO-1001")
-            self.assertTrue(res_fill_po["success"])
+            self.assertTrue(res_fill_po["success"], f"fill po failed: {res_fill_po.get('error')}")
             po_val = await page.locator("#po_number").input_value()
             self.assertEqual(po_val, "PO-1001")
 
             # 5. Test click (by accessibility label 'Create Invoice')
             res_click = await click(page, "Create Invoice")
-            self.assertTrue(res_click["success"])
+            self.assertTrue(res_click["success"], f"click failed: {res_click.get('error')}")
             self.assertTrue(res_click["clicked"])
             status_text = await page.locator("#status").inner_text()
             self.assertEqual(status_text, "Submitted")
@@ -230,7 +230,7 @@ class TestPhase23Tools(unittest.IsolatedAsyncioTestCase):
 
             # Test execute click
             res_click = await tools.execute("click", {"selector": "Click Me"})
-            self.assertTrue(res_click["success"])
+            self.assertTrue(res_click["success"], f"tools.execute click failed: {res_click.get('error')}")
 
             # Test execute check_exists
             res_check = await tools.execute("check_exists", {"entity_type": "purchase_order", "identifier": "PO-1001"})
