@@ -1,0 +1,33 @@
+import os
+from dataclasses import dataclass
+from typing import Optional
+from dotenv import load_dotenv
+
+# Ensure .env is loaded from the backend directory
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+
+@dataclass(frozen=True)
+class Settings:
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    BROWSER_WS_ENDPOINT: str = os.getenv("BROWSER_WS_ENDPOINT", "")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+    NEXT_PUBLIC_API_URL: str = os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000")
+    SIMULATE_FAILURE_AFTER: Optional[int] = (
+        int(os.getenv("SIMULATE_FAILURE_AFTER"))
+        if os.getenv("SIMULATE_FAILURE_AFTER")
+        else None
+    )
+
+    # CDP / Browser settings
+    BROWSER_CONNECT_TIMEOUT_MS: int = int(os.getenv("BROWSER_CONNECT_TIMEOUT_MS", "30000"))
+
+    # Database pool settings
+    DB_POOL_MIN_SIZE: int = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
+    DB_POOL_MAX_SIZE: int = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+    DB_POOL_MAX_INACTIVE_LIFETIME: float = float(os.getenv("DB_POOL_MAX_INACTIVE_LIFETIME", "180.0"))
+
+
+settings = Settings()
