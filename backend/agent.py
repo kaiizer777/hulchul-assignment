@@ -652,8 +652,24 @@ class ReActAgent:
 
             # Check Approval Gate on form submission actions (e.g. click 'Create Invoice' or submit)
             if tool_name == "click":
-                btn_name = str(tool_args.get("selector", "")).lower()
-                is_submit_action = any(k in btn_name for k in ("create invoice", "submit", "save invoice"))
+                selector = str(tool_args.get("selector", ""))
+                btn_name = selector.lower()
+                is_submit_action = any(k in btn_name for k in ("create invoice", "submit", "save invoice", "save"))
+
+                # Resolve element targeted by click to detect submit buttons when CSS selectors are used
+                if not is_submit_action and getattr(self.tools, "page", None):
+                    try:
+                        elem = self.tools.page.locator(selector).first
+                        if elem:
+                            elem_type = (await elem.get_attribute("type") or "").lower()
+                            elem_text = (await elem.inner_text() or "").lower()
+                            aria_label = (await elem.get_attribute("aria-label") or "").lower()
+                            combined_text = f"{elem_type} {elem_text} {aria_label}"
+                            if elem_type == "submit" or any(k in combined_text for k in ("submit", "create invoice", "save invoice")):
+                                is_submit_action = True
+                    except Exception as elem_err:
+                        logger.debug(f"Could not inspect element attributes for '{selector}': {elem_err}")
+
                 active_amount = self._active_form_state.get("amount")
 
                 if is_submit_action and active_amount is not None:

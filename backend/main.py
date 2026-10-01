@@ -302,9 +302,12 @@ async def get_agent_run(run_id: uuid.UUID) -> AgentRunDetailResponse:
 @app.post("/agent/runs/{run_id}/pause", response_model=PauseResumeResponse)
 async def pause_agent_run(run_id: str) -> PauseResumeResponse:
     """Set pause flag in Redis for an active agent run."""
+    from fastapi import HTTPException
     from backend.redis_client import get_redis_client
     redis = get_redis_client()
-    await redis.set_pause_flag(run_id, paused=True)
+    ok = await redis.set_pause_flag(run_id, paused=True)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Redis is not configured")
     return PauseResumeResponse(
         run_id=run_id,
         paused=True,
@@ -315,9 +318,12 @@ async def pause_agent_run(run_id: str) -> PauseResumeResponse:
 @app.post("/agent/runs/{run_id}/resume", response_model=PauseResumeResponse)
 async def resume_agent_run(run_id: str) -> PauseResumeResponse:
     """Clear pause flag in Redis for an active agent run."""
+    from fastapi import HTTPException
     from backend.redis_client import get_redis_client
     redis = get_redis_client()
-    await redis.set_pause_flag(run_id, paused=False)
+    ok = await redis.set_pause_flag(run_id, paused=False)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Redis is not configured")
     return PauseResumeResponse(
         run_id=run_id,
         paused=False,
