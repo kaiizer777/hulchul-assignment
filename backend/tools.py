@@ -241,7 +241,6 @@ async def resolve_locator(
 
     # Clean off trailing asterisks or hints
     clean_no_star = re.sub(r"[\*]+$", "", clean).strip()
-    base_word = clean_no_star.split()[0] if clean_no_star.split() else clean_no_star
 
     # 1. Actionable Click Elements (buttons, links)
     if target_type in ("button", "link", "any"):
@@ -256,7 +255,7 @@ async def resolve_locator(
 
     # 2. Form Input Elements (textboxes, spinbuttons, inputs)
     if target_type in ("input", "any"):
-        for candidate in (clean, clean_no_star, base_word):
+        for candidate in (clean, clean_no_star):
             lbl_loc = page.get_by_label(candidate, exact=False)
             if await lbl_loc.count() > 0:
                 return lbl_loc.first
@@ -275,7 +274,7 @@ async def resolve_locator(
 
     # 3. Dropdowns (comboboxes / selects)
     if target_type in ("select", "any"):
-        for candidate in (clean, clean_no_star, base_word):
+        for candidate in (clean, clean_no_star):
             sel_lbl = page.get_by_label(candidate, exact=False)
             if await sel_lbl.count() > 0:
                 return sel_lbl.first
@@ -291,10 +290,10 @@ async def resolve_locator(
             return txt_loc.first
 
     # 5. ID / Name match fallback
-    safe_id = re.sub(r"[^\w\-]", "", base_word)
+    safe_id = re.sub(r"[^\w\-]", "", clean_no_star)
     if safe_id:
         try:
-            attr_loc = page.locator(f"#{safe_id}, [name='{safe_id}'], [id*='{safe_id}']")
+            attr_loc = page.locator(f"#{safe_id}, [name='{safe_id}']")
             if await attr_loc.count() > 0:
                 return attr_loc.first
         except Exception:
