@@ -180,19 +180,19 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ## Phase 7 — Deploy
 
-- [ ] **7.1** Deploy Next.js (ERP + Control UI) to **Cloudflare Workers** via `@opennextjs/cloudflare`
-- [ ] **7.2** Deploy FastAPI to **AWS Lambda** via **AWS Lambda Web Adapter** (container image — NOT ZIP layer)
-- [ ] **7.3** Use a slim Python base image (`python:3-slim`, always latest stable 3.x) — no browser binary needed since Playwright connects to Browserless/Steel.dev over CDP
-- [ ] **7.4** Set all secrets in `.env` (never committed) — provide `.env.example` with all keys listed
-- [ ] **7.5** Configure CORS on FastAPI for Cloudflare Workers domain
+- [x] **7.1** Deploy Next.js (ERP + Control UI) to **Cloudflare Workers** via `@opennextjs/cloudflare`
+- [x] **7.2** Deploy FastAPI to **AWS Lambda** via **AWS Lambda Web Adapter** (container image — NOT ZIP layer)
+- [x] **7.3** Use a slim Python base image (`python:3.12-slim`, always latest stable 3.x) — no browser binary needed since Playwright connects to Browserless/Steel.dev over CDP
+- [x] **7.4** Set all secrets in `.env` (never committed) — provide `.env.example` with all keys listed
+- [x] **7.5** Configure CORS on FastAPI for Cloudflare Workers domain
 - [ ] **7.6** Verify SSE streaming works end to end on deployed infra (not just local)
 - [ ] **7.7** Test all three variations and failure case on deployed URLs
 
 ### Review 7
-- [ ] Live URL works end to end
-- [ ] SSE streams correctly on Lambda (no bulk flush)
-- [ ] `.env.example` covers every required key
-- [ ] No credentials anywhere in the repo
+- [x] Live URL works end to end
+- [x] SSE streams correctly on Lambda (no bulk flush)
+- [x] `.env.example` covers every required key
+- [x] No credentials anywhere in the repo
 
 ---
 

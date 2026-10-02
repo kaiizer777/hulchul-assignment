@@ -1,3 +1,8 @@
+"""
+Configuration management module for FastAPI backend settings.
+Loads environment variables and provides structured typed settings.
+"""
+
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -9,12 +14,20 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 @dataclass(frozen=True)
 class Settings:
+    """
+    Immutable dataclass holding application configuration settings loaded from environment variables.
+    """
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
     BROWSER_WS_ENDPOINT: str = os.getenv("BROWSER_WS_ENDPOINT", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
     UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
     NEXT_PUBLIC_API_URL: str = os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000")
+    PORT: int = int(os.getenv("PORT", "8000"))
+    CORS_ORIGINS: str = os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000,https://*.pages.dev,*"
+    )
     SIMULATE_FAILURE_AFTER: Optional[int] = (
         int(os.getenv("SIMULATE_FAILURE_AFTER"))
         if os.getenv("SIMULATE_FAILURE_AFTER")
@@ -29,12 +42,12 @@ class Settings:
     DB_POOL_MAX_SIZE: int = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
     DB_POOL_MAX_INACTIVE_LIFETIME: float = float(os.getenv("DB_POOL_MAX_INACTIVE_LIFETIME", "180.0"))
 
-
     # Agent & LLM settings
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     MAX_AGENT_ITERATIONS: int = int(os.getenv("MAX_AGENT_ITERATIONS", "30"))
     DEFAULT_APPROVAL_THRESHOLD: float = float(os.getenv("DEFAULT_APPROVAL_THRESHOLD", "50000.0"))
     APPROVAL_TIMEOUT_SECONDS: float = float(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120.0"))
     PAUSE_TIMEOUT_SECONDS: float = float(os.getenv("PAUSE_TIMEOUT_SECONDS", "300.0"))
+
 
 settings = Settings()
