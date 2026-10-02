@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import AsyncGenerator, Optional
 import asyncpg
@@ -9,9 +10,14 @@ _db_pool: Optional[asyncpg.Pool] = None
 
 
 async def init_db_pool() -> asyncpg.Pool:
-    """Initialize the asyncpg connection pool if not already initialized."""
+    """Initialize the asyncpg connection pool if not already initialized for current loop."""
     global _db_pool
-    if _db_pool is None:
+    current_loop = asyncio.get_running_loop()
+    if (
+        _db_pool is None
+        or getattr(_db_pool, "_closed", True)
+        or getattr(_db_pool, "_loop", None) is not current_loop
+    ):
         if not settings.DATABASE_URL:
             raise ValueError("DATABASE_URL is not set in environment or .env")
         logger.info("Initializing asyncpg connection pool...")
@@ -28,7 +34,12 @@ async def init_db_pool() -> asyncpg.Pool:
 async def get_db_pool() -> asyncpg.Pool:
     """Get the current asyncpg pool, initializing if necessary."""
     global _db_pool
-    if _db_pool is None:
+    current_loop = asyncio.get_running_loop()
+    if (
+        _db_pool is None
+        or getattr(_db_pool, "_closed", True)
+        or getattr(_db_pool, "_loop", None) is not current_loop
+    ):
         return await init_db_pool()
     return _db_pool
 

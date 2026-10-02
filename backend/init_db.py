@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS agent_steps (
 
 -- Foreign key & query performance indexes
 CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps(run_id);
+CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp ON agent_steps(run_id, timestamp ASC);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_po_number ON invoices(po_number);
 """

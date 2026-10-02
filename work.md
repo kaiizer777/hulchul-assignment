@@ -73,7 +73,7 @@ Control UI (SSE live log, Pause, Approval modal)
   - On `needs_approval`: emit SSE event, write approval-pending state to Upstash Redis, pause the loop — do not exit
   - Hard cap at 30 iterations per run to prevent infinite loops; mark run as `stalled` if cap is hit
 - [x] **2.5** Implement idempotency — before every `fill + submit`, call `check_exists` first; abort if already present
-- [ ] **2.6** Persist every step to `agent_steps` table in Neon (action, result, screenshot_b64, timestamp)
+- [x] **2.6** Persist every step to `agent_steps` table in Neon (action, result, screenshot_b64, timestamp)
 - [ ] **2.7** Implement approval gate — when the agent detects an invoice amount exceeding the threshold (extracted from the goal, default ₹50,000), it must NOT submit the form. Instead: emit a `needs_approval` SSE event containing `{ invoice_id, vendor, amount, po_number }`, write `{ run_id, status: "awaiting_approval", invoice_id }` to Upstash Redis, and pause the loop by polling Redis every 2 seconds for an `approved` or `rejected` flag. On `approved`: proceed to submit. On `rejected`: mark the invoice as `skipped` in Neon and move to the next invoice.
 - [ ] **2.8** Implement recovery — wrap every tool execution in a try/except. On any failure (network error, ERP 500, CDP session drop, timeout): log the error to `agent_steps` with `result: "failed"`, take a screenshot, emit a `step_failed` SSE event, then attempt resume. Resume logic: query Neon for the last `agent_steps` row with `result: "success"` for this `run_id`, extract the step index, and restart the loop from `step_index + 1`. Never re-navigate to or re-submit an invoice that already has a `completed` or `skipped` status in the ERP — the `check_exists` call guards this.
 - [ ] **2.9** Store active session state (current step index, run_id, pause flag) in Upstash Redis
@@ -83,7 +83,7 @@ Control UI (SSE live log, Pause, Approval modal)
 - [x] Idempotency check fires before every create action
 - [ ] Approval gate pauses execution and waits for human
 - [ ] Recovery correctly resumes from last persisted step, not from the beginning
-- [ ] All steps persisted to Neon with correct timestamps
+- [x] All steps persisted to Neon with correct timestamps
 
 ### Tests 2
 - [x] Unit test: each tool function (navigate, fill, click, check_exists) returns correct shape

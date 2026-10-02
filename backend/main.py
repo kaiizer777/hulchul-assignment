@@ -2,13 +2,13 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional
-from fastapi import FastAPI, Depends, status
+from fastapi import FastAPI, Depends, status, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import asyncpg
 
 from backend.config import settings
-from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection
+from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
 
 logging.basicConfig(
@@ -107,7 +107,7 @@ async def root() -> RootResponse:
     return RootResponse(
         message="Hulchul Backend API is running",
         version="0.2.0",
-        phase="Phase 2.1, 2.2, 2.3 & 2.4 Complete",
+        phase="Phase 2.1 - 2.6 Complete",
     )
 
 
@@ -223,6 +223,24 @@ class AgentRunDetailResponse(BaseModel):
     steps: list[Dict[str, Any]]
 
 
+class AgentStepDetailResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    step_id: str
+    run_id: str
+    action: str
+    result: Optional[str] = None
+    has_screenshot: bool
+    screenshot_b64: Optional[str] = None
+    timestamp: str
+
+
+class AgentStepsListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    count: int
+    steps: list[AgentStepDetailResponse]
+
+
 class AgentSessionStateResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_id: str
@@ -296,6 +314,74 @@ async def get_agent_run(run_id: uuid.UUID) -> AgentRunDetailResponse:
             status=run_row["status"],
             created_at=run_row["created_at"].isoformat(),
             steps=steps,
+        )
+
+
+@app.get("/agent/runs/{run_id}/steps", response_model=AgentStepsListResponse)
+async def list_agent_run_steps(
+    run_id: uuid.UUID,
+    include_screenshots: bool = Query(default=False, description="Include base64 screenshot buffers in response"),
+) -> AgentStepsListResponse:
+    """Fetch all persisted execution steps for an agent run ordered chronologically (Phase 2.6)."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        run_exists = await conn.fetchval(
+            "SELECT 1 FROM agent_runs WHERE run_id = $1;",
+            run_id,
+        )
+        if not run_exists:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+
+        query = """
+            SELECT step_id, run_id, action, result, screenshot_b64, timestamp
+            FROM agent_steps
+            WHERE run_id = $1
+            ORDER BY timestamp ASC;
+        """
+        rows = await conn.fetch(query, run_id)
+        steps_list = [
+            AgentStepDetailResponse(
+                step_id=str(r["step_id"]),
+                run_id=str(r["run_id"]),
+                action=r["action"],
+                result=r["result"],
+                has_screenshot=bool(r["screenshot_b64"]),
+                screenshot_b64=r["screenshot_b64"] if include_screenshots else None,
+                timestamp=r["timestamp"].isoformat(),
+            )
+            for r in rows
+        ]
+        return AgentStepsListResponse(
+            run_id=str(run_id),
+            count=len(steps_list),
+            steps=steps_list,
+        )
+
+
+@app.get("/agent/steps/{step_id}", response_model=AgentStepDetailResponse)
+async def get_agent_step(step_id: uuid.UUID) -> AgentStepDetailResponse:
+    """Fetch single step details including base64 screenshot buffer from Neon DB (Phase 2.6)."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            """
+            SELECT step_id, run_id, action, result, screenshot_b64, timestamp
+            FROM agent_steps
+            WHERE step_id = $1;
+            """,
+            step_id,
+        )
+        if not r:
+            raise HTTPException(status_code=404, detail=f"Step '{step_id}' not found")
+
+        return AgentStepDetailResponse(
+            step_id=str(r["step_id"]),
+            run_id=str(r["run_id"]),
+            action=r["action"],
+            result=r["result"],
+            has_screenshot=bool(r["screenshot_b64"]),
+            screenshot_b64=r["screenshot_b64"],
+            timestamp=r["timestamp"].isoformat(),
         )
 
 

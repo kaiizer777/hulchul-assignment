@@ -290,7 +290,7 @@ class ReActAgent:
             except Exception as e:
                 logger.warning(f"Error in on_event handler for {event_type}: {e}")
 
-    async def ensure_run_record(self, goal: str) -> None:
+    async def ensure_run_record(self, goal: str = "Agent Execution Run") -> None:
         """Ensure an agent_runs row exists in Neon database."""
         pool = await self.get_db()
         async with pool.acquire() as conn:
@@ -324,24 +324,131 @@ class ReActAgent:
     async def persist_step(
         self,
         action: str,
-        result: str,
+        result: Optional[str] = None,
         screenshot_b64: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
     ) -> str:
-        """Persist an agent step to Neon agent_steps table."""
+        """
+        Persist an agent step to Neon agent_steps table (Phase 2.6).
+        Records action, result, optional base64 screenshot, and timestamp.
+        Guarantees foreign key integrity by ensuring agent_runs record exists.
+        """
+        run_uuid = uuid.UUID(str(self.run_id))
+        pool = await self.get_db()
+
+        async def _execute_insert() -> uuid.UUID:
+            async with pool.acquire() as conn:
+                return await conn.fetchval(
+                    """
+                    INSERT INTO agent_steps (run_id, action, result, screenshot_b64, timestamp)
+                    VALUES ($1, $2, $3, $4, COALESCE($5, now()))
+                    RETURNING step_id;
+                    """,
+                    run_uuid,
+                    action,
+                    result,
+                    screenshot_b64,
+                    timestamp,
+                )
+
+        try:
+            step_id = await _execute_insert()
+            return str(step_id)
+        except asyncpg.ForeignKeyViolationError:
+            logger.info(f"Run {self.run_id} missing in agent_runs during persist_step; ensuring record...")
+            await self.ensure_run_record()
+            step_id = await _execute_insert()
+            return str(step_id)
+
+    async def update_step(
+        self,
+        step_id: str,
+        result: Optional[str] = None,
+        screenshot_b64: Optional[str] = None,
+    ) -> bool:
+        """
+        Update an existing agent step in Neon (e.g. attaching failure screenshot or updating result).
+        """
+        try:
+            step_uuid = uuid.UUID(str(step_id))
+            pool = await self.get_db()
+            async with pool.acquire() as conn:
+                query = """
+                    UPDATE agent_steps
+                    SET result = COALESCE($1, result),
+                        screenshot_b64 = COALESCE($2, screenshot_b64)
+                    WHERE step_id = $3;
+                """
+                res = await conn.execute(query, result, screenshot_b64, step_uuid)
+                return "UPDATE 1" in res
+        except Exception as e:
+            logger.error(f"Failed to update step {step_id}: {e}")
+            return False
+
+    async def get_steps(
+        self,
+        include_screenshots: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Query all persisted steps for this run from Neon agent_steps ordered chronologically.
+        """
         pool = await self.get_db()
         async with pool.acquire() as conn:
-            step_id = await conn.fetchval(
+            rows = await conn.fetch(
                 """
-                INSERT INTO agent_steps (run_id, action, result, screenshot_b64, timestamp)
-                VALUES ($1, $2, $3, $4, now())
-                RETURNING step_id;
+                SELECT step_id, run_id, action, result, screenshot_b64, timestamp
+                FROM agent_steps
+                WHERE run_id = $1
+                ORDER BY timestamp ASC;
                 """,
-                uuid.UUID(self.run_id),
-                action,
-                result,
-                screenshot_b64,
+                uuid.UUID(str(self.run_id)),
             )
-            return str(step_id)
+            return [
+                {
+                    "step_id": str(r["step_id"]),
+                    "run_id": str(r["run_id"]),
+                    "action": r["action"],
+                    "result": r["result"],
+                    "has_screenshot": bool(r["screenshot_b64"]),
+                    "screenshot_b64": r["screenshot_b64"] if include_screenshots else None,
+                    "timestamp": r["timestamp"].isoformat(),
+                }
+                for r in rows
+            ]
+
+    async def get_step_by_id(
+        self,
+        step_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Query a specific step from Neon agent_steps by step_id.
+        """
+        try:
+            step_uuid = uuid.UUID(str(step_id))
+            pool = await self.get_db()
+            async with pool.acquire() as conn:
+                r = await conn.fetchrow(
+                    """
+                    SELECT step_id, run_id, action, result, screenshot_b64, timestamp
+                    FROM agent_steps
+                    WHERE step_id = $1;
+                    """,
+                    step_uuid,
+                )
+                if not r:
+                    return None
+                return {
+                    "step_id": str(r["step_id"]),
+                    "run_id": str(r["run_id"]),
+                    "action": r["action"],
+                    "result": r["result"],
+                    "has_screenshot": bool(r["screenshot_b64"]),
+                    "screenshot_b64": r["screenshot_b64"],
+                    "timestamp": r["timestamp"].isoformat(),
+                }
+        except Exception as e:
+            logger.error(f"Error fetching step {step_id}: {e}")
+            return None
 
     async def get_last_successful_step_index(self) -> int:
         """
@@ -429,13 +536,19 @@ class ReActAgent:
         # 1. Update Neon run status
         await self.update_run_status("awaiting_approval")
 
-        # 2. Persist approval request to Upstash Redis
+        # 2. Persist approval gate step in Neon agent_steps
+        await self.persist_step(
+            action="approval_gate",
+            result=f"awaiting_approval: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={approval_data['invoice_id']}",
+        )
+
+        # 3. Persist approval request to Upstash Redis
         await redis.set_approval_pending(self.run_id, approval_data)
 
-        # 3. Emit SSE event
+        # 4. Emit SSE event
         await self.emit_event("needs_approval", approval_data)
 
-        # 4. Polling loop: poll Redis every 2 seconds with configurable deadline
+        # 5. Polling loop: poll Redis every 2 seconds with configurable deadline
         logger.info(f"Agent {self.run_id}: Pausing ReAct loop, waiting for approval decision (timeout: {settings.APPROVAL_TIMEOUT_SECONDS}s)...")
         decision: Optional[str] = None
         deadline = asyncio.get_running_loop().time() + settings.APPROVAL_TIMEOUT_SECONDS
@@ -461,6 +574,10 @@ class ReActAgent:
 
         if decision not in ("approved", "rejected"):
             logger.warning(f"Agent {self.run_id}: Approval gate timed out after {settings.APPROVAL_TIMEOUT_SECONDS}s.")
+            await self.persist_step(
+                action="approval_gate",
+                result=f"timed_out: vendor={vendor}, amount={amount} after {settings.APPROVAL_TIMEOUT_SECONDS}s",
+            )
             await redis.clear_approval(self.run_id)
             await self.update_run_status("stalled")
             await self.emit_event(
@@ -490,8 +607,16 @@ class ReActAgent:
         )
 
         if decision == "approved":
+            await self.persist_step(
+                action="approval_gate",
+                result=f"approved: vendor={vendor}, amount={amount}, po={po_number or 'None'}",
+            )
             return "approved"
         else:
+            await self.persist_step(
+                action="approval_gate",
+                result=f"rejected_and_skipped: vendor={vendor}, amount={amount}, po={po_number or 'None'}",
+            )
             # If rejected, mark invoice as skipped in Neon if invoice exists
             if invoice_id:
                 try:
@@ -586,6 +711,10 @@ class ReActAgent:
                         if asyncio.get_running_loop().time() > pause_deadline:
                             logger.warning(f"Agent {self.run_id}: Pause wait timed out after {settings.PAUSE_TIMEOUT_SECONDS}s. Stalling run.")
                             await self.update_run_status("stalled")
+                            await self.persist_step(
+                                action="stalled",
+                                result=f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
+                            )
                             await self.emit_event("stalled", {"step": iteration, "reason": "pause_timeout"})
                             return {
                                 "run_id": self.run_id,
@@ -648,6 +777,10 @@ class ReActAgent:
                     final_summary = response_msg.content or "Task completed successfully."
                     run_status = "completed"
                     await self.update_run_status("completed")
+                    await self.persist_step(
+                        action="done",
+                        result=final_summary,
+                    )
                     await redis.set_session_state(
                         self.run_id,
                         {
@@ -1098,18 +1231,30 @@ class ReActAgent:
             else:
                 # Persist successful step to Neon (Phase 2.6)
                 result_summary = "success"
-                if "url" in tool_result:
-                    result_summary = f"navigated to {tool_result['url']}"
-                elif "clicked" in tool_result:
+                sc_b64 = None
+                if tool_name == "read_page":
+                    result_summary = f"read_page: {tool_result.get('size_bytes', 0)} bytes (url: {tool_result.get('url')})"
+                elif tool_name == "navigate":
+                    result_summary = f"navigated to {tool_result.get('url')} (status: {tool_result.get('status', 200)})"
+                elif tool_name == "click":
                     result_summary = f"clicked {tool_args.get('selector')}"
-                elif "value" in tool_result:
-                    result_summary = f"filled {tool_args.get('selector')} = {tool_result['value']}"
-                elif "selected" in tool_result:
+                elif tool_name == "fill":
+                    result_summary = f"filled {tool_args.get('selector')} = {tool_result.get('value')}"
+                elif tool_name == "select":
                     result_summary = f"selected {tool_result.get('selected')}"
-                elif "exists" in tool_result:
-                    result_summary = f"check_exists={tool_result.get('exists')}"
+                elif tool_name == "check_exists":
+                    result_summary = f"check_exists({tool_args.get('entity_type')}, {tool_args.get('identifier')}): exists={tool_result.get('exists')}"
+                elif tool_name == "take_screenshot":
+                    result_summary = f"screenshot captured ({tool_result.get('size_bytes', 0)} bytes)"
+                    sc_b64 = tool_result.get("screenshot_b64")
 
-                await self.persist_step(action=tool_name, result=result_summary)
+                # If take_screenshot was already persisted by tools.take_screenshot, avoid duplicate row
+                if not (tool_name == "take_screenshot" and tool_result.get("persisted")):
+                    await self.persist_step(
+                        action=tool_name,
+                        result=result_summary,
+                        screenshot_b64=sc_b64,
+                    )
                 await self.emit_event(
                     "step",
                     {
@@ -1159,6 +1304,10 @@ class ReActAgent:
             logger.warning(f"Agent {self.run_id} hit hard cap of {self.max_iterations} iterations. Marking as stalled.")
             run_status = "stalled"
             await self.update_run_status("stalled")
+            await self.persist_step(
+                action="stalled",
+                result=f"Exceeded maximum iteration cap of {self.max_iterations} steps.",
+            )
             await redis.set_session_state(
                 self.run_id,
                 {
