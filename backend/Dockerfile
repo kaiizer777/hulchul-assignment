@@ -4,21 +4,20 @@ FROM python:3.12-slim
 # Copy AWS Lambda Web Adapter extension binary
 COPY --from=lambda-adapter /lambda-adapter /opt/extensions/lambda-adapter
 
-WORKDIR /app/backend
+WORKDIR /app
 
 # Set environment variables for Lambda Web Adapter and FastAPI
 ENV PORT=8051
 ENV AWS_LWA_ENABLE_COMPRESSION=false
 ENV AWS_LWA_INVOKE_MODE=response_stream
+ENV PYTHONPATH=/app
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code into backend package directory
-COPY . .
-
-WORKDIR /app
+COPY . /app/backend/
 
 EXPOSE 8051
 
