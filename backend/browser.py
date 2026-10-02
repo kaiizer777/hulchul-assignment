@@ -99,6 +99,16 @@ async def get_browser_session(
     steel_session_id: Optional[str] = None
     actual_ws_endpoint = ws_endpoint
 
+    if ws_endpoint and ("localhost:9222" in ws_endpoint or "127.0.0.1:9222" in ws_endpoint):
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get("http://localhost:9222/json/version")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    actual_ws_endpoint = data.get("webSocketDebuggerUrl", ws_endpoint)
+        except Exception as e:
+            logger.warning(f"Could not fetch chrome debugger version URL: {e}")
+
     # Detect Steel.dev endpoint to handle isolated session lifecycle and release
     parsed = urlparse(ws_endpoint)
     is_steel = "steel.dev" in (parsed.netloc or "")
