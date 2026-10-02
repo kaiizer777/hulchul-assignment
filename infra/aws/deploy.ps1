@@ -56,7 +56,7 @@ Write-Host "Logging into AWS ECR..." -ForegroundColor Cyan
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ecrUrl
 
 Write-Host "Building Docker image..." -ForegroundColor Cyan
-docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../backend
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
 docker tag hulchul-backend:latest "${ecrUrl}:latest"
