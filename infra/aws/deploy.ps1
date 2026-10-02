@@ -75,13 +75,18 @@ Assert-LastExitCode "terraform output -raw ecr_repository_url"
 $ecrDomain = $ecrUrl.Trim()
 Write-Host "ECR Repository URL: $ecrDomain" -ForegroundColor Green
 
+if ([string]::IsNullOrWhiteSpace($ecrDomain)) {
+    Write-Error "Failed to retrieve ECR repository URL from Terraform output!"
+    exit 1
+}
+
 Write-Host "Logging into AWS ECR..." -ForegroundColor Cyan
 $pass = aws ecr get-login-password --region us-east-1
-Assert-LastExitCode "aws ecr get-login-password"
+if ($LASTEXITCODE -ne 0) { throw "aws ecr get-login-password failed with exit code $LASTEXITCODE" }
 
 $registryHost = $ecrDomain.Split('/')[0]
 $pass | docker login --username AWS --password-stdin $registryHost
-Assert-LastExitCode "docker login"
+if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCODE" }
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
 Write-Host "Building Docker image with tag $imageTag..." -ForegroundColor Cyan
