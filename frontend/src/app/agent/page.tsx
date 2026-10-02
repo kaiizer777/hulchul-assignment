@@ -32,6 +32,58 @@ interface ApprovalData {
   nonce?: string;
 }
 
+/**
+ * Interface representing an individual invoice verification record.
+ */
+interface VerificationRow {
+  invoice_id: string;
+  vendor: string;
+  amount: number;
+  po_number?: string;
+  expected_status: string;
+  actual_status: string;
+  pass_fail: boolean;
+  reason: string;
+  classification: string;
+}
+
+/**
+ * Interface representing an incomplete or flagged invoice item.
+ */
+interface IncompleteItem {
+  invoice_id: string;
+  vendor: string;
+  amount: number;
+  po_number?: string;
+  status: string;
+  reason: string;
+}
+
+/**
+ * Interface representing failed step execution evidence with screenshot.
+ */
+interface FailedStepEvidence {
+  step_id: string;
+  action: string;
+  result?: string;
+  screenshot_b64?: string;
+  timestamp: string;
+}
+
+/**
+ * Interface representing the comprehensive verification report for an agent run.
+ */
+interface VerificationReport {
+  run_id: string;
+  total_invoices: number;
+  pass_count: number;
+  fail_count: number;
+  incomplete_count: number;
+  verification_table: VerificationRow[];
+  incomplete_items: IncompleteItem[];
+  failed_steps: FailedStepEvidence[];
+}
+
 const DEFAULT_GOALS = [
   "Process all pending invoices",
   "Process only invoices from Vendor Acme",
@@ -82,6 +134,40 @@ export default function AgentControlPage() {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   }, [steps, autoScroll]);
+
+  // Verification Report State (Phase 4)
+  const [verificationReport, setVerificationReport] = useState<VerificationReport | null>(null);
+  const [isFetchingVerification, setIsFetchingVerification] = useState(false);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+
+  /**
+   * Fetches the comprehensive verification report for the active agent run from the FastAPI backend.
+   */
+  const handleFetchVerification = async () => {
+    if (!runId) return;
+    setIsFetchingVerification(true);
+    setVerificationError(null);
+    try {
+      const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/verification`);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Failed to fetch verification report (${res.status})`);
+      }
+      const data: VerificationReport = await res.json();
+      setVerificationReport(data);
+    } catch (err: unknown) {
+      setVerificationError(err instanceof Error ? err.message : 'Failed to fetch verification report');
+    } finally {
+      setIsFetchingVerification(false);
+    }
+  };
+
+  // Automatically fetch verification report when run completes or fails
+  useEffect(() => {
+    if (runId && (status === 'done' || status === 'failed')) {
+      handleFetchVerification();
+    }
+  }, [runId, status]);
 
   /**
    * Dispatches a new agent run with the specified goal instruction.
@@ -515,6 +601,206 @@ export default function AgentControlPage() {
           )}
         </div>
       </div>
+
+      {/* Verification Report Section (Phase 4) */}
+      {(verificationReport || isFetchingVerification || verificationError || (runId && (status === 'done' || status === 'failed'))) && (
+        <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60 space-y-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-4 border-b border-zinc-200/80 dark:border-zinc-800">
+            <div>
+              <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                Phase 4: Verification & Evidence Report
+              </h3>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                Automated post-run comparison of actual ERP invoice states against expected seed rules.
+              </p>
+            </div>
+            <button
+              onClick={handleFetchVerification}
+              disabled={isFetchingVerification || !runId}
+              className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3.5 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 disabled:opacity-50"
+            >
+              {isFetchingVerification ? (
+                <>
+                  <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  <span>Refreshing Verification...</span>
+                </>
+              ) : (
+                <>
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                  </svg>
+                  <span>Refresh Report</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {verificationError && (
+            <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-xs text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
+              {verificationError}
+            </div>
+          )}
+
+          {verificationReport ? (
+            <>
+              {/* Summary Metrics Cards */}
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <div className="rounded-xl border border-zinc-200/80 bg-zinc-50/50 p-4 dark:border-zinc-800 dark:bg-zinc-950/40">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Total Invoices</div>
+                  <div className="mt-1 text-2xl font-bold text-zinc-900 dark:text-zinc-100">{verificationReport.total_invoices}</div>
+                </div>
+                <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-4 dark:border-emerald-900/50 dark:bg-emerald-950/30">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">Passed</div>
+                  <div className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{verificationReport.pass_count}</div>
+                </div>
+                <div className="rounded-xl border border-rose-200/80 bg-rose-50/50 p-4 dark:border-rose-900/50 dark:bg-rose-950/30">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-rose-700 dark:text-rose-400">Failed / Mismatched</div>
+                  <div className="mt-1 text-2xl font-bold text-rose-800 dark:text-rose-300">{verificationReport.fail_count}</div>
+                </div>
+                <div className="rounded-xl border border-amber-200/80 bg-amber-50/50 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">Incomplete / Flagged</div>
+                  <div className="mt-1 text-2xl font-bold text-amber-800 dark:text-amber-300">{verificationReport.incomplete_count}</div>
+                </div>
+              </div>
+
+              {/* Incomplete / Flagged Items Callout */}
+              {verificationReport.incomplete_items.length > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-amber-900 dark:text-amber-300 mb-2">
+                    Incomplete / Flagged Items Requiring Attention ({verificationReport.incomplete_items.length})
+                  </h4>
+                  <div className="space-y-2">
+                    {verificationReport.incomplete_items.map((item, idx) => (
+                      <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between text-xs gap-1 border-t border-amber-200/60 dark:border-amber-900/40 pt-2 font-mono">
+                        <div>
+                          <span className="font-bold text-zinc-900 dark:text-zinc-100">{item.vendor}</span>
+                          <span className="text-zinc-500 ml-2">({item.po_number || 'No PO'})</span>
+                          <span className="ml-2 font-semibold text-emerald-700 dark:text-emerald-400">₹{item.amount.toLocaleString()}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="rounded bg-amber-200/70 px-2 py-0.5 text-[10px] font-semibold text-amber-900 dark:bg-amber-900 dark:text-amber-200 uppercase">
+                            {item.status}
+                          </span>
+                          <span className="text-zinc-600 dark:text-zinc-400">{item.reason}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Verification Table */}
+              <div className="overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead className="border-b border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">
+                    <tr>
+                      <th className="p-3">ID / Vendor</th>
+                      <th className="p-3">Amount</th>
+                      <th className="p-3">PO Number</th>
+                      <th className="p-3">Expected</th>
+                      <th className="p-3">Actual</th>
+                      <th className="p-3">Match</th>
+                      <th className="p-3">Reason / Details</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
+                    {verificationReport.verification_table.map((row, idx) => (
+                      <tr key={idx} className="hover:bg-zinc-50/50 dark:hover:bg-zinc-800/40">
+                        <td className="p-3">
+                          <div className="font-semibold text-zinc-900 dark:text-zinc-100">{row.vendor}</div>
+                          <div className="text-[10px] text-zinc-400">{row.invoice_id.slice(0, 8)}...</div>
+                        </td>
+                        <td className="p-3 font-semibold text-zinc-900 dark:text-zinc-100">
+                          ₹{row.amount.toLocaleString()}
+                        </td>
+                        <td className="p-3 text-zinc-700 dark:text-zinc-300">
+                          {row.po_number || <span className="text-zinc-400 italic">None</span>}
+                        </td>
+                        <td className="p-3">
+                          <span className="rounded bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
+                            {row.expected_status}
+                          </span>
+                        </td>
+                        <td className="p-3">
+                          <span className={`rounded px-2 py-0.5 text-[10px] font-medium ${
+                            row.actual_status === 'completed'
+                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                              : row.actual_status === 'flagged'
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
+                              : 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300'
+                          }`}>
+                            {row.actual_status}
+                          </span>
+                        </td>
+                        <td className="p-3">
+                          {row.pass_fail ? (
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-600 dark:text-emerald-400">
+                              ✅ Pass
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 font-bold text-rose-600 dark:text-rose-400">
+                              ❌ Fail
+                            </span>
+                          )}
+                        </td>
+                        <td className="p-3 text-zinc-600 dark:text-zinc-400">
+                          <div>{row.reason}</div>
+                          <div className="text-[10px] text-zinc-400 mt-0.5 font-sans">Class: {row.classification}</div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Failed Step Screenshots Inline Evidence */}
+              {verificationReport.failed_steps.length > 0 && (
+                <div className="space-y-3 pt-2">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-900 dark:text-zinc-100">
+                    Failed Step Screenshots & Evidence ({verificationReport.failed_steps.length})
+                  </h4>
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    {verificationReport.failed_steps.map((step, idx) => (
+                      <div key={idx} className="rounded-xl border border-red-200 bg-red-50/50 p-4 space-y-3 dark:border-red-900/50 dark:bg-red-950/20">
+                        <div className="flex items-center justify-between text-xs font-mono">
+                          <span className="font-bold text-red-900 dark:text-red-200">{step.action}</span>
+                          <span className="text-zinc-400">{new Date(step.timestamp).toLocaleTimeString()}</span>
+                        </div>
+                        <div className="text-xs font-mono text-red-800 dark:text-red-300 bg-white/50 dark:bg-black/30 p-2 rounded">
+                          {step.result || 'Failed step'}
+                        </div>
+                        {step.screenshot_b64 ? (
+                          <div
+                            onClick={() => setSelectedScreenshot(step.screenshot_b64 || null)}
+                            className="cursor-pointer overflow-hidden rounded-lg border border-red-200 bg-black group relative"
+                          >
+                            <img
+                              src={`data:image/png;base64,${step.screenshot_b64}`}
+                              alt="Failed Step Screenshot"
+                              className="h-36 w-full object-cover transition-transform group-hover:scale-105"
+                            />
+                            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white text-xs font-semibold">
+                              Click to expand thumbnail
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-zinc-400 italic">No screenshot captured for this step.</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="flex flex-col items-center justify-center py-8 text-center text-zinc-400">
+              <p className="text-xs">Verification report not loaded yet. Click &quot;Refresh Report&quot; above or wait for run completion.</p>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Approval Modal */}
       {status === 'awaiting_approval' && (

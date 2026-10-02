@@ -14,6 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
+from backend.verification import VerificationReport, generate_verification_report
 
 
 class RunEventHub:
@@ -456,6 +457,21 @@ async def get_agent_step(step_id: uuid.UUID) -> AgentStepDetailResponse:
             screenshot_b64=r["screenshot_b64"],
             timestamp=r["timestamp"].isoformat(),
         )
+
+
+@app.get("/agent/runs/{run_id}/verification", response_model=VerificationReport)
+async def get_agent_run_verification(run_id: uuid.UUID) -> VerificationReport:
+    """
+    Fetch comprehensive verification report for an agent run, comparing actual invoice states
+    in Neon against expected seed rules, including incomplete items and failed step screenshots (Phase 4).
+    """
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        run_exists = await conn.fetchval("SELECT 1 FROM agent_runs WHERE run_id = $1;", run_id)
+        if not run_exists:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
+
+    return await generate_verification_report(pool, str(run_id))
 
 
 @app.post("/agent/runs/{run_id}/pause", response_model=PauseResumeResponse)

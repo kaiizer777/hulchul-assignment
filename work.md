@@ -125,22 +125,22 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ## Phase 4 — Verification + Evidence `Difficulty: Low` `Complexity: Low`
 
-- [ ] **4.1** After agent completes, query Neon for final invoice states
-- [ ] **4.2** Compare actual state vs expected state (from seed data definition)
-- [ ] **4.3** Generate pass/fail verification table:
+- [x] **4.1** After agent completes, query Neon for final invoice states
+- [x] **4.2** Compare actual state vs expected state (from seed data definition)
+- [x] **4.3** Generate pass/fail verification table:
   - Invoice ID | Expected Status | Actual Status | Match (✅/❌)
-- [ ] **4.4** List any incomplete items clearly with reason (flagged, awaiting approval, failed)
-- [ ] **4.5** Render verification report on `/agent` page below the step log
-- [ ] **4.6** Screenshots (base64 from Neon) rendered inline in each failed step row in the report
+- [x] **4.4** List any incomplete items clearly with reason (flagged, awaiting approval, failed)
+- [x] **4.5** Render verification report on `/agent` page below the step log
+- [x] **4.6** Screenshots (base64 from Neon) rendered inline in each failed step row in the report
 
 ### Review 4
-- [ ] Verification catches both successes and failures correctly
-- [ ] Incomplete items are visible, not hidden
-- [ ] Screenshots render correctly inline from Neon base64 data
+- [x] Verification catches both successes and failures correctly
+- [x] Incomplete items are visible, not hidden
+- [x] Screenshots render correctly inline from Neon base64 data
 
 ### Tests 4
-- [ ] Unit test: verification function correctly diffs expected vs actual state
-- [ ] Test with a deliberately wrong invoice — verify it shows ❌ not ✅
+- [x] Unit test: verification function correctly diffs expected vs actual state
+- [x] Test with a deliberately wrong invoice — verify it shows ❌ not ✅
 
 ---
 
