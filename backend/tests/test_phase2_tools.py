@@ -226,7 +226,8 @@ class TestPhase23Tools(unittest.IsolatedAsyncioTestCase):
             res_nav = await tools.execute("navigate", {"url": "about:blank"})
             self.assertTrue(res_nav["success"])
 
-            await session.page.set_content("<button id='b'>Click Me</button>")
+            await session.page.set_content("<!DOCTYPE html><html><head><style>body { width: 800px; height: 600px; }</style></head><body><button id='b'>Click Me</button></body></html>")
+            await asyncio.sleep(0.5)
 
             # Test execute click
             res_click = await tools.execute("click", {"selector": "Click Me"})
