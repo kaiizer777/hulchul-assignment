@@ -21,5 +21,5 @@ COPY . .
 
 EXPOSE 8051
 
-# Start Uvicorn ASGI server
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8051"]
+# Start Uvicorn ASGI server using python -m
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8051"]
