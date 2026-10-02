@@ -5,6 +5,7 @@ const NAV_ITEMS = [
   { href: '/invoices/new', label: 'New Invoice' },
   { href: '/purchase-orders', label: 'Purchase Orders' },
   { href: '/vendors', label: 'Vendors' },
+  { href: '/agent', label: 'Agent Control' },
 ];
 
 export function Navbar() {
