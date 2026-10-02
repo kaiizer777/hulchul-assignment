@@ -376,12 +376,13 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
     """
     Click an interactive element by accessibility label, button/link name, or selector.
     Verifies element attachment and visibility before retrying with force=True on click failure.
+    Uses no_wait_after=True to prevent waiting for navigation on non-navigating submit/button actions.
     """
     try:
         logger.info(f"Tool click: resolving selector '{selector}'")
         locator = await resolve_locator(page, selector, target_type="button")
         try:
-            await locator.click(timeout=5000)
+            await locator.click(timeout=5000, no_wait_after=True)
         except Exception as ce:
             logger.warning(f"Standard click failed on selector '{selector}': {ce}")
             # Verify element is attached and visible before considering force retry
@@ -395,7 +396,7 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
 
             if is_attached and is_visible:
                 logger.info(f"Retrying click with force=True on verified attached/visible element '{selector}'")
-                await locator.click(force=True, timeout=5000)
+                await locator.click(force=True, timeout=5000, no_wait_after=True)
             else:
                 logger.error(f"Element for selector '{selector}' is not attached or not visible; aborting forced click retry.")
                 raise ce
