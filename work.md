@@ -198,8 +198,8 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ## Phase 8 — Polish & Submission
 
-- [ ] **8.1** Write `README.md` with: project overview, setup steps, how to run locally, env vars, deployed URLs
-- [ ] **8.2** Write `ENGINEERING_NOTE.md`:
+- [x] **8.1** Write `README.md` with: project overview, setup steps, how to run locally, env vars, deployed URLs
+- [x] **8.2** Write `ENGINEERING_NOTE.md`:
   - Why this workflow
   - Personal contribution vs AI assistance (be specific)
   - Key technical decisions and tradeoffs
