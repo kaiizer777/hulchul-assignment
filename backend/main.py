@@ -58,6 +58,7 @@ app.add_middleware(
 
 # Response Schemas (Strict Pydantic v2 Models)
 class HealthResponse(BaseModel):
+    """Response model for system health checks."""
     model_config = ConfigDict(extra="forbid")
     status: str
     database: str
@@ -65,6 +66,7 @@ class HealthResponse(BaseModel):
 
 
 class BrowserHealthResponse(BaseModel):
+    """Response model for remote CDP browser diagnostic checks."""
     model_config = ConfigDict(extra="forbid")
     connected: bool
     browser_type: Optional[str] = None
@@ -75,6 +77,7 @@ class BrowserHealthResponse(BaseModel):
 
 
 class RootResponse(BaseModel):
+    """Response model for API root endpoint."""
     model_config = ConfigDict(extra="forbid")
     message: str
     version: str
@@ -82,12 +85,14 @@ class RootResponse(BaseModel):
 
 
 class CheckExistsRequest(BaseModel):
+    """Request model for entity presence / idempotency checks."""
     model_config = ConfigDict(extra="forbid")
     entity_type: str
     identifier: str
 
 
 class CheckExistsResponse(BaseModel):
+    """Response model for entity presence / idempotency checks."""
     model_config = ConfigDict(extra="forbid")
     exists: bool
     entity_type: str
@@ -97,6 +102,7 @@ class CheckExistsResponse(BaseModel):
 
 
 class ToolsResponse(BaseModel):
+    """Response model listing available agent tools."""
     model_config = ConfigDict(extra="forbid")
     count: int
     tools: list[Dict[str, Any]]
@@ -104,6 +110,7 @@ class ToolsResponse(BaseModel):
 
 @app.get("/", response_model=RootResponse)
 async def root() -> RootResponse:
+    """Root API endpoint returning basic service status."""
     return RootResponse(
         message="Hulchul Backend API is running",
         version="0.2.0",
@@ -113,6 +120,7 @@ async def root() -> RootResponse:
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
+    """System health check endpoint verifying database connectivity."""
     db_ok = await check_db_health()
     db_status = "connected" if db_ok else "unreachable"
     overall_status = "healthy" if db_ok else "degraded"
@@ -179,12 +187,14 @@ async def check_exists_endpoint(payload: CheckExistsRequest) -> CheckExistsRespo
 # ---------------------------------------------------------------------------
 
 class AgentRunRequest(BaseModel):
+    """Request model to initiate an agent run with goal and optional run ID."""
     model_config = ConfigDict(extra="forbid")
     goal: str
     run_id: Optional[uuid.UUID] = None
 
 
 class AgentRunResponse(BaseModel):
+    """Response model detailing agent execution results."""
     model_config = ConfigDict(extra="forbid")
     run_id: str
     status: str
@@ -195,6 +205,7 @@ class AgentRunResponse(BaseModel):
 
 
 class PauseResumeResponse(BaseModel):
+    """Response model for agent pause and resume actions."""
     model_config = ConfigDict(extra="forbid")
     run_id: str
     paused: bool
@@ -202,19 +213,30 @@ class PauseResumeResponse(BaseModel):
 
 
 class ApprovalDecisionRequest(BaseModel):
+    """Request model for human approval decision and nonce verification."""
     model_config = ConfigDict(extra="forbid")
     decision: str
     nonce: Optional[str] = None
 
 
 class ApprovalDecisionResponse(BaseModel):
+    """Response model confirming recorded approval decision."""
     model_config = ConfigDict(extra="forbid")
     run_id: str
     decision: str
     recorded: bool
 
 
+class ApprovalPendingResponse(BaseModel):
+    """Response model indicating whether an agent run is awaiting approval."""
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    pending: bool
+    approval_data: Optional[Dict[str, Any]] = None
+
+
 class AgentRunDetailResponse(BaseModel):
+    """Response model containing full details and history of an agent run."""
     model_config = ConfigDict(extra="forbid")
     run_id: str
     goal: str
@@ -224,6 +246,7 @@ class AgentRunDetailResponse(BaseModel):
 
 
 class AgentStepDetailResponse(BaseModel):
+    """Response model detailing a single agent execution step."""
     model_config = ConfigDict(extra="forbid")
     step_id: str
     run_id: str
@@ -235,6 +258,7 @@ class AgentStepDetailResponse(BaseModel):
 
 
 class AgentStepsListResponse(BaseModel):
+    """Response model listing all execution steps for an agent run."""
     model_config = ConfigDict(extra="forbid")
     run_id: str
     count: int
@@ -242,6 +266,7 @@ class AgentStepsListResponse(BaseModel):
 
 
 class AgentSessionStateResponse(BaseModel):
+    """Response model containing active agent session state from Redis."""
     model_config = ConfigDict(extra="forbid")
     run_id: str
     state: Optional[Dict[str, Any]] = None
@@ -417,6 +442,17 @@ async def resume_agent_run(run_id: str) -> PauseResumeResponse:
     )
 
 
+@app.get("/agent/runs/{run_id}/approval", response_model=ApprovalPendingResponse)
+async def get_pending_approval(run_id: str) -> ApprovalPendingResponse:
+    """Fetch pending approval request details from Redis if awaiting approval (Phase 2.7 / Phase 3)."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    pending = await redis.get_approval_pending(run_id)
+    if pending and pending.get("status") == "awaiting_approval":
+        return ApprovalPendingResponse(run_id=run_id, pending=True, approval_data=pending)
+    return ApprovalPendingResponse(run_id=run_id, pending=False, approval_data=None)
+
+
 @app.post("/agent/runs/{run_id}/approval", response_model=ApprovalDecisionResponse)
 async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
     """Record human approval decision ('approved' or 'rejected') in Redis with active request and nonce check."""
@@ -434,16 +470,23 @@ async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest
 
     # Validate per-request nonce if provided or expected
     pending_nonce = pending.get("nonce")
-    if pending_nonce and payload.nonce != pending_nonce:
+    if pending_nonce and (payload.nonce is None or payload.nonce != pending_nonce):
         raise HTTPException(
             status_code=400,
-            detail="Invalid approval nonce for the current pending request",
+            detail="Invalid or missing approval nonce for the current pending request",
         )
 
-    ok = await redis.set_approval_decision(run_id, payload.decision, nonce=pending_nonce)
+    norm_decision = payload.decision.strip().lower()
+    if norm_decision not in ("approved", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Decision must be 'approved' or 'rejected', got '{payload.decision}'",
+        )
+
+    ok = await redis.set_approval_decision(run_id, norm_decision, nonce=pending_nonce)
     return ApprovalDecisionResponse(
         run_id=run_id,
-        decision=payload.decision,
+        decision=norm_decision,
         recorded=ok,
     )
 

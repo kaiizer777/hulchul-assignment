@@ -43,8 +43,8 @@ def extract_approval_threshold(goal: str, default: float = 50000.0) -> float:
     # Match patterns like:
     #   over ₹25,000 / above ₹25000 / over 25000 / Rs. 25,000 / INR 25,000 / ₹ 50,000
     patterns = [
-        r"(?:over|above|exceeding|threshold\s+(?:of|at)?|greater\s+than)\s*(?:₹|rs\.?|inr|\$)?\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
-        r"(?:₹|rs\.?|inr|\$)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
+        r"(?:over|above|exceeding|threshold\s+(?:of|at)?|greater\s+than|limit\s+(?:of|at)?|more\s+than)\s*(?:₹|rs\.?|inr|\$)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)",
+        r"(?:standard|default)\s*(?:₹|rs\.?|inr|\$)?\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*(?:rule|threshold)?",
     ]
 
     for pat in patterns:
@@ -156,6 +156,7 @@ Your mission is to execute the user's goal with precision, safety, and verifiabl
 # ---------------------------------------------------------------------------
 
 class ParsedToolCall(BaseModel):
+    """Structured representation of a parsed tool call invoked by the LLM agent."""
     model_config = ConfigDict(extra="forbid")
     id: str
     name: str
@@ -174,10 +175,11 @@ def parse_tool_call(response_message: Any) -> Optional[ParsedToolCall]:
     tool_calls = getattr(response_message, "tool_calls", None)
     if tool_calls and len(tool_calls) > 0:
         first_call = tool_calls[0]
-        call_id = getattr(first_call, "id", f"call_{uuid.uuid4().hex[:8]}")
+        call_id = str(getattr(first_call, "id", f"call_{uuid.uuid4().hex[:8]}"))
         fn = getattr(first_call, "function", None)
         if fn:
-            name = getattr(fn, "name", "")
+            raw_name = getattr(fn, "name", "")
+            name = str(raw_name) if raw_name is not None else ""
             raw_args = getattr(fn, "arguments", "{}")
             if isinstance(raw_args, dict):
                 args = raw_args
@@ -254,6 +256,9 @@ class ReActAgent:
 
         # Track active form state during multi-step invoice creation to detect approval needs
         self._active_form_state: Dict[str, Any] = {}
+
+        # Track current execution iteration index
+        self._current_iteration: int = 0
 
         # Track idempotency checks performed during this run (cache key: entity_type:identifier -> check_result)
         self._checked_entities: Dict[str, Dict[str, Any]] = {}
@@ -337,6 +342,7 @@ class ReActAgent:
         pool = await self.get_db()
 
         async def _execute_insert() -> uuid.UUID:
+            """Executes SQL insert statement for agent step and returns step UUID."""
             async with pool.acquire() as conn:
                 return await conn.fetchval(
                     """
@@ -505,7 +511,9 @@ class ReActAgent:
         po_number: Optional[str] = None,
     ) -> str:
         """
-        Pauses the agent loop and waits for human approval via Upstash Redis.
+        Pauses the agent loop and waits for human approval via Upstash Redis (Phase 2.7).
+        Emits 'needs_approval' SSE event, writes awaiting state to Redis, polls every 2 seconds,
+        and on rejection marks the invoice as 'skipped' in Neon before moving to the next invoice.
         Returns 'approved', 'rejected', or 'stalled'.
         """
         logger.info(f"Agent {self.run_id}: Triggering approval gate for invoice {invoice_id or po_number} (Amount: {amount})")
@@ -518,6 +526,24 @@ class ReActAgent:
             await self.emit_event("approval_failed", {"run_id": self.run_id, "error": "Redis not configured"})
             return "stalled"
 
+        # Resolve existing invoice_id from Neon by po_number if invoice_id is not already provided
+        resolved_invoice_id = invoice_id
+        if not resolved_invoice_id and po_number:
+            try:
+                pool = await self.get_db()
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT id FROM invoices WHERE po_number = $1 ORDER BY created_at DESC LIMIT 1;",
+                        str(po_number).strip(),
+                    )
+                    if row:
+                        resolved_invoice_id = str(row["id"])
+            except Exception as e:
+                logger.debug(f"Could not resolve invoice_id from po_number {po_number}: {e}")
+
+        if not resolved_invoice_id:
+            resolved_invoice_id = f"inv-{uuid.uuid4().hex[:6]}"
+
         # Drop any stale decision before creating the next approval request
         await redis.execute_command("DEL", f"hulchul:decision:{self.run_id}")
 
@@ -526,7 +552,7 @@ class ReActAgent:
             "run_id": self.run_id,
             "nonce": request_nonce,
             "status": "awaiting_approval",
-            "invoice_id": invoice_id or f"inv-{uuid.uuid4().hex[:6]}",
+            "invoice_id": resolved_invoice_id,
             "vendor": vendor,
             "amount": amount,
             "po_number": po_number,
@@ -536,20 +562,32 @@ class ReActAgent:
         # 1. Update Neon run status
         await self.update_run_status("awaiting_approval")
 
-        # 2. Persist approval gate step in Neon agent_steps
+        # 2. Persist approval gate step in Neon agent_steps (Phase 2.6)
         await self.persist_step(
             action="approval_gate",
-            result=f"awaiting_approval: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={approval_data['invoice_id']}",
+            result=f"awaiting_approval: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={resolved_invoice_id}",
         )
 
-        # 3. Persist approval request to Upstash Redis
+        # 3. Persist approval request & active session state to Upstash Redis
         await redis.set_approval_pending(self.run_id, approval_data)
+        await redis.set_session_state(
+            self.run_id,
+            {
+                "run_id": self.run_id,
+                "status": "awaiting_approval",
+                "invoice_id": resolved_invoice_id,
+                "vendor": vendor,
+                "amount": amount,
+                "po_number": po_number,
+                "current_step": getattr(self, "_current_iteration", 0),
+            },
+        )
 
-        # 4. Emit SSE event
+        # 4. Emit SSE event (Phase 2.7: needs_approval event containing invoice_id, vendor, amount, po_number)
         await self.emit_event("needs_approval", approval_data)
 
         # 5. Polling loop: poll Redis every 2 seconds with configurable deadline
-        logger.info(f"Agent {self.run_id}: Pausing ReAct loop, waiting for approval decision (timeout: {settings.APPROVAL_TIMEOUT_SECONDS}s)...")
+        logger.info(f"Agent {self.run_id}: Pausing ReAct loop, polling Redis every 2s for approval decision (timeout: {settings.APPROVAL_TIMEOUT_SECONDS}s)...")
         decision: Optional[str] = None
         deadline = asyncio.get_running_loop().time() + settings.APPROVAL_TIMEOUT_SECONDS
 
@@ -582,7 +620,7 @@ class ReActAgent:
             await self.update_run_status("stalled")
             await self.emit_event(
                 "approval_timeout",
-                {"run_id": self.run_id, "invoice_id": approval_data["invoice_id"]},
+                {"run_id": self.run_id, "invoice_id": resolved_invoice_id},
             )
             return "stalled"
 
@@ -600,41 +638,56 @@ class ReActAgent:
             {
                 "run_id": self.run_id,
                 "decision": decision,
-                "invoice_id": approval_data["invoice_id"],
+                "invoice_id": resolved_invoice_id,
                 "vendor": vendor,
                 "amount": amount,
+                "po_number": po_number,
             },
         )
 
         if decision == "approved":
             await self.persist_step(
                 action="approval_gate",
-                result=f"approved: vendor={vendor}, amount={amount}, po={po_number or 'None'}",
+                result=f"approved: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={resolved_invoice_id}",
             )
             return "approved"
         else:
             await self.persist_step(
                 action="approval_gate",
-                result=f"rejected_and_skipped: vendor={vendor}, amount={amount}, po={po_number or 'None'}",
+                result=f"rejected_and_skipped: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={resolved_invoice_id}",
             )
-            # If rejected, mark invoice as skipped in Neon if invoice exists
-            if invoice_id:
-                try:
-                    pool = await self.get_db()
-                    async with pool.acquire() as conn:
+            # Mark invoice as skipped in Neon (Phase 2.7)
+            try:
+                pool = await self.get_db()
+                async with pool.acquire() as conn:
+                    marked = False
+                    if resolved_invoice_id:
                         try:
-                            inv_uuid = uuid.UUID(invoice_id)
-                            await conn.execute(
+                            inv_uuid = uuid.UUID(str(resolved_invoice_id))
+                            res = await conn.execute(
                                 "UPDATE invoices SET status = 'skipped' WHERE id = $1;",
                                 inv_uuid,
                             )
+                            if "UPDATE 1" in res:
+                                marked = True
                         except (ValueError, TypeError):
-                            await conn.execute(
-                                "UPDATE invoices SET status = 'skipped' WHERE po_number = $1;",
-                                invoice_id,
-                            )
-                except Exception as dbe:
-                    logger.warning(f"Could not mark invoice as skipped in Neon: {dbe}")
+                            pass
+                    if not marked and po_number:
+                        res = await conn.execute(
+                            "UPDATE invoices SET status = 'skipped' WHERE id IN (SELECT id FROM invoices WHERE po_number = $1 AND status NOT IN ('completed', 'skipped') ORDER BY created_at DESC LIMIT 1);",
+                            str(po_number).strip(),
+                        )
+                        parts = res.split()
+                        if len(parts) >= 2:
+                            try:
+                                count = int(parts[1])
+                                if count > 0:
+                                    marked = True
+                            except ValueError:
+                                pass
+                    logger.info(f"Marked invoice (id={resolved_invoice_id}, po={po_number}) status='skipped' in Neon: {marked}")
+            except Exception as dbe:
+                logger.warning(f"Could not mark invoice as skipped in Neon: {dbe}")
             return "rejected"
 
     async def run(
@@ -697,6 +750,7 @@ class ReActAgent:
 
         while iteration < self.max_iterations:
             iteration += 1
+            self._current_iteration = iteration
             logger.info(f"Agent {self.run_id}: Iteration {iteration}/{self.max_iterations}")
 
             # Check pause flag in Redis (Phase 2.9 & Phase 3)
@@ -793,14 +847,63 @@ class ReActAgent:
                     await self.emit_event("done", {"summary": final_summary, "total_steps": iteration})
                     break
                 else:
-                    # Model provided text but no tool call and not marked done; prompt to act
+                    # Model provided text but no tool call; check if model flagged approval in prose
                     text_content = response_msg.content or ""
-                    messages.append({"role": "assistant", "content": text_content})
-                    messages.append({
-                        "role": "user",
-                        "content": "Please proceed by calling an appropriate tool, or declare 'done' if the goal is satisfied."
-                    })
-                    continue
+                    is_approval_statement = bool(
+                        re.search(r"(?:needs|requires|awaiting|requesting|hold(?:ing)?\s+for)\s+approval", text_content, re.IGNORECASE)
+                        or re.search(r"(?:exceeds|above|over)\s+(?:the\s+)?(?:approval\s+)?threshold", text_content, re.IGNORECASE)
+                    )
+                    detected_amount = parse_amount(self._active_form_state.get("amount"))
+                    if not detected_amount and text_content:
+                        curr_match = re.search(r"(?:₹|rs\.?|inr|\$|usd|eur|gbp|£|€)\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)", text_content, re.IGNORECASE)
+                        if curr_match:
+                            detected_amount = parse_amount(curr_match.group(0))
+                    if is_approval_statement and detected_amount and self.check_amount_exceeds_threshold(detected_amount, threshold):
+                        detected_po = extract_target_po(text_content) or self._active_form_state.get("po_number")
+                        detected_vendor = self._active_form_state.get("vendor") or extract_vendor_filter(text_content) or "Unknown Vendor"
+                        logger.info(f"Agent {self.run_id}: LLM declared approval needed for {detected_vendor}, amount={detected_amount}, po={detected_po}")
+                        gate_outcome = await self.handle_approval_gate(
+                            vendor=detected_vendor,
+                            amount=detected_amount,
+                            invoice_id=self._active_form_state.get("invoice_id"),
+                            po_number=detected_po,
+                        )
+                        if gate_outcome == "stalled":
+                            return {
+                                "run_id": self.run_id,
+                                "status": "stalled",
+                                "iterations": iteration,
+                                "goal": clean_goal,
+                                "threshold": threshold,
+                                "summary": "Approval gate did not receive a decision or timed out.",
+                            }
+                        messages.append({"role": "assistant", "content": text_content})
+                        if gate_outcome == "approved":
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"Human supervisor APPROVED invoice {detected_po or ''} ({detected_vendor}, ₹{detected_amount:,.2f}). "
+                                    "Proceed to submit or finalize the invoice in the ERP."
+                                ),
+                            })
+                        else:
+                            self._active_form_state.clear()
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"Human supervisor REJECTED invoice {detected_po or ''} ({detected_vendor}, ₹{detected_amount:,.2f}). "
+                                    "The invoice has been marked as 'skipped' in the database. "
+                                    "Do NOT submit this invoice. Move on to the next invoice."
+                                ),
+                            })
+                        continue
+                    else:
+                        messages.append({"role": "assistant", "content": text_content})
+                        messages.append({
+                            "role": "user",
+                            "content": "Please proceed by calling an appropriate tool, or declare 'done' if the goal is satisfied."
+                        })
+                        continue
 
             # Step 4: ACT - Execute the chosen tool
             tool_name = parsed_call.name
@@ -1131,10 +1234,15 @@ class ReActAgent:
 
                     if self.check_amount_exceeds_threshold(parsed_amt, threshold):
                         logger.info(f"Detected submission of invoice exceeding threshold ({parsed_amt} > {threshold})")
+                        target_vendor = self._active_form_state.get("vendor", "Unknown Vendor")
+                        target_po = self._active_form_state.get("po_number")
+                        target_inv_id = self._active_form_state.get("invoice_id")
+
                         gate_outcome = await self.handle_approval_gate(
-                            vendor=self._active_form_state.get("vendor", "Unknown Vendor"),
+                            vendor=target_vendor,
                             amount=parsed_amt,
-                            po_number=self._active_form_state.get("po_number"),
+                            invoice_id=target_inv_id,
+                            po_number=target_po,
                         )
                         if gate_outcome == "stalled":
                             logger.warning(f"Agent {self.run_id}: Run stalled at approval gate.")
@@ -1147,11 +1255,16 @@ class ReActAgent:
                                 "summary": "Approval gate did not receive a decision or timed out.",
                             }
                         if gate_outcome != "approved":
-                            # Rejection: skip submission, reset active form, inform LLM
+                            # Rejection: skip submission, reset active form, inform LLM (Phase 2.7)
                             tool_result = {
                                 "success": False,
                                 "rejected": True,
-                                "message": f"Invoice submission rejected by human supervisor. Invoice skipped per policy.",
+                                "message": (
+                                    f"Invoice submission rejected by human supervisor. "
+                                    f"Invoice for vendor '{target_vendor}' (Amount: ₹{parsed_amt:,.2f}, PO: {target_po or 'N/A'}) "
+                                    f"has been marked as 'skipped' in the database. "
+                                    f"Do NOT retry this invoice. Move on to the next invoice."
+                                ),
                             }
                             self._active_form_state.clear()
 
