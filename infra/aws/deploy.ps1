@@ -93,8 +93,8 @@ $pass | docker login --username AWS --password-stdin $registryHost
 if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCODE" }
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
-Write-Host "Building Docker image with tag $imageTag..." -ForegroundColor Cyan
-docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+Write-Host "Building Docker image with tag $imageTag (provenance=false)..." -ForegroundColor Cyan
+docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../backend
 Assert-LastExitCode "docker build"
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
