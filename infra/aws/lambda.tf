@@ -7,7 +7,7 @@ resource "aws_lambda_function" "backend" {
   function_name     = "hulchul-backend"
   role              = aws_iam_role.lambda_role.arn
   package_type      = "Image"
-  image_uri         = "${aws_ecr_repository.backend.repository_url}:latest"
+  image_uri         = "${aws_ecr_repository.backend.repository_url}:${var.image_tag}"
   timeout           = 300
   memory_size       = 1024
 
@@ -47,8 +47,8 @@ resource "aws_lambda_function_url" "backend" {
   }
 }
 
-resource "aws_lambda_permission" "allow_public_url" {
-  statement_id           = "AllowPublicLambdaFunctionUrl"
+resource "aws_lambda_permission" "url_public_access" {
+  statement_id           = "FunctionURLAllowPublicAccess"
   action                 = "lambda:InvokeFunctionUrl"
   function_name          = aws_lambda_function.backend.function_name
   principal              = "*"

@@ -2,6 +2,24 @@ $ErrorActionPreference = "Stop"
 
 $env:GODEBUG = 'netdns=cgo'
 
+function Assert-LastExitCode($cmd) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command '$cmd' failed with exit code $LASTEXITCODE"
+    }
+}
+
+Write-Host "Locating Terraform binary..." -ForegroundColor Cyan
+$terraformPath = "C:\Terraform\terraform.exe"
+if (!(Test-Path $terraformPath)) {
+    $found = (Get-Command terraform -ErrorAction SilentlyContinue).Source
+    if ($found) {
+        $terraformPath = $found
+    } else {
+        throw "Terraform executable not found at C:\Terraform\terraform.exe or in PATH."
+    }
+}
+Write-Host "Using Terraform at: $terraformPath" -ForegroundColor Green
+
 Write-Host "Reading backend/.env..." -ForegroundColor Cyan
 if (!(Test-Path "../../backend/.env")) {
     Write-Error "backend/.env not found!"
@@ -9,8 +27,7 @@ if (!(Test-Path "../../backend/.env")) {
 }
 
 $envContent = Get-Content "../../backend/.env"
-$tfvarsPath = "terraform.tfvars"
-$tfvarsLines = @()
+$envDict = @{}
 
 foreach ($line in $envContent) {
     if ($line -match "^\s*#") { continue }
@@ -20,51 +37,78 @@ foreach ($line in $envContent) {
     if ($parts.Length -eq 2) {
         $key = $parts[0].Trim().ToLower()
         $val = $parts[1].Trim().Trim('"').Trim("'")
-        
-        if ($key -eq "database_url") { $tfvarsLines += "database_url = `"$val`"" }
-        elseif ($key -eq "groq_api_key") { $tfvarsLines += "groq_api_key = `"$val`"" }
-        elseif ($key -eq "upstash_redis_rest_url") { $tfvarsLines += "upstash_redis_rest_url = `"$val`"" }
-        elseif ($key -eq "upstash_redis_rest_token") { $tfvarsLines += "upstash_redis_rest_token = `"$val`"" }
-        elseif ($key -eq "browser_ws_endpoint") { $tfvarsLines += "browser_ws_endpoint = `"$val`"" }
-        elseif ($key -eq "next_public_api_url") { $tfvarsLines += "frontend_url = `"$val`"" }
-        elseif ($key -eq "cors_origins") { $tfvarsLines += "cors_origins = `"$val`"" }
+        $envDict[$key] = $val
     }
 }
 
-if (!($tfvarsLines -match "cors_origins")) {
-    $tfvarsLines += 'cors_origins = "http://localhost:3051,http://127.0.0.1:3051"'
+$corsOrigins = if ($envDict.ContainsKey("cors_origins") -and $envDict["cors_origins"]) {
+    $envDict["cors_origins"]
+} else {
+    "http://localhost:3051,http://127.0.0.1:3051,https://*.pages.dev"
 }
 
-$tfvarsLines | Out-File -Encoding utf8 $tfvarsPath
-Write-Host "Generated terraform.tfvars successfully." -ForegroundColor Green
+$tfvarsObj = @{
+    database_url             = $envDict["database_url"]
+    groq_api_key             = $envDict["groq_api_key"]
+    upstash_redis_rest_url   = $envDict["upstash_redis_rest_url"]
+    upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
+    browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
+    frontend_url             = $envDict["next_public_api_url"]
+    cors_origins             = $corsOrigins
+}
+
+$tfvarsJsonPath = "terraform.tfvars.json"
+$jsonContent = $tfvarsObj | ConvertTo-Json -Depth 10
+[System.IO.File]::WriteAllText((Join-Path (Get-Location) $tfvarsJsonPath), $jsonContent, (New-Object System.Text.UTF8Encoding $false))
+Write-Host "Generated terraform.tfvars.json successfully." -ForegroundColor Green
 
 Write-Host "Initializing Terraform..." -ForegroundColor Cyan
-& 'C:\Terraform\terraform.exe' init
+& $terraformPath init
+Assert-LastExitCode "terraform init"
 
 Write-Host "Applying Terraform to create ECR repository..." -ForegroundColor Cyan
-& 'C:\Terraform\terraform.exe' apply -target="aws_ecr_repository.backend" -auto-approve
+& $terraformPath apply -target aws_ecr_repository.backend -auto-approve
+Assert-LastExitCode "terraform apply -target aws_ecr_repository.backend"
 
-$ecrUrl = ((& 'C:\Terraform\terraform.exe' output -raw ecr_repository_url) -replace "`r","" -replace "`n","").Trim()
-Write-Host "ECR Repository URL: $ecrUrl" -ForegroundColor Green
+$ecrUrl = & $terraformPath output -raw ecr_repository_url
+Assert-LastExitCode "terraform output -raw ecr_repository_url"
+$ecrDomain = $ecrUrl.Trim()
+Write-Host "ECR Repository URL: $ecrDomain" -ForegroundColor Green
 
-if ([string]::IsNullOrWhiteSpace($ecrUrl)) {
+if ([string]::IsNullOrWhiteSpace($ecrDomain)) {
     Write-Error "Failed to retrieve ECR repository URL from Terraform output!"
     exit 1
 }
 
 Write-Host "Logging into AWS ECR..." -ForegroundColor Cyan
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ecrUrl
+$pass = aws ecr get-login-password --region us-east-1
+if ($LASTEXITCODE -ne 0) { throw "aws ecr get-login-password failed with exit code $LASTEXITCODE" }
 
-Write-Host "Building Docker image..." -ForegroundColor Cyan
-docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+$registryHost = $ecrDomain.Split('/')[0]
+$pass | docker login --username AWS --password-stdin $registryHost
+if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCODE" }
+
+$imageTag = (Get-Date -Format "yyyyMMddHHmmss")
+Write-Host "Building Docker image with tag $imageTag..." -ForegroundColor Cyan
+docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+Assert-LastExitCode "docker build"
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
-docker tag hulchul-backend:latest "${ecrUrl}:latest"
+docker tag hulchul-backend:latest "${ecrDomain}:${imageTag}"
+Assert-LastExitCode "docker tag with timestamp"
+
+docker tag hulchul-backend:latest "${ecrDomain}:latest"
+Assert-LastExitCode "docker tag latest"
 
 Write-Host "Pushing Docker image to ECR..." -ForegroundColor Cyan
-docker push "${ecrUrl}:latest"
+docker push "${ecrDomain}:${imageTag}"
+Assert-LastExitCode "docker push timestamp"
 
-Write-Host "Applying remaining Terraform infrastructure..." -ForegroundColor Cyan
-& 'C:\Terraform\terraform.exe' apply -auto-approve
+docker push "${ecrDomain}:latest"
+Assert-LastExitCode "docker push latest"
+
+Write-Host "Applying remaining Terraform infrastructure with image_tag=$imageTag..." -ForegroundColor Cyan
+& $terraformPath apply -var="image_tag=$imageTag" -auto-approve
+Assert-LastExitCode "terraform apply"
 
 Write-Host "Deployment completed successfully!" -ForegroundColor Green
