@@ -5,20 +5,20 @@
   "scripts": {
     "dev": "next dev -p 3051",
     "build": "next build",
-    "build:cloudflare": "opennextjs-cloudflare",
+    "build:cloudflare": "opennextjs-cloudflare build",
     "start": "next start -p 3051",
     "lint": "eslint",
     "test": "vitest run"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.2.0",
-    "next": "15.2.0",
+    "next": "15.5.27",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^0.3.0",
+    "@opennextjs/cloudflare": "^1.20.7",
     "@tailwindcss/postcss": "^4",
     "@testing-library/dom": "^10.4.2",
     "@testing-library/react": "^16.3.3",
@@ -28,7 +28,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "@vitest/coverage-v8": "^5.0.3",
     "eslint": "^9",
-    "eslint-config-next": "15.2.0",
+    "eslint-config-next": "15.5.27",
     "jsdom": "^29.1.1",
     "tailwindcss": "^4",
     "typescript": "^5",
