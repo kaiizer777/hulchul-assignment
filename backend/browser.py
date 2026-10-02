@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -108,34 +109,31 @@ async def get_browser_session(
             steel_api_key = api_key_list[0]
 
     if is_steel and steel_api_key:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    "https://api.steel.dev/v1/sessions",
-                    headers={"Authorization": f"Bearer {steel_api_key}", "Content-Type": "application/json"},
-                    json={"timeout": 120000},
-                )
-                if resp.status_code in (200, 201):
-                    session_data = resp.json()
-                    steel_session_id = session_data.get("id")
-                    actual_ws_endpoint = session_data.get("websocketUrl", ws_endpoint)
-                    logger.info(f"Created dedicated Steel.dev session {steel_session_id}")
-                elif resp.status_code == 429:
-                    # Concurrency limit hit, attempt cleanup of stale sessions
-                    logger.warning("Steel.dev concurrency limit reached; cleaning up stale sessions...")
-                    await _cleanup_stale_steel_sessions(steel_api_key)
-                    # Retry session creation once
-                    retry_resp = await client.post(
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
                         "https://api.steel.dev/v1/sessions",
                         headers={"Authorization": f"Bearer {steel_api_key}", "Content-Type": "application/json"},
                         json={"timeout": 120000},
                     )
-                    if retry_resp.status_code in (200, 201):
-                        session_data = retry_resp.json()
+                    if resp.status_code in (200, 201):
+                        session_data = resp.json()
                         steel_session_id = session_data.get("id")
                         actual_ws_endpoint = session_data.get("websocketUrl", ws_endpoint)
-        except Exception as e:
-            logger.warning(f"Could not initialize Steel session via REST API: {e}; falling back to direct CDP")
+                        logger.info(f"Created dedicated Steel.dev session {steel_session_id}")
+                        break
+                    elif resp.status_code == 429:
+                        logger.warning(f"Steel.dev concurrency limit hit on attempt {attempt + 1}. Retrying with backoff...")
+                        if attempt < 2:
+                            await asyncio.sleep(2.0 * (attempt + 1))
+                    else:
+                        logger.warning(f"Steel session creation returned status {resp.status_code}: {resp.text}")
+                        break
+            except Exception as e:
+                logger.warning(f"Error creating Steel session on attempt {attempt + 1}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
 
     logger.info("Connecting to remote browser over CDP via %s...", actual_ws_endpoint[:25] + "...")
     try:
@@ -203,32 +201,42 @@ async def get_browser_session(
 async def verify_cdp_connection(
     endpoint: Optional[str] = None,
     timeout_ms: Optional[int] = None,
+    retries: int = 1,
 ) -> Dict[str, Any]:
     """
     Connect to the remote browser over CDP, perform a probe navigation,
-    and return diagnostic connectivity metrics.
+    and return diagnostic connectivity metrics. Includes retry for transient connection drops.
     """
     start_time = time.perf_counter()
-    try:
-        async with get_browser_session(endpoint=endpoint, timeout_ms=timeout_ms) as session:
-            browser_name = session.browser.browser_type.name
-            await session.page.goto("about:blank")
-            title = await session.page.title()
-            elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            
-            return {
-                "connected": True,
-                "browser_type": browser_name,
-                "blank_page_title": title,
-                "latency_ms": elapsed_ms,
-                "endpoint_configured": bool(endpoint or settings.BROWSER_WS_ENDPOINT),
-            }
-    except Exception as e:
-        elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        logger.error(f"CDP verification probe failed: {e}")
-        return {
-            "connected": False,
-            "error": str(e),
-            "latency_ms": elapsed_ms,
-            "endpoint_configured": bool(endpoint or settings.BROWSER_WS_ENDPOINT),
-        }
+    last_error: Optional[Exception] = None
+
+    for attempt in range(retries + 1):
+        try:
+            async with get_browser_session(endpoint=endpoint, timeout_ms=timeout_ms) as session:
+                browser_name = session.browser.browser_type.name
+                await session.page.goto("about:blank")
+                title = await session.page.title()
+                elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                
+                return {
+                    "connected": True,
+                    "browser_type": browser_name,
+                    "blank_page_title": title,
+                    "latency_ms": elapsed_ms,
+                    "endpoint_configured": bool(endpoint or settings.BROWSER_WS_ENDPOINT),
+                }
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                logger.warning(f"CDP probe attempt {attempt + 1} failed: {e}. Retrying after 2s...")
+                await asyncio.sleep(2.0)
+
+    elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    logger.error(f"CDP verification probe failed: {last_error}")
+    return {
+        "connected": False,
+        "error": str(last_error),
+        "latency_ms": elapsed_ms,
+        "endpoint_configured": bool(endpoint or settings.BROWSER_WS_ENDPOINT),
+    }
+

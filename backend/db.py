@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import AsyncGenerator, Optional
 import asyncpg
@@ -9,11 +10,30 @@ _db_pool: Optional[asyncpg.Pool] = None
 
 
 async def init_db_pool() -> asyncpg.Pool:
-    """Initialize the asyncpg connection pool if not already initialized."""
+    """Initialize the asyncpg connection pool if not already initialized for current loop."""
     global _db_pool
-    if _db_pool is None:
+    current_loop = asyncio.get_running_loop()
+    if (
+        _db_pool is None
+        or getattr(_db_pool, "_closed", True)
+        or getattr(_db_pool, "_loop", None) is not current_loop
+    ):
         if not settings.DATABASE_URL:
             raise ValueError("DATABASE_URL is not set in environment or .env")
+        if _db_pool is not None and not getattr(_db_pool, "_closed", True):
+            old_pool = _db_pool
+            old_loop = getattr(old_pool, "_loop", None)
+            try:
+                if old_loop and not old_loop.is_closed() and old_loop.is_running():
+                    fut = asyncio.run_coroutine_threadsafe(old_pool.close(), old_loop)
+                    fut.add_done_callback(
+                        lambda f: f.exception()
+                        and logger.warning(f"Old db pool close failed: {f.exception()}")
+                    )
+                else:
+                    old_pool.terminate()
+            except Exception as e:
+                logger.warning(f"Failed to cleanly close previous db pool: {e}")
         logger.info("Initializing asyncpg connection pool...")
         _db_pool = await asyncpg.create_pool(
             dsn=settings.DATABASE_URL,
@@ -28,7 +48,12 @@ async def init_db_pool() -> asyncpg.Pool:
 async def get_db_pool() -> asyncpg.Pool:
     """Get the current asyncpg pool, initializing if necessary."""
     global _db_pool
-    if _db_pool is None:
+    current_loop = asyncio.get_running_loop()
+    if (
+        _db_pool is None
+        or getattr(_db_pool, "_closed", True)
+        or getattr(_db_pool, "_loop", None) is not current_loop
+    ):
         return await init_db_pool()
     return _db_pool
 
