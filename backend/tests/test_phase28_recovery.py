@@ -16,7 +16,7 @@ class TestPhase28RecoveryUnit(unittest.TestCase):
     """Unit tests for Phase 2.8 recovery logic and error handling."""
 
     def test_01_get_last_successful_step_index_mock(self):
-        """Verify calculation of last successful step index using fetchval."""
+        """Verify calculation of last successful step index using fetchval, None return, and exception handling."""
         agent = ReActAgent(run_id=str(uuid.uuid4()), tools=MagicMock(spec=PlaywrightTools))
         agent.get_db = AsyncMock()
         mock_conn = AsyncMock()
@@ -27,6 +27,20 @@ class TestPhase28RecoveryUnit(unittest.TestCase):
 
         count = asyncio.run(agent.get_last_successful_step_index())
         self.assertEqual(count, 2)
+        mock_conn.fetchval.assert_awaited_once()
+        args = mock_conn.fetchval.await_args[0]
+        self.assertIn("agent_steps", args[0])
+        self.assertEqual(args[1], uuid.UUID(agent.run_id))
+
+        # Test when fetchval returns None
+        mock_conn.fetchval.return_value = None
+        count_none = asyncio.run(agent.get_last_successful_step_index())
+        self.assertEqual(count_none, 0)
+
+        # Test when fetchval raises an exception
+        mock_conn.fetchval.side_effect = Exception("Simulated database error")
+        count_exc = asyncio.run(agent.get_last_successful_step_index())
+        self.assertEqual(count_exc, 0)
 
 
 @unittest.skipUnless(
@@ -37,12 +51,14 @@ class TestPhase28RecoveryIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration test suite for Phase 2.8 & 2.9 Recovery, Error Handling, and Redis Session State."""
 
     async def asyncSetUp(self):
+        """Initialize database pool, Redis client, and test run ID tracking before each integration test."""
         await init_db_pool()
         self.pool = await get_db_pool()
         self.redis = UpstashRedisClient()
         self.test_run_ids: List[str] = []
 
     async def asyncTearDown(self):
+        """Clean up test agent runs, steps, and Redis session keys after each integration test."""
         if self.test_run_ids:
             try:
                 valid_uuids = [uuid.UUID(str(r)) for r in self.test_run_ids]
@@ -97,7 +113,7 @@ class TestPhase28RecoveryIntegration(unittest.IsolatedAsyncioTestCase):
         agent.get_groq_client = AsyncMock(return_value=mock_groq)
 
         res = await agent.run(goal="Process invoice with error")
-        self.assertIn(res["status"], ("running", "stalled", "completed"))
+        self.assertEqual(res["status"], "stalled")
 
         async with self.pool.acquire() as conn:
             steps = await conn.fetch("SELECT action, result FROM agent_steps WHERE run_id = $1;", uuid.UUID(run_id))

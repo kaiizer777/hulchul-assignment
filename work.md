@@ -79,7 +79,7 @@ Control UI (SSE live log, Pause, Approval modal)
 - [x] **2.9** Store active session state (current step index, run_id, pause flag) in Upstash Redis
 
 ### Review 2
-- [x] ReAct loop correctly selects tools given accessibility tree input
+- [ ] ReAct loop correctly selects tools given accessibility tree input
 - [x] Idempotency check fires before every create action
 - [x] Approval gate pauses execution and waits for human
 - [x] Recovery correctly resumes from last persisted step, not from the beginning
