@@ -83,13 +83,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS configuration for Next.js frontend
-allowed_origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-if settings.NEXT_PUBLIC_API_URL and settings.NEXT_PUBLIC_API_URL not in allowed_origins:
-    allowed_origins.append(settings.NEXT_PUBLIC_API_URL)
+# CORS configuration for Next.js frontend and Cloudflare Workers via dynamic settings
+def get_allowed_origins() -> list[str]:
+    """
+    Parse and return allowed CORS origins from settings.CORS_ORIGINS and NEXT_PUBLIC_API_URL.
+    Supports comma-separated lists, wildcards, and Cloudflare Workers domains.
+    """
+    origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    if settings.NEXT_PUBLIC_API_URL and settings.NEXT_PUBLIC_API_URL not in origins:
+        origins.append(settings.NEXT_PUBLIC_API_URL)
+    return origins
+
+allowed_origins = get_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
