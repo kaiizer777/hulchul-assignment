@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+$PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Set-Location $PSScriptRoot
+
 $env:GODEBUG = 'netdns=cgo'
 
 function Assert-LastExitCode($cmd) {
@@ -21,12 +24,13 @@ if (!(Test-Path $terraformPath)) {
 Write-Host "Using Terraform at: $terraformPath" -ForegroundColor Green
 
 Write-Host "Reading backend/.env..." -ForegroundColor Cyan
-if (!(Test-Path "../../backend/.env")) {
-    Write-Error "backend/.env not found!"
+$envPath = Join-Path $PSScriptRoot "../../backend/.env"
+if (!(Test-Path $envPath)) {
+    Write-Error "backend/.env not found at $envPath!"
     exit 1
 }
 
-$envContent = Get-Content "../../backend/.env"
+$envContent = Get-Content $envPath
 $envDict = @{}
 
 foreach ($line in $envContent) {
@@ -44,7 +48,7 @@ foreach ($line in $envContent) {
 $corsOrigins = if ($envDict.ContainsKey("cors_origins") -and $envDict["cors_origins"]) {
     $envDict["cors_origins"]
 } else {
-    "http://localhost:3051,http://127.0.0.1:3051,https://*.pages.dev"
+    "http://localhost:3051,http://127.0.0.1:3051"
 }
 
 $tfvarsObj = @{
@@ -89,8 +93,8 @@ $pass | docker login --username AWS --password-stdin $registryHost
 if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCODE" }
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
-Write-Host "Building Docker image with tag $imageTag..." -ForegroundColor Cyan
-docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+Write-Host "Building Docker image with tag $imageTag (provenance=false)..." -ForegroundColor Cyan
+docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../backend
 Assert-LastExitCode "docker build"
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
@@ -107,8 +111,11 @@ Assert-LastExitCode "docker push timestamp"
 docker push "${ecrDomain}:latest"
 Assert-LastExitCode "docker push latest"
 
+
 Write-Host "Applying remaining Terraform infrastructure with image_tag=$imageTag..." -ForegroundColor Cyan
 & $terraformPath apply -var="image_tag=$imageTag" -auto-approve
 Assert-LastExitCode "terraform apply"
 
-Write-Host "Deployment completed successfully!" -ForegroundColor Green
+$backendFunctionUrl = & $terraformPath output -raw backend_function_url
+Assert-LastExitCode "terraform output -raw backend_function_url"
+Write-Host "Deployment completed successfully! Backend Function URL: $backendFunctionUrl" -ForegroundColor Green
