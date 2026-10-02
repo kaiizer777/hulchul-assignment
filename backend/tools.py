@@ -375,11 +375,55 @@ async def read_page(page: Page) -> Dict[str, Any]:
 async def click(page: Page, selector: str) -> Dict[str, Any]:
     """
     Click an interactive element by accessibility label, button/link name, or selector.
+    Verifies element attachment and visibility before retrying with force=True on click failure.
+    Uses no_wait_after=True to prevent waiting for navigation on non-navigating submit/button actions.
     """
     try:
         logger.info(f"Tool click: resolving selector '{selector}'")
         locator = await resolve_locator(page, selector, target_type="button")
-        await locator.click(timeout=10000)
+        clicked_successfully = False
+        try:
+            await locator.click(timeout=5000, no_wait_after=True)
+            clicked_successfully = True
+        except Exception as ce:
+            logger.warning(f"Standard click failed on selector '{selector}': {ce}")
+            err_str = str(ce).lower()
+            is_actionability_failure = (
+                isinstance(ce, TimeoutError) or 
+                "timeout" in err_str or 
+                "not visible" in err_str or 
+                "disabled" in err_str or 
+                "intercepted" in err_str
+            )
+
+            if not is_actionability_failure:
+                logger.error(f"Click failure on selector '{selector}' is not an actionability failure (dispatch status ambiguous); propagating error.")
+                raise ce
+
+            # Verify element is attached and visible before considering force retry
+            is_attached = await locator.count() > 0
+            is_visible = False
+            if is_attached:
+                try:
+                    is_visible = await locator.is_visible()
+                except Exception:
+                    pass
+
+            if is_attached and is_visible:
+                logger.info(f"Retrying click with force=True on verified attached/visible element '{selector}'")
+                try:
+                    await locator.click(force=True, timeout=5000, no_wait_after=True)
+                    clicked_successfully = True
+                except Exception as fe:
+                    logger.error(f"Forced click failed on selector '{selector}': {fe}")
+                    raise fe
+            else:
+                logger.error(f"Element for selector '{selector}' is not attached or not visible; aborting forced click retry.")
+                raise ce
+
+        if not clicked_successfully:
+            raise RuntimeError(f"Click operation on selector '{selector}' did not complete successfully.")
+
         # Small settle delay for DOM transitions
         await asyncio.sleep(0.2)
 
@@ -686,32 +730,39 @@ class PlaywrightTools:
         self.pool = pool
 
     def set_page(self, page: Page) -> None:
+        """Set the active Playwright page instance."""
         self.page = page
 
     def set_run_id(self, run_id: str) -> None:
+        """Set the active agent run ID."""
         self.run_id = run_id
 
     async def navigate(self, url: str) -> Dict[str, Any]:
+        """Navigate browser page to URL."""
         if not self.page:
             return {"success": False, "error": "Browser page is not set"}
         return await navigate(self.page, url)
 
     async def read_page(self) -> Dict[str, Any]:
+        """Capture accessibility snapshot of current page."""
         if not self.page:
             return {"success": False, "error": "Browser page is not set"}
         return await read_page(self.page)
 
     async def click(self, selector: str) -> Dict[str, Any]:
+        """Click element matching selector."""
         if not self.page:
             return {"success": False, "error": "Browser page is not set"}
         return await click(self.page, selector)
 
     async def fill(self, selector: str, value: Union[str, int, float]) -> Dict[str, Any]:
+        """Fill input field matching selector with value."""
         if not self.page:
             return {"success": False, "error": "Browser page is not set"}
         return await fill(self.page, selector, value)
 
     async def select(self, selector: str, value: str) -> Dict[str, Any]:
+        """Select dropdown option matching selector."""
         if not self.page:
             return {"success": False, "error": "Browser page is not set"}
         return await select(self.page, selector, value)
@@ -722,6 +773,7 @@ class PlaywrightTools:
         action: Optional[str] = "take_screenshot",
         result: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Capture screenshot and optionally persist to database."""
         if not self.page:
             return {"success": False, "error": "Browser page is not set"}
         return await take_screenshot(
@@ -734,6 +786,7 @@ class PlaywrightTools:
         )
 
     async def check_exists(self, entity_type: str, identifier: str) -> Dict[str, Any]:
+        """Check if entity exists in database."""
         return await check_exists(entity_type=entity_type, identifier=identifier, pool=self.pool)
 
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
