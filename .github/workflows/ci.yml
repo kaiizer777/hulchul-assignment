@@ -75,6 +75,7 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: |
           python backend/init_db.py
+          python backend/seed_db.py
 
       - name: Start Headless Chrome
         run: |
@@ -86,8 +87,6 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           BROWSER_WS_ENDPOINT: ws://localhost:9222
           GROQ_API_KEY: dummy-groq-key
-          UPSTASH_REDIS_REST_URL: https://dummy-redis.upstash.io
-          UPSTASH_REDIS_REST_TOKEN: dummy-redis-token
         run: |
           python -m pytest backend/tests/
 
