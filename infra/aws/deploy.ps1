@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+$PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Set-Location $PSScriptRoot
+
 $env:GODEBUG = 'netdns=cgo'
 
 function Assert-LastExitCode($cmd) {
@@ -21,12 +24,13 @@ if (!(Test-Path $terraformPath)) {
 Write-Host "Using Terraform at: $terraformPath" -ForegroundColor Green
 
 Write-Host "Reading backend/.env..." -ForegroundColor Cyan
-if (!(Test-Path "../../backend/.env")) {
-    Write-Error "backend/.env not found!"
+$envPath = Join-Path $PSScriptRoot "../../backend/.env"
+if (!(Test-Path $envPath)) {
+    Write-Error "backend/.env not found at $envPath!"
     exit 1
 }
 
-$envContent = Get-Content "../../backend/.env"
+$envContent = Get-Content $envPath
 $envDict = @{}
 
 foreach ($line in $envContent) {
@@ -111,4 +115,6 @@ Write-Host "Applying remaining Terraform infrastructure with image_tag=$imageTag
 & $terraformPath apply -var="image_tag=$imageTag" -auto-approve
 Assert-LastExitCode "terraform apply"
 
-Write-Host "Deployment completed successfully!" -ForegroundColor Green
+$backendFunctionUrl = & $terraformPath output -raw backend_function_url
+Assert-LastExitCode "terraform output -raw backend_function_url"
+Write-Host "Deployment completed successfully! Backend Function URL: $backendFunctionUrl" -ForegroundColor Green
