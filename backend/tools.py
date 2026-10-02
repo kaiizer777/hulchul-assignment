@@ -381,10 +381,25 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
     try:
         logger.info(f"Tool click: resolving selector '{selector}'")
         locator = await resolve_locator(page, selector, target_type="button")
+        clicked_successfully = False
         try:
             await locator.click(timeout=5000, no_wait_after=True)
+            clicked_successfully = True
         except Exception as ce:
             logger.warning(f"Standard click failed on selector '{selector}': {ce}")
+            err_str = str(ce).lower()
+            is_actionability_failure = (
+                isinstance(ce, TimeoutError) or 
+                "timeout" in err_str or 
+                "not visible" in err_str or 
+                "disabled" in err_str or 
+                "intercepted" in err_str
+            )
+
+            if not is_actionability_failure:
+                logger.error(f"Click failure on selector '{selector}' is not an actionability failure (dispatch status ambiguous); propagating error.")
+                raise ce
+
             # Verify element is attached and visible before considering force retry
             is_attached = await locator.count() > 0
             is_visible = False
@@ -396,10 +411,18 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
 
             if is_attached and is_visible:
                 logger.info(f"Retrying click with force=True on verified attached/visible element '{selector}'")
-                await locator.click(force=True, timeout=5000, no_wait_after=True)
+                try:
+                    await locator.click(force=True, timeout=5000, no_wait_after=True)
+                    clicked_successfully = True
+                except Exception as fe:
+                    logger.error(f"Forced click failed on selector '{selector}': {fe}")
+                    raise fe
             else:
                 logger.error(f"Element for selector '{selector}' is not attached or not visible; aborting forced click retry.")
                 raise ce
+
+        if not clicked_successfully:
+            raise RuntimeError(f"Click operation on selector '{selector}' did not complete successfully.")
 
         # Small settle delay for DOM transitions
         await asyncio.sleep(0.2)
