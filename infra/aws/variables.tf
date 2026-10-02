@@ -25,7 +25,7 @@ variable "browser_ws_endpoint" {
 
 variable "cors_origins" {
   type    = string
-  default = "http://localhost:3051,http://127.0.0.1:3051,https://*.pages.dev,*"
+  default = "http://localhost:3051,http://127.0.0.1:3051"
 }
 
 variable "frontend_url" {

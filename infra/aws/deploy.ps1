@@ -32,7 +32,7 @@ foreach ($line in $envContent) {
 }
 
 if (!($tfvarsLines -match "cors_origins")) {
-    $tfvarsLines += 'cors_origins = "http://localhost:3051,http://127.0.0.1:3051,https://*.pages.dev,*"'
+    $tfvarsLines += 'cors_origins = "http://localhost:3051,http://127.0.0.1:3051"'
 }
 
 $tfvarsLines | Out-File -Encoding utf8 $tfvarsPath
