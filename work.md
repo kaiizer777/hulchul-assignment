@@ -96,7 +96,7 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ## Phase 3 — SSE Streaming + Control UI `Difficulty: Medium` `Complexity: High`
 
-- [ ] **3.1** Add SSE endpoint in FastAPI using `fastapi.sse.EventSourceResponse`
+- [x] **3.1** Add SSE endpoint in FastAPI using `sse_starlette.EventSourceResponse`
   - Stream step events: `{ type: "step", action, result, timestamp }`
   - Stream approval request: `{ type: "needs_approval", invoice_id, amount }`
   - Stream completion: `{ type: "done", summary }`

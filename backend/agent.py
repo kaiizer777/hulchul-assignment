@@ -282,18 +282,26 @@ class ReActAgent:
         return self.pool
 
     async def emit_event(self, event_type: str, payload: Dict[str, Any]) -> None:
-        """Emits an event to the registered SSE/event callback."""
+        """
+        Emits a structured real-time event to the registered SSE callback
+        and publishes it directly to the global run event hub for SSE streaming.
+        """
+        event_obj = {
+            "type": event_type,
+            "run_id": self.run_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
         if self.on_event:
-            event_obj = {
-                "type": event_type,
-                "run_id": self.run_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                **payload,
-            }
             try:
                 await self.on_event(event_obj)
             except Exception as e:
                 logger.warning(f"Error in on_event handler for {event_type}: {e}")
+        try:
+            from backend.main import run_event_hub
+            await run_event_hub.publish(self.run_id, event_obj)
+        except Exception:
+            pass
 
     async def ensure_run_record(self, goal: str = "Agent Execution Run") -> None:
         """Ensure an agent_runs row exists in Neon database."""
@@ -310,7 +318,7 @@ class ReActAgent:
             )
 
     async def update_run_status(self, status: str) -> None:
-        """Update agent_runs record status in Neon."""
+        """Update agent_runs record status in Neon database and emit status_change event."""
         try:
             pool = await self.get_db()
             async with pool.acquire() as conn:
@@ -323,6 +331,7 @@ class ReActAgent:
                     status,
                     uuid.UUID(self.run_id),
                 )
+            await self.emit_event("status_change", {"status": status})
         except Exception as e:
             logger.error(f"Failed to update agent_runs status for {self.run_id}: {e}")
 
@@ -1289,6 +1298,15 @@ class ReActAgent:
                             continue
 
             # Execute Tool with recovery wrap (Phase 2.8)
+            await self.emit_event(
+                "step_start",
+                {
+                    "step_index": iteration,
+                    "action": tool_name,
+                    "arguments": tool_args,
+                },
+            )
+
             screenshot_on_fail: Optional[str] = None
             try:
                 tool_result = await self.tools.execute(tool_name, tool_args)
@@ -1331,7 +1349,7 @@ class ReActAgent:
                 await self.emit_event(
                     "step_failed",
                     {
-                        "step": iteration,
+                        "step_index": iteration,
                         "action": tool_name,
                         "arguments": tool_args,
                         "error": tool_result.get("error"),
@@ -1365,8 +1383,18 @@ class ReActAgent:
                         screenshot_b64=sc_b64,
                     )
                 await self.emit_event(
+                    "step_complete",
+                    {
+                        "step_index": iteration,
+                        "action": tool_name,
+                        "result": result_summary,
+                        "has_screenshot": bool(sc_b64),
+                    },
+                )
+                await self.emit_event(
                     "step",
                     {
+                        "step_index": iteration,
                         "step": iteration,
                         "action": tool_name,
                         "arguments": tool_args,
