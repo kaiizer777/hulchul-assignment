@@ -51,13 +51,53 @@ $corsOrigins = if ($envDict.ContainsKey("cors_origins") -and $envDict["cors_orig
     "http://localhost:3051,http://127.0.0.1:3051,https://hulchul-frontend.sufiyanx.workers.dev"
 }
 
+# NEXT_PUBLIC_API_URL is the ERP base URL that the agent's remote browser is
+# navigated to from inside the Lambda container. A loopback address there points
+# at the container itself, so a local development value must never reach Lambda.
+$defaultFrontendUrl = "https://hulchul-frontend.sufiyanx.workers.dev"
+$frontendUrl = if ($envDict.ContainsKey("next_public_api_url") -and $envDict["next_public_api_url"]) {
+    $envDict["next_public_api_url"]
+} else {
+    Write-Host "backend/.env has no next_public_api_url; defaulting to $defaultFrontendUrl" -ForegroundColor Yellow
+    $defaultFrontendUrl
+}
+
+# Loopback detection must parse the host rather than match the raw string. A
+# literal comparison misses bracketed IPv6 loopback such as http://[::1]:3051 and
+# every other address in 127.0.0.0/8. [System.Uri].Host keeps the brackets around
+# an IPv6 literal, so they are stripped before comparing.
+$loopbackProbe = $frontendUrl
+if ($loopbackProbe -notmatch '^[a-zA-Z][a-zA-Z0-9+.\-]*://') {
+    # Scheme-less values stay valid input; the scheme is added only so the host
+    # can be parsed, and is never written to terraform.tfvars.json.
+    $loopbackProbe = "http://$loopbackProbe"
+}
+$frontendHost = try { ([System.Uri]$loopbackProbe).Host } catch { "" }
+$frontendHost = $frontendHost.Trim('[', ']')
+if (-not $frontendHost) {
+    # Unparseable input such as a bare "::1": compare the raw value so a malformed
+    # loopback literal still cannot reach Lambda.
+    $frontendHost = $frontendUrl.Trim('[', ']')
+}
+if ($frontendHost -eq "localhost" -or $frontendHost -eq "::1" -or $frontendHost -match "^127\.") {
+    Write-Error "next_public_api_url resolves to a loopback address ('$frontendUrl' -> host '$frontendHost'). The Lambda container would drive the remote browser at its own loopback interface. Set NEXT_PUBLIC_API_URL in backend/.env to the deployed frontend origin (for example $defaultFrontendUrl)."
+    exit 1
+}
+
+# Terraform loads terraform.tfvars.json after terraform.tfvars, so the generated
+# JSON wins. A hand-written terraform.tfvars is therefore inert but looks
+# authoritative, which silently misleads whoever edits it next.
+if (Test-Path "terraform.tfvars") {
+    Write-Host "WARNING: infra/aws/terraform.tfvars exists and is shadowed by the generated terraform.tfvars.json. Edits to it have no effect." -ForegroundColor Yellow
+}
+
 $tfvarsObj = @{
     database_url             = $envDict["database_url"]
     groq_api_key             = $envDict["groq_api_key"]
     upstash_redis_rest_url   = $envDict["upstash_redis_rest_url"]
     upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
     browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
-    frontend_url             = $envDict["next_public_api_url"]
+    frontend_url             = $frontendUrl
     cors_origins             = $corsOrigins
 }
 
@@ -94,7 +134,7 @@ if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCO
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
 Write-Host "Building Docker image with tag $imageTag (provenance=false)..." -ForegroundColor Cyan
-docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../
 Assert-LastExitCode "docker build"
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan

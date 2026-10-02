@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef, useTransition } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
+import { getBackendUrl, unreachableBackendMessage } from '@/lib/backend-url';
 
 /**
  * Interface representing a recorded agent step event.
@@ -90,18 +91,32 @@ const DEFAULT_GOALS = [
   "Hold anything over ₹25,000 for approval"
 ];
 
-const PRODUCTION_BACKEND_URL = 'https://gmruxxvvxbypxv4d74kix7l6aq0ppwmd.lambda-url.us-east-1.on.aws';
+/**
+ * Marks the case where no HTTP response was ever produced.
+ *
+ * fetch() rejects with a TypeError for connection refusal, DNS failure, TLS
+ * failure and CORS rejection, but a response body stream that dies mid-transfer
+ * also rejects with a TypeError. The thrown value's class alone therefore cannot
+ * distinguish "backend unreachable" from "backend answered, body unreadable", so
+ * the distinction is made by where the rejection happened instead.
+ */
+class BackendUnreachableError extends Error {}
 
-const getBackendUrl = () => {
-  if (process.env.NEXT_PUBLIC_BACKEND_URL) {
-    return process.env.NEXT_PUBLIC_BACKEND_URL.replace(/\/$/, '');
+/**
+ * Reads the JSON body of a response that was successfully received.
+ *
+ * @param res - A response with an ok status.
+ * @returns The parsed body.
+ */
+const readJsonBody = async <T,>(res: Response): Promise<T> => {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new Error(
+      `Backend returned a response that could not be read as JSON (HTTP ${res.status}).`
+    );
   }
-  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-    return PRODUCTION_BACKEND_URL;
-  }
-  return 'http://localhost:8051';
 };
-
 
 /**
  * AgentControlPage component provides the interactive UI for dispatching browser agent runs,
@@ -158,16 +173,28 @@ export default function AgentControlPage() {
     if (!runId) return;
     setIsFetchingVerification(true);
     setVerificationError(null);
+    const backendUrl = getBackendUrl();
     try {
-      const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/verification`);
+      let res: Response;
+      try {
+        res = await fetch(`${backendUrl}/agent/runs/${runId}/verification`);
+      } catch {
+        throw new BackendUnreachableError();
+      }
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || `Failed to fetch verification report (${res.status})`);
       }
-      const data: VerificationReport = await res.json();
+      const data = await readJsonBody<VerificationReport>(res);
       setVerificationReport(data);
     } catch (err: unknown) {
-      setVerificationError(err instanceof Error ? err.message : 'Failed to fetch verification report');
+      setVerificationError(
+        err instanceof BackendUnreachableError
+          ? unreachableBackendMessage(backendUrl)
+          : err instanceof Error
+            ? err.message
+            : 'Failed to fetch verification report'
+      );
     } finally {
       setIsFetchingVerification(false);
     }
@@ -194,23 +221,39 @@ export default function AgentControlPage() {
     setStatus("running");
     submittedNonceRef.current = null;
 
+    const backendUrl = getBackendUrl();
+
     try {
-      const res = await fetch(`${getBackendUrl()}/agent/run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal: goal.trim() }),
-      });
+      let res: Response;
+      try {
+        res = await fetch(`${backendUrl}/agent/run`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal: goal.trim() }),
+        });
+      } catch {
+        throw new BackendUnreachableError();
+      }
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || `Failed to start agent run (${res.status})`);
       }
 
-      const data = await res.json();
+      const data = await readJsonBody<{ run_id: string; status?: string }>(res);
       setRunId(data.run_id);
       setStatus(data.status || "running");
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Failed to start agent run');
+      // Only a rejection from fetch() itself means no response was produced.
+      // A body that arrived but could not be parsed is a different fault and
+      // gets its own message, so "backend unreachable" stays trustworthy.
+      setError(
+        err instanceof BackendUnreachableError
+          ? unreachableBackendMessage(backendUrl)
+          : err instanceof Error
+            ? err.message
+            : 'Failed to start agent run'
+      );
       setStatus("failed");
     } finally {
       setIsStarting(false);

@@ -10,6 +10,12 @@ jobs:
   frontend:
     name: Frontend Test & Build
     runs-on: ubuntu-latest
+    env:
+      # NEXT_PUBLIC_* values are inlined into the client bundle at build time.
+      # A Worker binding of the same name in wrangler.toml is invisible to the
+      # browser, so the build must be given a real backend URL or the deployed
+      # /agent page silently falls back to http://localhost:8051.
+      NEXT_PUBLIC_BACKEND_URL: https://gmruxxvvxbypxv4d74kix7l6aq0ppwmd.lambda-url.us-east-1.on.aws
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -23,15 +29,27 @@ jobs:
 
       - name: Install Dependencies
         working-directory: ./frontend
-        run: npm install --legacy-peer-deps
+        run: npm ci
 
       - name: Run Tests
         working-directory: ./frontend
         run: npm test
 
+      - name: Typecheck
+        working-directory: ./frontend
+        run: npx tsc --noEmit
+
       - name: Build Application
         working-directory: ./frontend
         run: npm run build
+
+      - name: Build Cloudflare Worker Bundle
+        working-directory: ./frontend
+        run: npm run build:cloudflare
+
+      - name: Verify Backend URL Is Inlined In Bundle
+        working-directory: ./frontend
+        run: npm run verify:cloudflare
 
   backend:
     name: Backend Tests

@@ -16,6 +16,7 @@
 # next.js
 /.next/
 /.open-next/
+/.wrangler/
 /out/
 
 # production
@@ -34,6 +35,10 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 !.env.example
+# NEXT_PUBLIC_* values only. Tracked so that `npm run build:cloudflare` inlines a
+# real backend URL into the client bundle on every machine and in CI. Never put
+# server-side secrets in this file.
+!.env.production
 
 # vercel
 .vercel
