@@ -79,7 +79,7 @@ jobs:
 
       - name: Start Headless Chrome
         run: |
-          google-chrome-stable --headless --disable-gpu --no-sandbox --remote-debugging-port=9222 &
+          google-chrome-stable --headless --disable-gpu --no-sandbox --user-data-dir=/tmp/chrome-data --remote-debugging-port=9222 &
           sleep 3
 
       - name: Run Pytest
