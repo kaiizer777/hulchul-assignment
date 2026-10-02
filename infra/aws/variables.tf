@@ -32,3 +32,9 @@ variable "frontend_url" {
   type    = string
   default = "http://localhost:3051"
 }
+
+variable "image_tag" {
+  type    = string
+  default = "latest"
+}
+
