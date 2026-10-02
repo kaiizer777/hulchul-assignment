@@ -18,6 +18,7 @@ __pycache__/
 
 # Next.js build
 .next/
+.open-next/
 out/
 build/
 dist/
