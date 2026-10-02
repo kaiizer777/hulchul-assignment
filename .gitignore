@@ -30,3 +30,9 @@ yarn-debug.log*
 yarn-error.log*
 .DS_Store
 Thumbs.db
+
+# Terraform
+.terraform/
+*.tfstate*
+terraform.tfvars
+
