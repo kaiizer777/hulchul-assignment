@@ -20,6 +20,16 @@ async def init_db_pool() -> asyncpg.Pool:
     ):
         if not settings.DATABASE_URL:
             raise ValueError("DATABASE_URL is not set in environment or .env")
+        if _db_pool is not None and not getattr(_db_pool, "_closed", True):
+            old_pool = _db_pool
+            old_loop = getattr(old_pool, "_loop", None)
+            try:
+                if old_loop and not old_loop.is_closed() and old_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(old_pool.close(), old_loop)
+                else:
+                    old_pool.terminate()
+            except Exception as e:
+                logger.warning(f"Failed to cleanly close previous db pool: {e}")
         logger.info("Initializing asyncpg connection pool...")
         _db_pool = await asyncpg.create_pool(
             dsn=settings.DATABASE_URL,

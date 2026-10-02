@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -123,15 +124,16 @@ async def get_browser_session(
                         logger.info(f"Created dedicated Steel.dev session {steel_session_id}")
                         break
                     elif resp.status_code == 429:
-                        logger.warning(f"Steel.dev concurrency limit hit on attempt {attempt + 1}. Cleaning up stale sessions...")
-                        await _cleanup_stale_steel_sessions(steel_api_key)
-                        await asyncio.sleep(2.0 * (attempt + 1))
+                        logger.warning(f"Steel.dev concurrency limit hit on attempt {attempt + 1}. Retrying with backoff...")
+                        if attempt < 2:
+                            await asyncio.sleep(2.0 * (attempt + 1))
                     else:
                         logger.warning(f"Steel session creation returned status {resp.status_code}: {resp.text}")
                         break
             except Exception as e:
                 logger.warning(f"Error creating Steel session on attempt {attempt + 1}: {e}")
-                await asyncio.sleep(1.5)
+                if attempt < 2:
+                    await asyncio.sleep(1.5)
 
     logger.info("Connecting to remote browser over CDP via %s...", actual_ws_endpoint[:25] + "...")
     try:

@@ -1153,10 +1153,6 @@ class ReActAgent:
                                 "rejected": True,
                                 "message": f"Invoice submission rejected by human supervisor. Invoice skipped per policy.",
                             }
-                            await self.persist_step(
-                                action="approval_gate",
-                                result="rejected_and_skipped",
-                            )
                             self._active_form_state.clear()
 
                             # Record in conversation history
