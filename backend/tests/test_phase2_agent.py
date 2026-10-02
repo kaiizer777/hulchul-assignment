@@ -318,15 +318,14 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         mock_tools.run_id = test_run_id
         mock_tools.set_run_id = MagicMock()
 
-        # Mock tools responses
         mock_tools.read_page = AsyncMock(return_value={
             "success": True,
-            "url": "http://localhost:3000/invoices",
+            "url": "http://localhost:3051/invoices",
             "title": "Invoices - Mock ERP",
             "snapshot": "- button 'Create Invoice'\n- table 'Invoices'",
         })
         mock_tools.execute = AsyncMock(side_effect=[
-            {"success": True, "url": "http://localhost:3000/invoices"},
+            {"success": True, "url": "http://localhost:3051/invoices"},
             {"success": True, "exists": True, "entity_type": "invoice", "identifier": "PO-1001"},
         ])
         mock_tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})
