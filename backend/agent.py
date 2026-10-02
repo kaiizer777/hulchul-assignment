@@ -156,6 +156,7 @@ Your mission is to execute the user's goal with precision, safety, and verifiabl
 # ---------------------------------------------------------------------------
 
 class ParsedToolCall(BaseModel):
+    """Structured representation of a parsed tool call invoked by the LLM agent."""
     model_config = ConfigDict(extra="forbid")
     id: str
     name: str
@@ -341,6 +342,7 @@ class ReActAgent:
         pool = await self.get_db()
 
         async def _execute_insert() -> uuid.UUID:
+            """Executes SQL insert statement for agent step and returns step UUID."""
             async with pool.acquire() as conn:
                 return await conn.fetchval(
                     """

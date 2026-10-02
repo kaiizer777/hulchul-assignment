@@ -111,6 +111,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
     """Integration test suite against live Neon Postgres and Upstash Redis for Phase 2.7 Approval Gate."""
 
     async def asyncSetUp(self):
+        """Initialize database connection pool, Redis client, and test tracking lists."""
         await init_db_pool()
         self.pool = await get_db_pool()
         self.redis = UpstashRedisClient()
@@ -118,7 +119,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         self.created_invoice_ids: List[uuid.UUID] = []
 
     async def asyncTearDown(self):
-        # Clean up test invoices, runs, and steps from Neon
+        """Clean up test invoices, runs, steps from Neon and clear Redis test keys."""
         if self.pool:
             try:
                 async with self.pool.acquire() as conn:
@@ -164,6 +165,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         emitted_events: List[Dict[str, Any]] = []
 
         async def record_event(evt: Dict[str, Any]):
+            """Record emitted agent event for test validation."""
             emitted_events.append(evt)
 
         agent = ReActAgent(
@@ -177,6 +179,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         # Simulate human approval injected via Redis
         async def background_approval_injector():
+            """Background task to simulate human approval injection via Redis."""
             for _ in range(40):
                 await asyncio.sleep(0.2)
                 pending = await self.redis.get_approval_pending(test_run_id)
@@ -251,6 +254,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         emitted_events: List[Dict[str, Any]] = []
 
         async def record_event(evt: Dict[str, Any]):
+            """Record emitted agent event for test validation."""
             emitted_events.append(evt)
 
         agent = ReActAgent(
@@ -264,6 +268,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         # Simulate human rejection injected via Redis with polling
         async def background_rejection_injector():
+            """Background task to simulate human rejection injection via Redis."""
             for _ in range(40):
                 await asyncio.sleep(0.2)
                 pending = await self.redis.get_approval_pending(test_run_id)
@@ -327,6 +332,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         executed_tools: List[str] = []
 
         async def mock_execute(tool_name: str, args: Dict[str, Any]):
+            """Mock tool execution callback tracking executed tool names."""
             executed_tools.append(tool_name)
             return {"success": True, "action": tool_name}
 
@@ -336,6 +342,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         mock_completions = MagicMock()
 
         def make_tc(call_id: str, tool_name: str, arguments: Dict[str, Any]):
+            """Helper to construct mock Groq tool call objects."""
             fn = MagicMock()
             fn.name = tool_name
             fn.arguments = json.dumps(arguments)
@@ -380,6 +387,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         # Background approver task
         async def approve_when_pending():
+            """Background task to approve pending approval request."""
             for _ in range(40):
                 await asyncio.sleep(0.2)
                 pending = await self.redis.get_approval_pending(test_run_id)
@@ -435,6 +443,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         executed_tools: List[str] = []
 
         async def mock_execute(tool_name: str, args: Dict[str, Any]):
+            """Mock tool execution callback tracking executed tool names."""
             executed_tools.append(tool_name)
             return {"success": True, "action": tool_name}
 
@@ -444,6 +453,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         mock_completions = MagicMock()
 
         def make_tc(call_id: str, tool_name: str, arguments: Dict[str, Any]):
+            """Helper to construct mock Groq tool call objects."""
             fn = MagicMock()
             fn.name = tool_name
             fn.arguments = json.dumps(arguments)
@@ -488,6 +498,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         # Background rejector task
         async def reject_when_pending():
+            """Background task to reject pending approval request."""
             for _ in range(40):
                 await asyncio.sleep(0.2)
                 pending = await self.redis.get_approval_pending(test_run_id)
