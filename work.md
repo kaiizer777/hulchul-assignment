@@ -146,14 +146,14 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ## Phase 5 — Adaptability (No Code Change) `Difficulty: Low` `Complexity: Low`
 
-- [ ] **5.1** Agent reads goal from plain-English input — no hardcoded vendor/amount/filter
-- [ ] **5.2** Test variation 1: `"Process only invoices from Vendor Acme"` — agent filters correctly
-- [ ] **5.3** Test variation 2: `"Hold anything over ₹25,000 for approval"` — threshold changes from goal, not config
-- [ ] **5.4** Test variation 3: Different invoice CSV/seed — agent handles new data without changes
+- [x] **5.1** Agent reads goal from plain-English input — no hardcoded vendor/amount/filter
+- [x] **5.2** Test variation 1: `"Process only invoices from Vendor Acme"` — agent filters correctly
+- [x] **5.3** Test variation 2: `"Hold anything over ₹25,000 for approval"` — threshold changes from goal, not config
+- [x] **5.4** Test variation 3: Different invoice CSV/seed — agent handles new data without changes
 
 ### Review 5
-- [ ] All three variations work with zero code changes
-- [ ] LLM correctly extracts vendor filter and threshold from plain-English goal
+- [x] All three variations work with zero code changes
+- [x] LLM correctly extracts vendor filter and threshold from plain-English goal
 
 ---
 
