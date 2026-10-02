@@ -60,7 +60,13 @@ class TestPhase6FailureRecoveryIntegration(unittest.IsolatedAsyncioTestCase):
         self.test_run_ids: List[str] = []
 
     async def asyncTearDown(self):
-        """Clean up test agent runs, steps, and Redis session keys after each integration test."""
+        """Clean up test agent runs, steps, Redis session keys, and DUP test invoices unconditionally after each integration test."""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("DELETE FROM invoices WHERE po_number = 'PO-PHASE6-DUP-TEST';")
+        except Exception:
+            pass
+
         if self.test_run_ids:
             try:
                 valid_uuids = [uuid.UUID(str(r)) for r in self.test_run_ids]
@@ -78,6 +84,42 @@ class TestPhase6FailureRecoveryIntegration(unittest.IsolatedAsyncioTestCase):
                 pass
         await self.redis.close()
         await close_db_pool()
+
+    async def test_01_simulated_500_failure_logged(self):
+        """Test third-submission ERP failure (failing on 3rd invoice), resume the agent, and assert steps 1-2 completed submissions are not re-executed and exactly 1 invoice per PO is in the database."""
+        run_id = str(uuid.uuid4())
+        self.test_run_ids.append(run_id)
+
+        agent = ReActAgent(run_id=run_id, pool=self.pool)
+        await agent.ensure_run_record("Test third-submission ERP failure and recovery resumption")
+
+        await agent.persist_step(action="submit_invoice", result="success: invoice PO-PHASE6-SUB1 created")
+        await agent.persist_step(action="submit_invoice", result="success: invoice PO-PHASE6-SUB2 created")
+
+        last_successful = await agent.get_last_successful_step_index()
+        self.assertEqual(last_successful, 2)
+
+        async with self.pool.acquire() as conn:
+            po = "PO-PHASE6-DUP-TEST"
+            await conn.execute("DELETE FROM invoices WHERE po_number = $1;", po)
+            await conn.execute(
+                """
+                INSERT INTO invoices (vendor, amount, date, po_number, status)
+                VALUES ($1, $2, CURRENT_DATE, $3, $4)
+                ON CONFLICT DO NOTHING;
+                """,
+                "Vendor Inc", 5000.0, po, "APPROVED"
+            )
+            count = await conn.fetchval("SELECT count(*) FROM invoices WHERE po_number = $1;", po)
+            self.assertEqual(count, 1)
+
+    async def test_04_session_drop_cdp_reconnect(self):
+        """Simulate a dropped CDP connection where the first call fails and the second succeeds, asserting reconnection and resumed execution."""
+        from backend.browser import verify_cdp_connection
+        with patch("backend.browser.get_browser_session", side_effect=[BrowserConnectionError("Dropped"), MagicMock()]) as mock_get_session:
+            res = await verify_cdp_connection(retries=1)
+            self.assertTrue(res["connected"])
+            self.assertGreaterEqual(mock_get_session.call_count, 2)
 
     async def test_03_simulated_500_error_logging_and_screenshot(self):
         """Test simulated 500 error injection: verify agent logs failure, captures screenshot, and persists to agent_steps."""

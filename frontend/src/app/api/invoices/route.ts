@@ -12,11 +12,21 @@ let invoiceSubmissionCount = 0;
 /**
  * Determines whether to simulate an internal server error based on `fail_after` query parameter
  * or `SIMULATE_FAILURE_AFTER` environment variable, or resets the counter if `reset_failure=true`.
+ * Gates failure injection behind test environment checks and validates fail_after format.
  *
+ * @param request - The incoming HTTP request.
  * @param url - The incoming request URL containing search parameters.
  * @returns True if failure should be simulated, false otherwise.
  */
-function shouldSimulateFailure(url: URL): boolean {
+function shouldSimulateFailure(request: Request, url: URL): boolean {
+  const isProd = process.env.NODE_ENV === 'production';
+  const enableTestInjection = process.env.ENABLE_TEST_FAILURE_INJECTION === 'true';
+  const testHeader = request.headers.get('x-test-failure-injection') === 'true' || request.headers.get('x-test-mode') === 'true';
+
+  if (isProd && !enableTestInjection && !testHeader) {
+    return false;
+  }
+
   const resetFailure = url.searchParams.get('reset_failure');
   if (resetFailure === 'true') {
     invoiceSubmissionCount = 0;
@@ -28,11 +38,11 @@ function shouldSimulateFailure(url: URL): boolean {
     return false;
   }
 
-  const failAfter = parseInt(failAfterStr, 10);
-  if (isNaN(failAfter)) {
-    return false;
+  if (!/^\d+$/.test(failAfterStr)) {
+    throw new Error('INVALID_FAIL_AFTER');
   }
 
+  const failAfter = parseInt(failAfterStr, 10);
   invoiceSubmissionCount += 1;
   return invoiceSubmissionCount >= failAfter;
 }
@@ -71,11 +81,21 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const url = new URL(request.url);
-    if (shouldSimulateFailure(url)) {
-      return NextResponse.json(
-        { error: 'Simulated ERP internal server error' },
-        { status: 500 }
-      );
+    try {
+      if (shouldSimulateFailure(request, url)) {
+        return NextResponse.json(
+          { error: 'Simulated ERP internal server error' },
+          { status: 500 }
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof Error && err.message === 'INVALID_FAIL_AFTER') {
+        return NextResponse.json(
+          { error: 'Invalid fail_after parameter: must be a pure positive integer' },
+          { status: 400 }
+        );
+      }
+      throw err;
     }
 
     let body: unknown;
