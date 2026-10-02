@@ -35,6 +35,13 @@ export const getBackendUrl = (): string => {
  * (connection refused, DNS failure, TLS failure or a CORS rejection), so the UI
  * reports which backend was unreachable instead of a bare "Failed to fetch".
  *
+ * The message deliberately does not claim the server never saw the request. A
+ * rejected fetch() cannot distinguish "never arrived" from "arrived, but the
+ * browser refused the response" (CORS), and POST /agent/run only returns a run
+ * id after the agent loop has already executed on the server. Asserting "no run
+ * started" would invite a duplicate submission of side-effecting work, so the
+ * operator is told to check the run status instead.
+ *
  * Credentials embedded in the URL are stripped: this string is rendered on
  * screen and must never carry a secret.
  */
@@ -51,8 +58,9 @@ export const unreachableBackendMessage = (backendUrl: string): string => {
     displayed = backendUrl;
   }
   return (
-    `Cannot reach the backend at ${displayed}. The request never reached the server, ` +
-    'so no agent run was started. The backend may be down, or this origin may not be ' +
+    `Cannot read a response from the backend at ${displayed}. ` +
+    'The request may have reached the server, so the run status may be unknown: ' +
+    'check it before retrying. The backend may be down, or this origin may not be ' +
     'allowed by its CORS policy.'
   );
 };

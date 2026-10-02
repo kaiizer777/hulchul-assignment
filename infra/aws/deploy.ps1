@@ -62,8 +62,25 @@ $frontendUrl = if ($envDict.ContainsKey("next_public_api_url") -and $envDict["ne
     $defaultFrontendUrl
 }
 
-if ($frontendUrl -match "^(https?://)?(localhost|127\.0\.0\.1)(:\d+)?(/.*)?$") {
-    Write-Error "next_public_api_url resolves to a loopback address ('$frontendUrl'). The Lambda container would drive the remote browser at its own loopback interface. Set NEXT_PUBLIC_API_URL in backend/.env to the deployed frontend origin (for example $defaultFrontendUrl)."
+# Loopback detection must parse the host rather than match the raw string. A
+# literal comparison misses bracketed IPv6 loopback such as http://[::1]:3051 and
+# every other address in 127.0.0.0/8. [System.Uri].Host keeps the brackets around
+# an IPv6 literal, so they are stripped before comparing.
+$loopbackProbe = $frontendUrl
+if ($loopbackProbe -notmatch '^[a-zA-Z][a-zA-Z0-9+.\-]*://') {
+    # Scheme-less values stay valid input; the scheme is added only so the host
+    # can be parsed, and is never written to terraform.tfvars.json.
+    $loopbackProbe = "http://$loopbackProbe"
+}
+$frontendHost = try { ([System.Uri]$loopbackProbe).Host } catch { "" }
+$frontendHost = $frontendHost.Trim('[', ']')
+if (-not $frontendHost) {
+    # Unparseable input such as a bare "::1": compare the raw value so a malformed
+    # loopback literal still cannot reach Lambda.
+    $frontendHost = $frontendUrl.Trim('[', ']')
+}
+if ($frontendHost -eq "localhost" -or $frontendHost -eq "::1" -or $frontendHost -match "^127\.") {
+    Write-Error "next_public_api_url resolves to a loopback address ('$frontendUrl' -> host '$frontendHost'). The Lambda container would drive the remote browser at its own loopback interface. Set NEXT_PUBLIC_API_URL in backend/.env to the deployed frontend origin (for example $defaultFrontendUrl)."
     exit 1
 }
 

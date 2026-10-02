@@ -124,6 +124,33 @@ def test_deploy_script_uses_repo_root_build_context() -> None:
         "deploy.ps1 must not use backend/ as the build context"
 
 
+def test_deploy_script_rejects_loopback_frontend_urls_by_host() -> None:
+    """
+    The frontend URL guard must resolve the host instead of matching the raw string.
+
+    Regression guard: the guard was a single regex, "^(https?://)?(localhost|
+    127\\.0\\.0\\.1)(:\\d+)?(/.*)?$", which never matched a bracketed IPv6 loopback.
+    NEXT_PUBLIC_API_URL=http://[::1]:3051 was accepted and written to
+    terraform.tfvars.json, so the Lambda container drove the remote browser at its
+    own loopback interface while the deployment reported success. The regex also
+    missed the rest of 127.0.0.0/8.
+
+    PowerShell is not exercised here, so this asserts the guard is host-based: it
+    is the shape that fails this test if the regex is ever restored.
+    """
+    content = _read_repo_file("infra", "aws", "deploy.ps1")
+
+    assert "(localhost|127\\.0\\.0\\.1)" not in content, \
+        "deploy.ps1 must not detect loopback by matching a literal localhost/127.0.0.1 regex, " \
+        "which misses bracketed IPv6 loopback such as http://[::1]:3051"
+    assert "[System.Uri]" in content, \
+        "deploy.ps1 must parse the frontend URL with [System.Uri] to inspect its host"
+    assert '"::1"' in content, \
+        "deploy.ps1 must reject the IPv6 loopback literal ::1"
+    assert "^127\\." in content, \
+        "deploy.ps1 must reject the whole 127.0.0.0/8 range"
+
+
 def test_no_committed_lambda_crash_payloads() -> None:
     """
     Guard against committing captured Lambda error payloads.

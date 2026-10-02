@@ -79,10 +79,21 @@ describe('getBackendUrl', () => {
 });
 
 describe('unreachableBackendMessage', () => {
-  it('names the backend that could not be reached', () => {
+  it('names the backend whose response could not be read', () => {
     const message = unreachableBackendMessage(PRODUCTION_BACKEND_URL);
     expect(message).toContain(PRODUCTION_BACKEND_URL);
-    expect(message).toMatch(/cannot reach/i);
+    expect(message).toMatch(/cannot read a response from the backend/i);
+  });
+
+  it('does not claim the run never started, which a rejected fetch cannot establish', () => {
+    // POST /agent/run executes the agent loop before returning a run id, so a lost
+    // response can leave work executing on the server. Telling the operator no run
+    // started invites a duplicate submission of side-effecting work.
+    const message = unreachableBackendMessage(PRODUCTION_BACKEND_URL);
+    expect(message).not.toMatch(/never reached the server/i);
+    expect(message).not.toMatch(/no agent run was started/i);
+    expect(message).toMatch(/may have reached the server/i);
+    expect(message).toMatch(/check it before retrying/i);
   });
 
   it('strips credentials embedded in the URL', () => {
@@ -116,8 +127,8 @@ describe('/agent network failure reporting', () => {
   it('reports the attempted backend URL when the request never reaches the server', async () => {
     setBackendUrlEnv('https://backend.example.com');
     setHostname('hulchul-frontend.sufiyanx.workers.dev');
-    // A TypeError is what fetch() rejects with for a connection refusal, DNS
-    // failure or CORS rejection: no response was ever produced.
+    // A rejection from fetch() is what a connection refusal, DNS failure or CORS
+    // rejection produces: no response was ever delivered to the browser.
     global.fetch = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
 
     await renderPage();
@@ -127,7 +138,7 @@ describe('/agent network failure reporting', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/cannot reach the backend at https:\/\/backend\.example\.com/i)).toBeDefined();
+      expect(screen.getByText(/cannot read a response from the backend at https:\/\/backend\.example\.com/i)).toBeDefined();
     });
 
     // The bare browser message is not what the operator should be left with.
@@ -149,9 +160,57 @@ describe('/agent network failure reporting', () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText(new RegExp(`cannot reach the backend at ${PRODUCTION_BACKEND_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'))
+        screen.getByText(new RegExp(`cannot read a response from the backend at ${PRODUCTION_BACKEND_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i'))
       ).toBeDefined();
     });
+  });
+
+  it('does not blame reachability when the response arrived but its body failed with a TypeError', async () => {
+    setBackendUrlEnv('https://backend.example.com');
+    // Regression guard: a body stream that dies mid-transfer rejects as a
+    // TypeError too, exactly like a connection failure. Classifying by the
+    // thrown class alone reported "no agent run was started" for a run that the
+    // backend had in fact already executed.
+    const res = new Response(JSON.stringify({ run_id: 'run-12345678' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+    vi.spyOn(res, 'json').mockRejectedValue(new TypeError('network error'));
+    global.fetch = vi.fn().mockResolvedValue(res);
+
+    await renderPage();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /run agent/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not be read as JSON/i)).toBeDefined();
+    });
+    expect(screen.queryByText(/cannot read a response from the backend at/i)).toBeNull();
+  });
+
+  it('does not blame reachability when the response body is not JSON', async () => {
+    setBackendUrlEnv('https://backend.example.com');
+    // An edge proxy answering 200 with an HTML body is a response fault, not an
+    // unreachable backend.
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response('<html><body>Bad Gateway</body></html>', {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      })
+    );
+
+    await renderPage();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /run agent/i }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not be read as JSON/i)).toBeDefined();
+    });
+    expect(screen.queryByText(/cannot read a response from the backend at/i)).toBeNull();
   });
 
   it('surfaces the server detail for an HTTP error response instead of the unreachable message', async () => {
@@ -172,7 +231,7 @@ describe('/agent network failure reporting', () => {
     await waitFor(() => {
       expect(screen.getByText('Database pool exhausted')).toBeDefined();
     });
-    expect(screen.queryByText(/cannot reach the backend/i)).toBeNull();
+    expect(screen.queryByText(/cannot read a response from the backend at/i)).toBeNull();
   });
 
   it('starts a run and opens the step stream when the backend responds', async () => {
@@ -214,6 +273,6 @@ describe('/agent network failure reporting', () => {
     // A run id means the SSE stream is opened, which is what never happened when
     // the bundle pointed the browser at localhost.
     expect(eventSourceUrls).toContain('https://backend.example.com/agent/runs/run-12345678/stream');
-    expect(screen.queryByText(/cannot reach the backend/i)).toBeNull();
+    expect(screen.queryByText(/cannot read a response from the backend at/i)).toBeNull();
   });
 });

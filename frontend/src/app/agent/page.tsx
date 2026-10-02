@@ -92,6 +92,33 @@ const DEFAULT_GOALS = [
 ];
 
 /**
+ * Marks the case where no HTTP response was ever produced.
+ *
+ * fetch() rejects with a TypeError for connection refusal, DNS failure, TLS
+ * failure and CORS rejection, but a response body stream that dies mid-transfer
+ * also rejects with a TypeError. The thrown value's class alone therefore cannot
+ * distinguish "backend unreachable" from "backend answered, body unreadable", so
+ * the distinction is made by where the rejection happened instead.
+ */
+class BackendUnreachableError extends Error {}
+
+/**
+ * Reads the JSON body of a response that was successfully received.
+ *
+ * @param res - A response with an ok status.
+ * @returns The parsed body.
+ */
+const readJsonBody = async <T,>(res: Response): Promise<T> => {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    throw new Error(
+      `Backend returned a response that could not be read as JSON (HTTP ${res.status}).`
+    );
+  }
+};
+
+/**
  * AgentControlPage component provides the interactive UI for dispatching browser agent runs,
  * streaming real-time execution steps, managing pause/resume/approval states, and viewing screenshots.
  */
@@ -148,16 +175,21 @@ export default function AgentControlPage() {
     setVerificationError(null);
     const backendUrl = getBackendUrl();
     try {
-      const res = await fetch(`${backendUrl}/agent/runs/${runId}/verification`);
+      let res: Response;
+      try {
+        res = await fetch(`${backendUrl}/agent/runs/${runId}/verification`);
+      } catch {
+        throw new BackendUnreachableError();
+      }
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || `Failed to fetch verification report (${res.status})`);
       }
-      const data: VerificationReport = await res.json();
+      const data = await readJsonBody<VerificationReport>(res);
       setVerificationReport(data);
     } catch (err: unknown) {
       setVerificationError(
-        err instanceof TypeError
+        err instanceof BackendUnreachableError
           ? unreachableBackendMessage(backendUrl)
           : err instanceof Error
             ? err.message
@@ -192,25 +224,31 @@ export default function AgentControlPage() {
     const backendUrl = getBackendUrl();
 
     try {
-      const res = await fetch(`${backendUrl}/agent/run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal: goal.trim() }),
-      });
+      let res: Response;
+      try {
+        res = await fetch(`${backendUrl}/agent/run`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal: goal.trim() }),
+        });
+      } catch {
+        throw new BackendUnreachableError();
+      }
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || `Failed to start agent run (${res.status})`);
       }
 
-      const data = await res.json();
+      const data = await readJsonBody<{ run_id: string; status?: string }>(res);
       setRunId(data.run_id);
       setStatus(data.status || "running");
     } catch (err: unknown) {
-      // A TypeError here means fetch() never produced a response: the request
-      // failed at the network layer rather than returning an HTTP error status.
+      // Only a rejection from fetch() itself means no response was produced.
+      // A body that arrived but could not be parsed is a different fault and
+      // gets its own message, so "backend unreachable" stays trustworthy.
       setError(
-        err instanceof TypeError
+        err instanceof BackendUnreachableError
           ? unreachableBackendMessage(backendUrl)
           : err instanceof Error
             ? err.message
