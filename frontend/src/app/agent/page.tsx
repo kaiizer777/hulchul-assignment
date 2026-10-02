@@ -90,7 +90,18 @@ const DEFAULT_GOALS = [
   "Hold anything over ₹25,000 for approval"
 ];
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8051';
+const PRODUCTION_BACKEND_URL = 'https://gmruxxvvxbypxv4d74kix7l6aq0ppwmd.lambda-url.us-east-1.on.aws';
+
+const getBackendUrl = () => {
+  if (process.env.NEXT_PUBLIC_BACKEND_URL) {
+    return process.env.NEXT_PUBLIC_BACKEND_URL.replace(/\/$/, '');
+  }
+  if (typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    return PRODUCTION_BACKEND_URL;
+  }
+  return 'http://localhost:8051';
+};
+
 
 /**
  * AgentControlPage component provides the interactive UI for dispatching browser agent runs,
@@ -148,7 +159,7 @@ export default function AgentControlPage() {
     setIsFetchingVerification(true);
     setVerificationError(null);
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/verification`);
+      const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/verification`);
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.detail || `Failed to fetch verification report (${res.status})`);
@@ -184,7 +195,7 @@ export default function AgentControlPage() {
     submittedNonceRef.current = null;
 
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/run`, {
+      const res = await fetch(`${getBackendUrl()}/agent/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ goal: goal.trim() }),
@@ -215,7 +226,7 @@ export default function AgentControlPage() {
     const abortController = new AbortController();
 
     try {
-      eventSource = new EventSource(`${BACKEND_URL}/agent/runs/${runId}/stream`);
+      eventSource = new EventSource(`${getBackendUrl()}/agent/runs/${runId}/stream`);
 
       eventSource.onmessage = (event) => {
         try {
@@ -278,7 +289,7 @@ export default function AgentControlPage() {
     // Poll approval endpoint periodically while run is active or awaiting approval
     pollInterval = setInterval(async () => {
       try {
-        const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`, {
+        const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/approval`, {
           signal: abortController.signal,
         });
         if (res.ok) {
@@ -316,7 +327,7 @@ export default function AgentControlPage() {
     const endpoint = isCurrentlyPaused ? 'resume' : 'pause';
 
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/${endpoint}`, {
+      const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/${endpoint}`, {
         method: 'POST',
       });
       if (!res.ok) throw new Error(`Failed to ${endpoint} run`);
@@ -338,7 +349,7 @@ export default function AgentControlPage() {
     submittedNonceRef.current = approvalData.nonce;
 
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`, {
+      const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/approval`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -369,7 +380,7 @@ export default function AgentControlPage() {
     if (!stepIdentifier) return;
     setIsFetchingScreenshot(true);
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/steps/${stepIdentifier}`);
+      const res = await fetch(`${getBackendUrl()}/agent/steps/${stepIdentifier}`);
       if (!res.ok) throw new Error('Failed to load screenshot');
       const data = await res.json();
       if (data.screenshot_b64) {

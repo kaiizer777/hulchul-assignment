@@ -9,3 +9,5 @@ binding = "ASSETS"
 
 [vars]
 NEXT_PUBLIC_BACKEND_URL = "https://gmruxxvvxbypxv4d74kix7l6aq0ppwmd.lambda-url.us-east-1.on.aws/"
+NEXT_PUBLIC_API_URL = "https://hulchul-frontend.sufiyanx.workers.dev"
+
