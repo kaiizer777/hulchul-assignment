@@ -47,10 +47,17 @@ resource "aws_lambda_function_url" "backend" {
   }
 }
 
-resource "aws_lambda_permission" "url_public_access" {
+resource "aws_lambda_permission" "public_function_url" {
   statement_id           = "FunctionURLAllowPublicAccess"
   action                 = "lambda:InvokeFunctionUrl"
   function_name          = aws_lambda_function.backend.function_name
   principal              = "*"
   function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "public_function_invoke" {
+  statement_id  = "AllowPublicLambdaFunctionUrl"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.backend.function_name
+  principal     = "*"
 }
