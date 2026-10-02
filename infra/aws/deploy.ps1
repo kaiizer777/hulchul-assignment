@@ -67,8 +67,8 @@ Write-Host "Initializing Terraform..." -ForegroundColor Cyan
 Assert-LastExitCode "terraform init"
 
 Write-Host "Applying Terraform to create ECR repository..." -ForegroundColor Cyan
-& $terraformPath apply -target=aws_ecr_repository.backend -auto-approve
-Assert-LastExitCode "terraform apply -target=aws_ecr_repository.backend"
+& $terraformPath apply -target aws_ecr_repository.backend -auto-approve
+Assert-LastExitCode "terraform apply -target aws_ecr_repository.backend"
 
 $ecrUrl = & $terraformPath output -raw ecr_repository_url
 Assert-LastExitCode "terraform output -raw ecr_repository_url"
