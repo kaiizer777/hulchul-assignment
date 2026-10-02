@@ -7,3 +7,5 @@ asyncpg
 httpx
 pytest
 pytest-asyncio
+sse-starlette
+

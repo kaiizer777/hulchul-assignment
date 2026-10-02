@@ -1,15 +1,58 @@
+import asyncio
+import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set
 from fastapi import FastAPI, Depends, status, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import asyncpg
+from sse_starlette.sse import EventSourceResponse
 
 from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
+
+
+class RunEventHub:
+    """
+    Manages active per-run asynchronous event queues for real-time Server-Sent Events (SSE) streaming.
+    Provides publish, subscribe, and unsubscribe operations for agent runs.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the run event hub subscriber registry dictionary."""
+        self._subscribers: Dict[str, Set[asyncio.Queue]] = {}
+
+    def subscribe(self, run_id: str) -> asyncio.Queue:
+        """Subscribe and return a new asynchronous event queue for the specified run ID."""
+        q = asyncio.Queue()
+        if run_id not in self._subscribers:
+            self._subscribers[run_id] = set()
+        self._subscribers[run_id].add(q)
+        return q
+
+    def unsubscribe(self, run_id: str, q: asyncio.Queue) -> None:
+        """Unsubscribe and discard an asynchronous event queue from the specified run ID."""
+        if run_id in self._subscribers:
+            self._subscribers[run_id].discard(q)
+            if not self._subscribers[run_id]:
+                del self._subscribers[run_id]
+
+    async def publish(self, run_id: str, event: Dict[str, Any]) -> None:
+        """Publish an event dictionary to all active subscriber queues for the specified run ID."""
+        if run_id in self._subscribers:
+            for q in list(self._subscribers[run_id]):
+                try:
+                    await q.put(event)
+                except Exception:
+                    pass
+
+
+run_event_hub = RunEventHub()
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -274,7 +317,7 @@ class AgentSessionStateResponse(BaseModel):
 
 @app.post("/agent/run", response_model=AgentRunResponse)
 async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
-    """Execute the ReAct agent loop for a given goal."""
+    """Execute the ReAct agent loop for a given goal with real-time event broadcasting."""
     from backend.browser import get_browser_session
     from backend.tools import PlaywrightTools
     from backend.agent import ReActAgent
@@ -282,7 +325,12 @@ async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
     run_id_str = str(payload.run_id) if payload.run_id else None
     async with get_browser_session() as session:
         tools = PlaywrightTools(page=session.page, run_id=run_id_str)
-        agent = ReActAgent(run_id=run_id_str, tools=tools)
+
+        async def handle_agent_event(event: Dict[str, Any]) -> None:
+            """Forward agent events to the global run event hub for SSE broadcasting."""
+            await run_event_hub.publish(agent.run_id, event)
+
+        agent = ReActAgent(run_id=run_id_str, tools=tools, on_event=handle_agent_event)
         result = await agent.run(goal=payload.goal)
 
     return AgentRunResponse(
@@ -501,5 +549,93 @@ async def get_agent_state(run_id: str) -> AgentSessionStateResponse:
         run_id=run_id,
         state=state,
     )
+
+
+@app.get("/agent/runs/{run_id}/stream", response_class=EventSourceResponse)
+async def stream_agent_run_endpoint(run_id: uuid.UUID) -> EventSourceResponse:
+    """
+    Server-Sent Events (SSE) streaming endpoint: GET /agent/runs/{run_id}/stream.
+    Streams structured real-time agent execution events and history playback from Neon DB.
+    """
+    run_id_str = str(run_id)
+
+    async def event_generator():
+        """Asynchronous generator yielding historical and live SSE events."""
+        # 1. History playback from Neon database
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as conn:
+                run_row = await conn.fetchrow(
+                    "SELECT run_id, goal, status, created_at FROM agent_runs WHERE run_id = $1;",
+                    run_id,
+                )
+                if run_row:
+                    yield {
+                        "event": "status_change",
+                        "data": json.dumps({
+                            "type": "status_change",
+                            "run_id": run_id_str,
+                            "status": run_row["status"],
+                            "timestamp": run_row["created_at"].isoformat(),
+                        })
+                    }
+
+                step_rows = await conn.fetch(
+                    """
+                    SELECT step_id, action, result, screenshot_b64, timestamp
+                    FROM agent_steps
+                    WHERE run_id = $1
+                    ORDER BY timestamp ASC;
+                    """,
+                    run_id,
+                )
+                for idx, r in enumerate(step_rows, start=1):
+                    res_str = r["result"] or ""
+                    is_fail = "failed" in res_str.lower() or "aborted" in res_str.lower()
+                    event_type = "step_failed" if is_fail else "step_complete"
+                    event_data = {
+                        "type": event_type,
+                        "run_id": run_id_str,
+                        "step_index": idx,
+                        "action": r["action"],
+                        "result": res_str,
+                        "timestamp": r["timestamp"].isoformat(),
+                        "has_screenshot": bool(r["screenshot_b64"]),
+                    }
+                    if is_fail:
+                        event_data["error"] = res_str
+                    yield {
+                        "event": event_type,
+                        "data": json.dumps(event_data)
+                    }
+        except Exception as db_err:
+            logger.warning(f"Error fetching historical steps for SSE stream {run_id_str}: {db_err}")
+
+        # 2. Live event queue subscription
+        queue = run_event_hub.subscribe(run_id_str)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    event_type = event.get("type", "message")
+                    yield {
+                        "event": event_type,
+                        "data": json.dumps(event)
+                    }
+                except asyncio.TimeoutError:
+                    # Keep-alive ping event / comment
+                    yield {
+                        "event": "ping",
+                        "data": json.dumps({
+                            "type": "ping",
+                            "run_id": run_id_str,
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        })
+                    }
+        finally:
+            run_event_hub.unsubscribe(run_id_str, queue)
+
+    return EventSourceResponse(event_generator())
+
 
 
