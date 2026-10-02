@@ -21,6 +21,8 @@ jobs:
         with:
           node-version: '20'
 
+        # Fresh run trigger
+
       - name: Install Dependencies
         working-directory: ./frontend
         run: npm install --legacy-peer-deps
