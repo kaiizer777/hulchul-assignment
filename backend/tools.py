@@ -317,12 +317,12 @@ async def resolve_locator(
 async def navigate(page: Page, url: str) -> Dict[str, Any]:
     """
     Navigate the browser to a destination URL. Resolves relative paths
-    against NEXT_PUBLIC_API_URL or default http://localhost:3000.
+    against NEXT_PUBLIC_API_URL or default http://localhost:3051.
     """
     try:
         target_url = url.strip()
         if target_url.startswith("/"):
-            base = settings.NEXT_PUBLIC_API_URL or "http://localhost:3000"
+            base = settings.NEXT_PUBLIC_API_URL or "http://localhost:3051"
             target_url = urljoin(base, target_url)
 
         logger.info(f"Tool navigate: heading to {target_url}")

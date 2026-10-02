@@ -257,13 +257,13 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
 
         mock_tools.read_page = AsyncMock(return_value={
             "success": True,
-            "url": "http://localhost:3000/invoices/new",
+            "url": "http://localhost:3051/invoices/new",
             "title": "New Invoice",
             "snapshot": "- input 'Amount'\n- button 'Create Invoice'",
             "size_bytes": 1200,
         })
         mock_tools.execute = AsyncMock(side_effect=[
-            {"success": True, "url": "http://localhost:3000/invoices/new", "status": 200},
+            {"success": True, "url": "http://localhost:3051/invoices/new", "status": 200},
             {"success": True, "selector": "Vendor", "selected": "Acme Corp"},
             {"success": True, "selector": "Amount", "value": "35000"},
             {"success": True, "selector": "Create Invoice", "clicked": True},

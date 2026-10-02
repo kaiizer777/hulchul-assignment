@@ -90,7 +90,7 @@ const DEFAULT_GOALS = [
   "Hold anything over ₹25,000 for approval"
 ];
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8051';
 
 /**
  * AgentControlPage component provides the interactive UI for dispatching browser agent runs,

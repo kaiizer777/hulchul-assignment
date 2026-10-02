@@ -92,7 +92,7 @@ describe('API Route Unit Tests', () => {
       mockSql.mockResolvedValueOnce([createdRow]);
 
       const { POST } = await import('@/app/api/invoices/route');
-      const request = new Request('http://localhost:3000/api/invoices', {
+      const request = new Request('http://localhost:3051/api/invoices', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -114,7 +114,7 @@ describe('API Route Unit Tests', () => {
 
     it('returns status 400 for invalid payload', async () => {
       const { POST } = await import('@/app/api/invoices/route');
-      const request = new Request('http://localhost:3000/api/invoices', {
+      const request = new Request('http://localhost:3051/api/invoices', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ vendor: '', amount: -50, date: 'invalid-date' }),

@@ -93,7 +93,7 @@ DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
 UPSTASH_REDIS_REST_URL=https://your-redis.upstash.io
 UPSTASH_REDIS_REST_TOKEN=your_redis_token
 BROWSER_WS_ENDPOINT=wss://chrome.browserless.io?token=your_token
-NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_API_URL=http://localhost:8051
 SIMULATE_FAILURE_AFTER=
 ```
 
@@ -113,14 +113,14 @@ cd ..
   cd frontend
   npm run dev
   ```
-  Runs on `http://localhost:3000`.
+  Runs on `http://localhost:3051`.
 
 - **Start FastAPI Orchestrator (Backend)**:
   ```bash
   cd backend
-  uvicorn main:app --reload --port 8000
+  uvicorn main:app --reload --port 8051
   ```
-  Runs on `http://localhost:8000` (API docs at `http://localhost:8000/docs`).
+  Runs on `http://localhost:8051` (API docs at `http://localhost:8051/docs`).
 
 ---
 
@@ -133,7 +133,7 @@ cd ..
 | `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL for session and approval gates | Yes | None |
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST token | Yes | None |
 | `BROWSER_WS_ENDPOINT` | WebSocket CDP endpoint for remote browser (Browserless/Steel.dev) | Yes | None |
-| `NEXT_PUBLIC_API_URL` | FastAPI backend URL consumed by Next.js Control UI | Yes | `http://localhost:8000` |
+| `NEXT_PUBLIC_API_URL` | FastAPI backend URL consumed by Next.js Control UI | Yes | `http://localhost:8051` |
 | `SIMULATE_FAILURE_AFTER` | Simulates ERP 500 error after N invoice submissions for recovery testing | No | Empty (Disabled) |
 
 ---

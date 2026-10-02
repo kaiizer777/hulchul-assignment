@@ -12,7 +12,7 @@ from backend.main import get_allowed_origins
 def test_dockerfile_exists_and_configured() -> None:
     """
     Verify that backend/Dockerfile exists and contains AWS Lambda Web Adapter,
-    AWS_LWA_ENABLE_COMPRESSION=false, and PORT=8000 configurations.
+    AWS_LWA_ENABLE_COMPRESSION=false, and PORT=8051 configurations.
     """
     dockerfile_path = os.path.join(os.path.dirname(__file__), "..", "Dockerfile")
     assert os.path.exists(dockerfile_path), "backend/Dockerfile must exist"
@@ -24,8 +24,8 @@ def test_dockerfile_exists_and_configured() -> None:
         "Dockerfile must reference AWS Lambda Web Adapter"
     assert "AWS_LWA_ENABLE_COMPRESSION=false" in content, \
         "Dockerfile must set AWS_LWA_ENABLE_COMPRESSION=false for unbuffered SSE streaming"
-    assert "PORT=8000" in content, \
-        "Dockerfile must set PORT=8000"
+    assert "PORT=8051" in content, \
+        "Dockerfile must set PORT=8051"
     assert "response_stream" in content, \
         "Dockerfile must set AWS_LWA_INVOKE_MODE=response_stream"
 
@@ -80,4 +80,4 @@ def test_dynamic_cors_parsing() -> None:
     origins = get_allowed_origins()
     assert isinstance(origins, list)
     assert len(origins) > 0
-    assert "http://localhost:3000" in origins
+    assert "http://localhost:3051" in origins

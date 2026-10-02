@@ -22,11 +22,11 @@ class Settings:
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
     UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-    NEXT_PUBLIC_API_URL: str = os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3000")
-    PORT: int = int(os.getenv("PORT", "8000"))
+    NEXT_PUBLIC_API_URL: str = os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3051")
+    PORT: int = int(os.getenv("PORT", "8051"))
     CORS_ORIGINS: str = os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,https://*.pages.dev,*"
+        "http://localhost:3051,http://127.0.0.1:3051,https://*.pages.dev,*"
     )
     SIMULATE_FAILURE_AFTER: Optional[int] = (
         int(os.getenv("SIMULATE_FAILURE_AFTER"))

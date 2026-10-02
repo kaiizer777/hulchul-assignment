@@ -321,7 +321,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         # Return page snapshots
         mock_tools.read_page = AsyncMock(return_value={
             "success": True,
-            "url": "http://localhost:3000/invoices/new",
+            "url": "http://localhost:3051/invoices/new",
             "title": "Create Invoice",
             "snapshot": "- button 'Create Invoice'\n- textbox 'Amount'\n- textbox 'PO Number'",
         })
@@ -434,7 +434,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         mock_tools.read_page = AsyncMock(return_value={
             "success": True,
-            "url": "http://localhost:3000/invoices/new",
+            "url": "http://localhost:3051/invoices/new",
             "snapshot": "- button 'Create Invoice'",
         })
         mock_tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})

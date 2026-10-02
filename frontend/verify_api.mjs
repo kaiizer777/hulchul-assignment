@@ -1,6 +1,6 @@
 import { neon } from '@neondatabase/serverless';
 
-const BASE_URL = 'http://localhost:3000';
+const BASE_URL = 'http://localhost:3051';
 const DATABASE_URL = process.env.DATABASE_URL;
 
 async function runTests() {
