@@ -48,7 +48,7 @@ foreach ($line in $envContent) {
 $corsOrigins = if ($envDict.ContainsKey("cors_origins") -and $envDict["cors_origins"]) {
     $envDict["cors_origins"]
 } else {
-    "http://localhost:3051,http://127.0.0.1:3051"
+    "http://localhost:3051,http://127.0.0.1:3051,https://hulchul-frontend.sufiyanx.workers.dev"
 }
 
 $tfvarsObj = @{
