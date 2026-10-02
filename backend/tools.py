@@ -375,7 +375,7 @@ async def read_page(page: Page) -> Dict[str, Any]:
 async def click(page: Page, selector: str) -> Dict[str, Any]:
     """
     Click an interactive element by accessibility label, button/link name, or selector.
-    Retries with force=True if standard stability/click timeout occurs.
+    Verifies element attachment and visibility before retrying with force=True on click failure.
     """
     try:
         logger.info(f"Tool click: resolving selector '{selector}'")
@@ -383,8 +383,23 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
         try:
             await locator.click(timeout=5000)
         except Exception as ce:
-            logger.warning(f"Standard click timed out or failed on '{selector}', retrying with force=True: {ce}")
-            await locator.click(force=True, timeout=5000)
+            logger.warning(f"Standard click failed on selector '{selector}': {ce}")
+            # Verify element is attached and visible before considering force retry
+            is_attached = await locator.count() > 0
+            is_visible = False
+            if is_attached:
+                try:
+                    is_visible = await locator.is_visible()
+                except Exception:
+                    pass
+
+            if is_attached and is_visible:
+                logger.info(f"Retrying click with force=True on verified attached/visible element '{selector}'")
+                await locator.click(force=True, timeout=5000)
+            else:
+                logger.error(f"Element for selector '{selector}' is not attached or not visible; aborting forced click retry.")
+                raise ce
+
         # Small settle delay for DOM transitions
         await asyncio.sleep(0.2)
 
