@@ -48,7 +48,7 @@ foreach ($line in $envContent) {
 $corsOrigins = if ($envDict.ContainsKey("cors_origins") -and $envDict["cors_origins"]) {
     $envDict["cors_origins"]
 } else {
-    "http://localhost:3051,http://127.0.0.1:3051,https://*"
+    "http://localhost:3051,http://127.0.0.1:3051,https://hulchul-frontend.sufiyanx.workers.dev"
 }
 
 $tfvarsObj = @{
@@ -111,9 +111,6 @@ Assert-LastExitCode "docker push timestamp"
 docker push "${ecrDomain}:latest"
 Assert-LastExitCode "docker push latest"
 
-Write-Host "Cleaning up any stale AWS Lambda permissions..." -ForegroundColor Cyan
-aws lambda remove-permission --function-name hulchul-backend --statement-id FunctionURLAllowPublicAccess 2>$null
-aws lambda remove-permission --function-name hulchul-backend --statement-id AllowPublicLambdaFunctionUrl 2>$null
 
 Write-Host "Applying remaining Terraform infrastructure with image_tag=$imageTag..." -ForegroundColor Cyan
 & $terraformPath apply -var="image_tag=$imageTag" -auto-approve
