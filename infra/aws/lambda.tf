@@ -39,7 +39,7 @@ resource "aws_lambda_function_url" "backend" {
 
   cors {
     allow_credentials = true
-    allow_origins     = [var.cors_origins]
+    allow_origins     = [for origin in split(",", var.cors_origins) : trimspace(origin) if trimspace(origin) != ""]
     allow_methods     = ["*"]
     allow_headers     = ["*"]
     expose_headers    = ["*"]

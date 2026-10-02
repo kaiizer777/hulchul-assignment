@@ -32,6 +32,7 @@ yarn-error.log*
 Thumbs.db
 
 # Terraform
-.terraform*
+.terraform/
 *.tfstate*
 terraform.tfvars
+
