@@ -83,12 +83,6 @@ $registryHost = $ecrDomain.Split('/')[0]
 $pass | docker login --username AWS --password-stdin $registryHost
 Assert-LastExitCode "docker login"
 
-Write-Host "Logging into AWS Public ECR for lambda-adapter..." -ForegroundColor Cyan
-$publicPass = aws ecr-public get-login-password --region us-east-1
-if ($LASTEXITCODE -eq 0) {
-    $publicPass | docker login --username AWS --password-stdin public.ecr.aws
-}
-
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
 Write-Host "Building Docker image with tag $imageTag..." -ForegroundColor Cyan
 docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
