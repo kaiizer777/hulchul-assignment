@@ -3,9 +3,13 @@
 import React, { useState, useEffect, useRef, useTransition } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
 
+/**
+ * Interface representing a recorded agent step event.
+ */
 interface StepEvent {
   type: string;
   run_id: string;
+  step_id?: string;
   step_index?: number;
   action: string;
   result?: string;
@@ -14,6 +18,9 @@ interface StepEvent {
   error?: string;
 }
 
+/**
+ * Interface representing approval gate details.
+ */
 interface ApprovalData {
   run_id: string;
   status: string;
@@ -33,6 +40,10 @@ const DEFAULT_GOALS = [
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
 
+/**
+ * AgentControlPage component provides the interactive UI for dispatching browser agent runs,
+ * streaming real-time execution steps, managing pause/resume/approval states, and viewing screenshots.
+ */
 export default function AgentControlPage() {
   const [goal, setGoal] = useState("Process all pending invoices");
   const [runId, setRunId] = useState<string | null>(null);
@@ -45,6 +56,7 @@ export default function AgentControlPage() {
   // Approval Modal State
   const [approvalData, setApprovalData] = useState<ApprovalData | null>(null);
   const [isSubmittingApproval, setIsSubmittingApproval] = useState(false);
+  const submittedNonceRef = useRef<string | null>(null);
 
   // Screenshot Modal State
   const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
@@ -54,7 +66,9 @@ export default function AgentControlPage() {
   const logContainerRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
-  // Handle scroll to check manual scroll pause
+  /**
+   * Handles manual scroll container interaction to pause or resume auto-scrolling of step logs.
+   */
   const handleScroll = () => {
     if (!logContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
@@ -69,15 +83,19 @@ export default function AgentControlPage() {
     }
   }, [steps, autoScroll]);
 
-  // Start Agent Run
+  /**
+   * Dispatches a new agent run with the specified goal instruction.
+   * Prevents starting while running, paused, or awaiting approval.
+   */
   const handleRunAgent = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!goal.trim() || isStarting) return;
+    if (!goal.trim() || isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval') return;
 
     setIsStarting(true);
     setError(null);
     setSteps([]);
     setStatus("running");
+    submittedNonceRef.current = null;
 
     try {
       const res = await fetch(`${BACKEND_URL}/agent/run`, {
@@ -108,6 +126,7 @@ export default function AgentControlPage() {
 
     let eventSource: EventSource | null = null;
     let pollInterval: NodeJS.Timeout | null = null;
+    const abortController = new AbortController();
 
     try {
       eventSource = new EventSource(`${BACKEND_URL}/agent/runs/${runId}/stream`);
@@ -148,9 +167,16 @@ export default function AgentControlPage() {
         } catch (e) {}
       });
 
+      eventSource.addEventListener('done', (event: MessageEvent) => {
+        setStatus('done');
+      });
+
       eventSource.addEventListener('needs_approval', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
+          if (data.nonce && data.nonce === submittedNonceRef.current) {
+            return;
+          }
           setStatus('awaiting_approval');
           setApprovalData(data);
         } catch (e) {}
@@ -166,24 +192,37 @@ export default function AgentControlPage() {
     // Poll approval endpoint periodically while run is active or awaiting approval
     pollInterval = setInterval(async () => {
       try {
-        const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`);
+        const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`, {
+          signal: abortController.signal,
+        });
         if (res.ok) {
           const data = await res.json();
           if (data.pending && data.approval_data) {
+            const nonce = data.approval_data.nonce;
+            if (nonce && nonce === submittedNonceRef.current) {
+              return;
+            }
             setStatus('awaiting_approval');
             setApprovalData(data.approval_data);
           }
         }
-      } catch (e) {}
+      } catch (e: any) {
+        if (e.name !== 'AbortError') {
+          // ignore
+        }
+      }
     }, 2500);
 
     return () => {
+      abortController.abort();
       if (eventSource) eventSource.close();
       if (pollInterval) clearInterval(pollInterval);
     };
   }, [runId]);
 
-  // Pause / Resume handler
+  /**
+   * Toggles the pause or resume state of the active agent run.
+   */
   const handleTogglePause = async () => {
     if (!runId || isPausingOrResuming) return;
     setIsPausingOrResuming(true);
@@ -203,10 +242,14 @@ export default function AgentControlPage() {
     }
   };
 
-  // Approval Action (Approve / Reject)
+  /**
+   * Submits human approval decision ('approved' or 'rejected') for the pending approval gate.
+   * @param decision - The approval decision to submit.
+   */
   const handleApprovalDecision = async (decision: 'approved' | 'rejected') => {
-    if (!runId || isSubmittingApproval) return;
+    if (!runId || isSubmittingApproval || !approvalData?.nonce) return;
     setIsSubmittingApproval(true);
+    submittedNonceRef.current = approvalData.nonce;
 
     try {
       const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`, {
@@ -214,7 +257,7 @@ export default function AgentControlPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           decision,
-          nonce: approvalData?.nonce,
+          nonce: approvalData.nonce,
         }),
       });
 
@@ -232,11 +275,15 @@ export default function AgentControlPage() {
     }
   };
 
-  // Fetch Step Screenshot
-  const handleViewScreenshot = async (stepId: string) => {
+  /**
+   * Fetches and displays the screenshot associated with a specific step ID or index.
+   * @param stepIdentifier - The unique step ID or step index identifier.
+   */
+  const handleViewScreenshot = async (stepIdentifier?: string) => {
+    if (!stepIdentifier) return;
     setIsFetchingScreenshot(true);
     try {
-      const res = await fetch(`${BACKEND_URL}/agent/steps/${stepId}`);
+      const res = await fetch(`${BACKEND_URL}/agent/steps/${stepIdentifier}`);
       if (!res.ok) throw new Error('Failed to load screenshot');
       const data = await res.json();
       if (data.screenshot_b64) {
@@ -343,7 +390,7 @@ export default function AgentControlPage() {
 
             <button
               type="submit"
-              disabled={isStarting || status === 'running'}
+              disabled={isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval'}
               className="inline-flex items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-zinc-950 bg-gradient-to-b from-zinc-800 to-zinc-900 px-5 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_2px_4px_rgba(0,0,0,0.2)] transition-all hover:from-zinc-750 hover:to-zinc-850 active:translate-y-[0.5px] disabled:opacity-50 dark:border-t-white dark:border-x-zinc-200 dark:border-b-zinc-400 dark:from-zinc-100 dark:to-zinc-200 dark:text-zinc-900 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_2px_4px_rgba(0,0,0,0.1)]"
             >
               {isStarting ? (
@@ -442,7 +489,7 @@ export default function AgentControlPage() {
                     <div className="flex items-center gap-3">
                       {st.has_screenshot && (
                         <button
-                          onClick={() => st.step_index && handleViewScreenshot(st.step_index.toString())}
+                          onClick={() => handleViewScreenshot(st.step_id || st.step_index?.toString() || (idx + 1).toString())}
                           disabled={isFetchingScreenshot}
                           className="inline-flex items-center gap-1 rounded bg-zinc-200/80 px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:bg-zinc-300 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
                         >
@@ -492,28 +539,30 @@ export default function AgentControlPage() {
             <div className="my-5 rounded-xl border border-zinc-200/80 bg-zinc-50 p-4 space-y-2.5 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-950/60">
               <div className="flex justify-between">
                 <span className="text-zinc-500 dark:text-zinc-400">Vendor:</span>
-                <span className="font-bold text-zinc-900 dark:text-zinc-100">{approvalData?.vendor || 'Acme Corp'}</span>
+                <span className="font-bold text-zinc-900 dark:text-zinc-100">{approvalData?.vendor || '—'}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500 dark:text-zinc-400">Invoice Amount:</span>
                 <span className="font-bold text-emerald-600 dark:text-emerald-400">
-                  ₹{approvalData?.amount?.toLocaleString() || '50,000'}
+                  {approvalData?.amount != null ? `₹${approvalData.amount.toLocaleString()}` : '—'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500 dark:text-zinc-400">PO Number:</span>
-                <span className="text-zinc-900 dark:text-zinc-100">{approvalData?.po_number || 'PO-1001'}</span>
+                <span className="text-zinc-900 dark:text-zinc-100">{approvalData?.po_number || '—'}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500 dark:text-zinc-400">Threshold:</span>
-                <span className="text-zinc-900 dark:text-zinc-100">₹{approvalData?.threshold?.toLocaleString() || '25,000'}</span>
+                <span className="text-zinc-900 dark:text-zinc-100">
+                  {approvalData?.threshold != null ? `₹${approvalData.threshold.toLocaleString()}` : '—'}
+                </span>
               </div>
             </div>
 
             <div className="flex items-center justify-end gap-3 pt-2">
               <button
                 type="button"
-                disabled={isSubmittingApproval}
+                disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
                 onClick={() => handleApprovalDecision('rejected')}
                 className="rounded-xl border border-rose-300 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-800 hover:bg-rose-100 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-300 disabled:opacity-50"
               >
@@ -522,7 +571,7 @@ export default function AgentControlPage() {
 
               <button
                 type="button"
-                disabled={isSubmittingApproval}
+                disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
                 onClick={() => handleApprovalDecision('approved')}
                 className="rounded-xl border border-emerald-300 bg-emerald-600 px-5 py-2.5 text-xs font-semibold text-white shadow-md hover:bg-emerald-700 dark:border-emerald-700 dark:bg-emerald-600 dark:hover:bg-emerald-700 disabled:opacity-50"
               >

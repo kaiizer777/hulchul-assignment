@@ -596,6 +596,7 @@ async def stream_agent_run_endpoint(run_id: uuid.UUID) -> EventSourceResponse:
                     event_data = {
                         "type": event_type,
                         "run_id": run_id_str,
+                        "step_id": str(r["step_id"]),
                         "step_index": idx,
                         "action": r["action"],
                         "result": res_str,

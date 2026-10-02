@@ -8,6 +8,9 @@ const NAV_ITEMS = [
   { href: '/agent', label: 'Agent Control' },
 ];
 
+/**
+ * Navbar component renders the top navigation header with ERP operations links and live sync status indicator.
+ */
 export function Navbar() {
   return (
     <header className="sticky top-0 z-40 w-full border-b border-zinc-200 bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80 dark:border-zinc-800 dark:bg-zinc-950/95 dark:supports-[backdrop-filter]:bg-zinc-950/80">
