@@ -134,7 +134,53 @@ cd ..
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST token | Yes | None |
 | `BROWSER_WS_ENDPOINT` | WebSocket CDP endpoint for remote browser (Browserless/Steel.dev) | Yes | None |
 | `NEXT_PUBLIC_API_URL` | ERP frontend base URL used for backend navigation | Yes | `http://localhost:3051` |
+| `NEXT_PUBLIC_BACKEND_URL` | Backend base URL inlined into the **client bundle at build time**. Must be set when building for Cloudflare. A `[vars]` entry of the same name in `wrangler.toml` is a runtime Worker binding and is **not** visible to the browser | Yes (for Cloudflare builds) | Production Lambda URL via `frontend/.env.production` |
 | `SIMULATE_FAILURE_AFTER` | Simulates ERP 500 error after N invoice submissions for recovery testing | No | Empty (Disabled) |
+
+---
+
+## Deployment
+
+### Frontend (Cloudflare Worker)
+
+```bash
+cd frontend
+npm run deploy:cloudflare
+```
+
+This builds the OpenNext bundle, asserts that `NEXT_PUBLIC_BACKEND_URL` was actually
+inlined into a client chunk (`npm run verify:cloudflare`), and only then deploys with
+Wrangler. Run the three steps separately while iterating:
+
+```bash
+npm run build:cloudflare
+npm run verify:cloudflare
+npx wrangler deploy
+```
+
+### Backend (AWS Lambda via ECR)
+
+```powershell
+cd infra/aws
+.\deploy.ps1
+```
+
+The Docker build uses the **repository root** as its context so that the `backend`
+package layout is preserved inside the image.
+
+#### Manual gate: container image import check
+
+CI cannot run Docker, so the image layout is asserted statically in
+`backend/tests/test_phase7_deploy.py`. After changing `backend/Dockerfile` or the build
+context, run the behavioural check by hand before deploying:
+
+```bash
+docker build -t hulchul-backend:check -f backend/Dockerfile .
+docker run --rm --entrypoint python hulchul-backend:check -c "import backend.main"
+```
+
+A failure here means `from backend.config import settings` cannot resolve inside the
+image, and every Lambda endpoint will return `Extension.Crash`.
 
 ---
 

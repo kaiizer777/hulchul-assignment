@@ -1,0 +1,42 @@
+# Build context for backend/Dockerfile is the repository root so that the
+# `backend` package layout is preserved inside the image. Everything below is
+# either not needed to build the backend image, or must never be baked into it.
+
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Secrets: the Lambda function receives all configuration through environment
+# variables set in infra/aws/lambda.tf, so no .env file is needed at runtime.
+# Baking these into the image would publish live credentials to ECR.
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python
+**/__pycache__
+**/*.py[cod]
+.venv
+**/.venv
+.pytest_cache
+**/.pytest_cache
+
+# Node / Next.js build output
+frontend/node_modules
+frontend/.next
+frontend/.open-next
+frontend/.wrangler
+frontend/coverage
+**/node_modules
+**/.next
+**/.open-next
+**/coverage
+
+# Terraform state and variables hold live credentials
+infra
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.log

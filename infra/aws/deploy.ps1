@@ -51,13 +51,36 @@ $corsOrigins = if ($envDict.ContainsKey("cors_origins") -and $envDict["cors_orig
     "http://localhost:3051,http://127.0.0.1:3051,https://hulchul-frontend.sufiyanx.workers.dev"
 }
 
+# NEXT_PUBLIC_API_URL is the ERP base URL that the agent's remote browser is
+# navigated to from inside the Lambda container. A loopback address there points
+# at the container itself, so a local development value must never reach Lambda.
+$defaultFrontendUrl = "https://hulchul-frontend.sufiyanx.workers.dev"
+$frontendUrl = if ($envDict.ContainsKey("next_public_api_url") -and $envDict["next_public_api_url"]) {
+    $envDict["next_public_api_url"]
+} else {
+    Write-Host "backend/.env has no next_public_api_url; defaulting to $defaultFrontendUrl" -ForegroundColor Yellow
+    $defaultFrontendUrl
+}
+
+if ($frontendUrl -match "^(https?://)?(localhost|127\.0\.0\.1)(:\d+)?(/.*)?$") {
+    Write-Error "next_public_api_url resolves to a loopback address ('$frontendUrl'). The Lambda container would drive the remote browser at its own loopback interface. Set NEXT_PUBLIC_API_URL in backend/.env to the deployed frontend origin (for example $defaultFrontendUrl)."
+    exit 1
+}
+
+# Terraform loads terraform.tfvars.json after terraform.tfvars, so the generated
+# JSON wins. A hand-written terraform.tfvars is therefore inert but looks
+# authoritative, which silently misleads whoever edits it next.
+if (Test-Path "terraform.tfvars") {
+    Write-Host "WARNING: infra/aws/terraform.tfvars exists and is shadowed by the generated terraform.tfvars.json. Edits to it have no effect." -ForegroundColor Yellow
+}
+
 $tfvarsObj = @{
     database_url             = $envDict["database_url"]
     groq_api_key             = $envDict["groq_api_key"]
     upstash_redis_rest_url   = $envDict["upstash_redis_rest_url"]
     upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
     browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
-    frontend_url             = $envDict["next_public_api_url"]
+    frontend_url             = $frontendUrl
     cors_origins             = $corsOrigins
 }
 
@@ -94,7 +117,7 @@ if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCO
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
 Write-Host "Building Docker image with tag $imageTag (provenance=false)..." -ForegroundColor Cyan
-docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../backend
+docker build --provenance=false -t hulchul-backend -f ../../backend/Dockerfile ../../
 Assert-LastExitCode "docker build"
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
