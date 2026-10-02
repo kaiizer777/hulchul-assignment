@@ -44,7 +44,7 @@ Write-Host "Initializing Terraform..." -ForegroundColor Cyan
 Write-Host "Applying Terraform to create ECR repository..." -ForegroundColor Cyan
 & 'C:\Terraform\terraform.exe' apply -target="aws_ecr_repository.backend" -auto-approve
 
-$ecrUrl = (& 'C:\Terraform\terraform.exe' output -raw ecr_repository_url).Trim()
+$ecrUrl = ((& 'C:\Terraform\terraform.exe' output -raw ecr_repository_url) -replace "`r","" -replace "`n","").Trim()
 Write-Host "ECR Repository URL: $ecrUrl" -ForegroundColor Green
 
 if ([string]::IsNullOrWhiteSpace($ecrUrl)) {
