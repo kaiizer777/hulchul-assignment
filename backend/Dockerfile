@@ -11,16 +11,15 @@ WORKDIR /app
 ENV PORT=8051
 ENV AWS_LWA_ENABLE_COMPRESSION=false
 ENV AWS_LWA_INVOKE_MODE=response_stream
-ENV PYTHONPATH=/app
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code into backend package directory
-COPY . /app/backend/
+# Copy application code
+COPY . .
 
 EXPOSE 8051
 
 # Start Uvicorn ASGI server
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8051"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8051"]
