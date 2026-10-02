@@ -188,7 +188,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
                     await self.redis.set_approval_decision(test_run_id, "approved", nonce=nonce)
                     return
 
-        asyncio.create_task(background_approval_injector())
+        task1 = asyncio.create_task(background_approval_injector())
 
         outcome = await agent.handle_approval_gate(
             vendor="Acme Corp",
@@ -196,6 +196,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
             invoice_id="inv-test-approval",
             po_number="PO-1006",
         )
+        await task1
 
         self.assertEqual(outcome, "approved")
 
@@ -271,7 +272,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
                     await self.redis.set_approval_decision(test_run_id, "rejected", nonce=nonce)
                     return
 
-        asyncio.create_task(background_rejection_injector())
+        task2 = asyncio.create_task(background_rejection_injector())
 
         outcome = await agent.handle_approval_gate(
             vendor="Bharat Supplies",
@@ -279,6 +280,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
             invoice_id=str(test_inv_uuid),
             po_number=test_po,
         )
+        await task2
 
         self.assertEqual(outcome, "rejected")
 
@@ -386,9 +388,10 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
                     await self.redis.set_approval_decision(test_run_id, "approved", nonce=nonce)
                     break
 
-        asyncio.create_task(approve_when_pending())
+        task3 = asyncio.create_task(approve_when_pending())
 
         result = await agent.run(goal="Create invoice for PO-1006 with amount ₹62,000")
+        await task3
 
         self.assertEqual(result["status"], "completed")
         # Ensure 'click' was eventually executed after approval was granted
@@ -493,9 +496,10 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
                     await self.redis.set_approval_decision(test_run_id, "rejected", nonce=nonce)
                     break
 
-        asyncio.create_task(reject_when_pending())
+        task4 = asyncio.create_task(reject_when_pending())
 
         result = await agent.run(goal=f"Create invoice for {test_po} with amount ₹70,000")
+        await task4
 
         self.assertEqual(result["status"], "completed")
         # Ensure 'click' was NEVER executed because the submission was rejected!

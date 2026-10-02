@@ -672,11 +672,17 @@ class ReActAgent:
                             pass
                     if not marked and po_number:
                         res = await conn.execute(
-                            "UPDATE invoices SET status = 'skipped' WHERE po_number = $1;",
+                            "UPDATE invoices SET status = 'skipped' WHERE id IN (SELECT id FROM invoices WHERE po_number = $1 AND status NOT IN ('completed', 'skipped') ORDER BY created_at DESC LIMIT 1);",
                             str(po_number).strip(),
                         )
-                        if "UPDATE" in res:
-                            marked = True
+                        parts = res.split()
+                        if len(parts) >= 2:
+                            try:
+                                count = int(parts[1])
+                                if count > 0:
+                                    marked = True
+                            except ValueError:
+                                pass
                     logger.info(f"Marked invoice (id={resolved_invoice_id}, po={po_number}) status='skipped' in Neon: {marked}")
             except Exception as dbe:
                 logger.warning(f"Could not mark invoice as skipped in Neon: {dbe}")
@@ -845,7 +851,11 @@ class ReActAgent:
                         re.search(r"(?:needs|requires|awaiting|requesting|hold(?:ing)?\s+for)\s+approval", text_content, re.IGNORECASE)
                         or re.search(r"(?:exceeds|above|over)\s+(?:the\s+)?(?:approval\s+)?threshold", text_content, re.IGNORECASE)
                     )
-                    detected_amount = parse_amount(text_content) or parse_amount(self._active_form_state.get("amount"))
+                    detected_amount = parse_amount(self._active_form_state.get("amount"))
+                    if not detected_amount and text_content:
+                        curr_match = re.search(r"(?:₹|rs\.?|inr|\$|usd|eur|gbp|£|€)\s*([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)", text_content, re.IGNORECASE)
+                        if curr_match:
+                            detected_amount = parse_amount(curr_match.group(0))
                     if is_approval_statement and detected_amount and self.check_amount_exceeds_threshold(detected_amount, threshold):
                         detected_po = extract_target_po(text_content) or self._active_form_state.get("po_number")
                         detected_vendor = self._active_form_state.get("vendor") or extract_vendor_filter(text_content) or "Unknown Vendor"

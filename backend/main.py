@@ -452,10 +452,10 @@ async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest
 
     # Validate per-request nonce if provided or expected
     pending_nonce = pending.get("nonce")
-    if pending_nonce and payload.nonce is not None and payload.nonce != pending_nonce:
+    if pending_nonce and (payload.nonce is None or payload.nonce != pending_nonce):
         raise HTTPException(
             status_code=400,
-            detail="Invalid approval nonce for the current pending request",
+            detail="Invalid or missing approval nonce for the current pending request",
         )
 
     norm_decision = payload.decision.strip().lower()
