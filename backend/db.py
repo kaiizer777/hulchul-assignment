@@ -25,7 +25,11 @@ async def init_db_pool() -> asyncpg.Pool:
             old_loop = getattr(old_pool, "_loop", None)
             try:
                 if old_loop and not old_loop.is_closed() and old_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(old_pool.close(), old_loop)
+                    fut = asyncio.run_coroutine_threadsafe(old_pool.close(), old_loop)
+                    fut.add_done_callback(
+                        lambda f: f.exception()
+                        and logger.warning(f"Old db pool close failed: {f.exception()}")
+                    )
                 else:
                     old_pool.terminate()
             except Exception as e:
