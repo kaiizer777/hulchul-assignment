@@ -93,7 +93,7 @@ def extract_target_po(goal: str) -> Optional[str]:
         return None
     match = re.search(r"\b(PO-[A-Za-z0-9\-]+)\b", goal, re.IGNORECASE)
     if match:
-        return match.group(1).upper()
+        return match.group(1)
     return None
 
 

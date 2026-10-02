@@ -44,7 +44,7 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
         """Verify PO extraction from goal strings."""
         self.assertEqual(extract_target_po("Process invoice for PO-1001"), "PO-1001")
         self.assertEqual(extract_target_po("Create invoice PO-2005 now"), "PO-2005")
-        self.assertEqual(extract_target_po("Check po-9999 in ledger"), "PO-9999")
+        self.assertEqual(extract_target_po("Check po-9999 in ledger"), "po-9999")
         self.assertIsNone(extract_target_po("Process all invoices without PO"))
         self.assertIsNone(extract_target_po(""))
 
