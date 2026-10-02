@@ -39,7 +39,7 @@ resource "aws_lambda_function_url" "backend" {
 
   cors {
     allow_credentials = true
-    allow_origins     = split(",", var.cors_origins)
+    allow_origins     = [for origin in split(",", var.cors_origins) : trimspace(origin) if trimspace(origin) != ""]
     allow_methods     = ["*"]
     allow_headers     = ["*"]
     expose_headers    = ["*"]
@@ -56,9 +56,10 @@ resource "aws_lambda_permission" "url_public_access" {
 }
 
 resource "aws_lambda_permission" "invoke_via_url" {
-  statement_id  = "FunctionAllowInvokeViaURL"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.backend.function_name
-  principal     = "*"
+  statement_id             = "FunctionAllowInvokeViaURL"
+  action                   = "lambda:InvokeFunction"
+  function_name            = aws_lambda_function.backend.function_name
+  principal                = "*"
+  invoked_via_function_url = true
 }
 

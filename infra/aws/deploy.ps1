@@ -58,7 +58,8 @@ $tfvarsObj = @{
 }
 
 $tfvarsJsonPath = "terraform.tfvars.json"
-$tfvarsObj | ConvertTo-Json -Depth 10 | Out-File -Encoding utf8 $tfvarsJsonPath
+$jsonContent = $tfvarsObj | ConvertTo-Json -Depth 10
+[System.IO.File]::WriteAllText((Join-Path (Get-Location) $tfvarsJsonPath), $jsonContent, (New-Object System.Text.UTF8Encoding $false))
 Write-Host "Generated terraform.tfvars.json successfully." -ForegroundColor Green
 
 Write-Host "Initializing Terraform..." -ForegroundColor Cyan
@@ -78,7 +79,8 @@ Write-Host "Logging into AWS ECR..." -ForegroundColor Cyan
 $pass = aws ecr get-login-password --region us-east-1
 Assert-LastExitCode "aws ecr get-login-password"
 
-$pass | docker login --username AWS --password-stdin $ecrDomain
+$registryHost = $ecrDomain.Split('/')[0]
+$pass | docker login --username AWS --password-stdin $registryHost
 Assert-LastExitCode "docker login"
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")
@@ -87,17 +89,17 @@ docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
 Assert-LastExitCode "docker build"
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
-docker tag hulchul-backend:latest "$ecrDomain:$imageTag"
+docker tag hulchul-backend:latest "${ecrDomain}:${imageTag}"
 Assert-LastExitCode "docker tag with timestamp"
 
-docker tag hulchul-backend:latest "$ecrDomain:latest"
+docker tag hulchul-backend:latest "${ecrDomain}:latest"
 Assert-LastExitCode "docker tag latest"
 
 Write-Host "Pushing Docker image to ECR..." -ForegroundColor Cyan
-docker push "$ecrDomain:$imageTag"
+docker push "${ecrDomain}:${imageTag}"
 Assert-LastExitCode "docker push timestamp"
 
-docker push "$ecrDomain:latest"
+docker push "${ecrDomain}:latest"
 Assert-LastExitCode "docker push latest"
 
 Write-Host "Applying remaining Terraform infrastructure with image_tag=$imageTag..." -ForegroundColor Cyan

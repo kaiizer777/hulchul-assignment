@@ -36,6 +36,7 @@ Thumbs.db
 *.tfstate*
 *.tfstate.backup
 terraform.tfvars
+terraform.tfvars.json
 !**/.terraform.lock.hcl
 
 
