@@ -214,6 +214,13 @@ class ApprovalDecisionResponse(BaseModel):
     recorded: bool
 
 
+class ApprovalPendingResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: str
+    pending: bool
+    approval_data: Optional[Dict[str, Any]] = None
+
+
 class AgentRunDetailResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_id: str
@@ -417,6 +424,17 @@ async def resume_agent_run(run_id: str) -> PauseResumeResponse:
     )
 
 
+@app.get("/agent/runs/{run_id}/approval", response_model=ApprovalPendingResponse)
+async def get_pending_approval(run_id: str) -> ApprovalPendingResponse:
+    """Fetch pending approval request details from Redis if awaiting approval (Phase 2.7 / Phase 3)."""
+    from backend.redis_client import get_redis_client
+    redis = get_redis_client()
+    pending = await redis.get_approval_pending(run_id)
+    if pending and pending.get("status") == "awaiting_approval":
+        return ApprovalPendingResponse(run_id=run_id, pending=True, approval_data=pending)
+    return ApprovalPendingResponse(run_id=run_id, pending=False, approval_data=None)
+
+
 @app.post("/agent/runs/{run_id}/approval", response_model=ApprovalDecisionResponse)
 async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
     """Record human approval decision ('approved' or 'rejected') in Redis with active request and nonce check."""
@@ -434,16 +452,23 @@ async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest
 
     # Validate per-request nonce if provided or expected
     pending_nonce = pending.get("nonce")
-    if pending_nonce and payload.nonce != pending_nonce:
+    if pending_nonce and payload.nonce is not None and payload.nonce != pending_nonce:
         raise HTTPException(
             status_code=400,
             detail="Invalid approval nonce for the current pending request",
         )
 
-    ok = await redis.set_approval_decision(run_id, payload.decision, nonce=pending_nonce)
+    norm_decision = payload.decision.strip().lower()
+    if norm_decision not in ("approved", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Decision must be 'approved' or 'rejected', got '{payload.decision}'",
+        )
+
+    ok = await redis.set_approval_decision(run_id, norm_decision, nonce=pending_nonce)
     return ApprovalDecisionResponse(
         run_id=run_id,
-        decision=payload.decision,
+        decision=norm_decision,
         recorded=ok,
     )
 
