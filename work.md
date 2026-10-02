@@ -159,21 +159,22 @@ Control UI (SSE live log, Pause, Approval modal)
 
 ## Phase 6 — Failure & Recovery Demo `Difficulty: High` `Complexity: Medium`
 
-- [ ] **6.1** Inject a simulated 500 error from the ERP after the 3rd invoice is processed — add a `?fail_after=3` query param or a `SIMULATE_FAILURE_AFTER` env var that the Next.js ERP API route reads and returns a 500 on the Nth invoice submission. This keeps failure injection in the test environment without touching agent code.
-- [ ] **6.2** Verify agent logs the failure, takes a screenshot, persists the failed step to Neon
-- [ ] **6.3** Verify agent does NOT retry completed steps (idempotency)
-- [ ] **6.4** Resume agent — verify it picks up from step 4, not step 1
-- [ ] **6.5** Inject a session drop (kill browser connection mid-run) — verify agent reconnects via CDP and resumes
-- [ ] **6.6** Verify no duplicate invoice entries in ERP after recovery
+- [x] **6.1** Inject a simulated 500 error from the ERP after the 3rd invoice is processed — add a `?fail_after=3` query param or a `SIMULATE_FAILURE_AFTER` env var that the Next.js ERP API route reads and returns a 500 on the Nth invoice submission. This keeps failure injection in the test environment without touching agent code.
+- [x] **6.2** Verify agent logs the failure, takes a screenshot, persists the failed step to Neon
+- [x] **6.3** Verify agent does NOT retry completed steps (idempotency)
+- [x] **6.4** Resume agent — verify it picks up from step 4, not step 1
+- [x] **6.5** Inject a session drop (kill browser connection mid-run) — verify agent reconnects via CDP and resumes
+- [x] **6.6** Verify no duplicate invoice entries in ERP after recovery
 
 ### Review 6
-- [ ] Recovery resumes from correct step every time
-- [ ] No duplicates in ERP after any failure scenario
-- [ ] Failure is clearly visible in step log and verification report
+- [x] Recovery resumes from correct step every time
+- [x] No duplicates in ERP after any failure scenario
+- [x] Failure is clearly visible in step log and verification report
 
 ### Tests 6
-- [ ] Test: inject 500 on step 3 → resume → verify steps 1-3 not re-executed
-- [ ] Test: verify ERP invoice count is correct after recovery (no duplicates)
+- [x] Test: inject 500 on step 3 → resume → verify steps 1-3 not re-executed
+- [x] Test: verify ERP invoice count is correct after recovery (no duplicates)
+
 
 ---
 
