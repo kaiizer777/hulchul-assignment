@@ -378,7 +378,8 @@ class ReActAgent:
             return self._checked_entities[cache_key]
 
         result = await self.tools.check_exists(entity_type=clean_type, identifier=clean_id)
-        self._checked_entities[cache_key] = result
+        if result.get("exists") and not result.get("error"):
+            self._checked_entities[cache_key] = result
         return result
 
     def check_amount_exceeds_threshold(self, amount: Union[float, int, str], threshold: float) -> bool:
@@ -685,7 +686,55 @@ class ReActAgent:
                     if clean_val:
                         # Idempotency check before filling PO number or identifier
                         check_res = await self.check_idempotency("invoice", clean_val)
-                        if check_res.get("exists"):
+                        if check_res.get("error"):
+                            logger.warning(
+                                f"Agent {self.run_id}: Idempotency check failed with error before fill: {check_res.get('error')}"
+                            )
+                            tool_result = {
+                                "success": False,
+                                "aborted": True,
+                                "error": check_res.get("error"),
+                                "entity_type": "invoice",
+                                "identifier": clean_val,
+                                "message": (
+                                    f"Idempotency check failed with error: {check_res.get('error')}. "
+                                    "Aborting form fill to prevent potential duplicate invoice creation."
+                                ),
+                            }
+                            await self.persist_step(
+                                action="idempotency_check",
+                                result=f"aborted_error: {check_res.get('error')}",
+                            )
+                            await self.emit_event(
+                                "idempotency_aborted",
+                                {
+                                    "step": iteration,
+                                    "action": "fill",
+                                    "entity_type": "invoice",
+                                    "identifier": clean_val,
+                                    "error": check_res.get("error"),
+                                },
+                            )
+                            self._active_form_state.clear()
+                            messages.append({
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": parsed_call.id,
+                                        "type": "function",
+                                        "function": {"name": tool_name, "arguments": json.dumps(tool_args)},
+                                    }
+                                ],
+                            })
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": parsed_call.id,
+                                "name": tool_name,
+                                "content": json.dumps(tool_result),
+                            })
+                            continue
+                        elif check_res.get("exists"):
                             logger.warning(
                                 f"Agent {self.run_id}: Idempotency abort before fill: invoice '{clean_val}' already exists in database."
                             )
@@ -794,7 +843,55 @@ class ReActAgent:
 
                     if target_po:
                         check_res = await self.check_idempotency("invoice", str(target_po).strip())
-                        if check_res.get("exists"):
+                        if check_res.get("error"):
+                            logger.warning(
+                                f"Agent {self.run_id}: Idempotency check failed with error before submit: {check_res.get('error')}"
+                            )
+                            tool_result = {
+                                "success": False,
+                                "aborted": True,
+                                "error": check_res.get("error"),
+                                "entity_type": "invoice",
+                                "identifier": str(target_po).strip(),
+                                "message": (
+                                    f"Idempotency check failed with error: {check_res.get('error')}. "
+                                    "Aborting submission to prevent potential duplicate invoice creation."
+                                ),
+                            }
+                            await self.persist_step(
+                                action="idempotency_check",
+                                result=f"aborted_error: {check_res.get('error')}",
+                            )
+                            await self.emit_event(
+                                "idempotency_aborted",
+                                {
+                                    "step": iteration,
+                                    "action": "click_submit",
+                                    "entity_type": "invoice",
+                                    "identifier": str(target_po).strip(),
+                                    "error": check_res.get("error"),
+                                },
+                            )
+                            self._active_form_state.clear()
+                            messages.append({
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": parsed_call.id,
+                                        "type": "function",
+                                        "function": {"name": tool_name, "arguments": json.dumps(tool_args)},
+                                    }
+                                ],
+                            })
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": parsed_call.id,
+                                "name": tool_name,
+                                "content": json.dumps(tool_result),
+                            })
+                            continue
+                        elif check_res.get("exists"):
                             logger.warning(
                                 f"Agent {self.run_id}: Idempotency abort before submit: invoice '{target_po}' already exists in database."
                             )
@@ -961,11 +1058,11 @@ class ReActAgent:
                 tool_result = {"success": False, "error": str(exec_err)}
                 tool_success = False
 
-            # Phase 2.5: Cache explicit check_exists results
-            if tool_name == "check_exists" and tool_success:
+            # Phase 2.5: Cache explicit check_exists results (positive matches only)
+            if tool_name == "check_exists" and tool_success and isinstance(tool_result, dict):
                 e_type = str(tool_args.get("entity_type", "")).strip().lower()
                 e_ident = str(tool_args.get("identifier", "")).strip()
-                if e_ident:
+                if e_ident and tool_result.get("exists") and not tool_result.get("error"):
                     self._checked_entities[f"{e_type}:{e_ident.lower()}"] = tool_result
 
             if not tool_success:

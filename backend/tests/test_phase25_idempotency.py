@@ -49,26 +49,40 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(extract_target_po(""))
 
     async def test_02_check_idempotency_caches_results(self):
-        """Verify check_idempotency caches results and avoids redundant tool calls."""
+        """Verify check_idempotency caches positive results only, ignoring non-existent and error outcomes."""
         mock_tools = MagicMock(spec=PlaywrightTools)
-        mock_tools.check_exists = AsyncMock(return_value={
-            "success": True,
-            "exists": True,
-            "entity_type": "invoice",
-            "identifier": "PO-1001",
-            "record": {"id": "test-uuid", "po_number": "PO-1001"},
-        })
+        mock_tools.check_exists = AsyncMock(side_effect=[
+            # First PO: exists is True -> cached
+            {"success": True, "exists": True, "entity_type": "invoice", "identifier": "PO-1001", "record": {"id": "test-uuid"}},
+            # Second PO: exists is False -> not cached
+            {"success": True, "exists": False, "entity_type": "invoice", "identifier": "PO-NEW", "record": None},
+            {"success": True, "exists": False, "entity_type": "invoice", "identifier": "PO-NEW", "record": None},
+            # Third PO: error occurred -> not cached
+            {"success": False, "exists": False, "error": "DB connection failed", "entity_type": "invoice", "identifier": "PO-ERR"},
+            {"success": False, "exists": False, "error": "DB connection failed", "entity_type": "invoice", "identifier": "PO-ERR"},
+        ])
         agent = create_unit_agent(mock_tools)
 
-        # First call hits mock_tools.check_exists
+        # 1. Existing entity: first call hits tools, second call served from cache
         res1 = await agent.check_idempotency("invoice", "PO-1001")
         self.assertTrue(res1["exists"])
-        self.assertEqual(mock_tools.check_exists.call_count, 1)
-
-        # Second call returns cached result without invoking tools again
         res2 = await agent.check_idempotency("invoice", "PO-1001")
         self.assertTrue(res2["exists"])
         self.assertEqual(mock_tools.check_exists.call_count, 1)
+
+        # 2. Non-existent entity: should NOT be cached, so repeated calls hit tools again
+        res_new1 = await agent.check_idempotency("invoice", "PO-NEW")
+        self.assertFalse(res_new1["exists"])
+        res_new2 = await agent.check_idempotency("invoice", "PO-NEW")
+        self.assertFalse(res_new2["exists"])
+        self.assertEqual(mock_tools.check_exists.call_count, 3)
+
+        # 3. Error result: should NOT be cached
+        res_err1 = await agent.check_idempotency("invoice", "PO-ERR")
+        self.assertEqual(res_err1.get("error"), "DB connection failed")
+        res_err2 = await agent.check_idempotency("invoice", "PO-ERR")
+        self.assertEqual(res_err2.get("error"), "DB connection failed")
+        self.assertEqual(mock_tools.check_exists.call_count, 5)
 
     async def test_03_idempotency_aborts_fill_when_invoice_already_exists(self):
         """
@@ -92,6 +106,7 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
         emitted_events: List[Dict[str, Any]] = []
 
         async def on_evt(e):
+            """Capture emitted agent events for assertion."""
             emitted_events.append(e)
 
         agent = create_unit_agent(mock_tools, on_event=on_evt)
@@ -133,6 +148,71 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
         agent.persist_step.assert_any_call(
             action="idempotency_check",
             result="aborted_duplicate: invoice PO-1002 already exists",
+        )
+
+    async def test_03b_idempotency_aborts_fill_on_check_error(self):
+        """
+        Phase 2.5: When check_exists returns an error during fill guard,
+        the agent must abort fill, emit idempotency_aborted with error,
+        and not execute tools.fill.
+        """
+        mock_tools = MagicMock(spec=PlaywrightTools)
+        mock_tools.run_id = "test-run"
+        mock_tools.set_run_id = MagicMock()
+        mock_tools.check_exists = AsyncMock(return_value={
+            "success": False,
+            "exists": False,
+            "error": "Neon DB connection timed out",
+            "entity_type": "invoice",
+            "identifier": "PO-ERR-FILL",
+        })
+        mock_tools.fill = AsyncMock()
+        mock_tools.read_page = AsyncMock(return_value={"success": True, "snapshot": ""})
+
+        emitted_events: List[Dict[str, Any]] = []
+
+        async def on_evt(e):
+            """Capture emitted agent events for assertion."""
+            emitted_events.append(e)
+
+        agent = create_unit_agent(mock_tools, on_event=on_evt)
+
+        mock_groq = MagicMock()
+        msg_fill = MagicMock()
+        tc = MagicMock()
+        tc.id = "call_fill_err"
+        tc.function.name = "fill"
+        tc.function.arguments = json.dumps({"selector": "PO Number", "value": "PO-ERR-FILL"})
+        msg_fill.tool_calls = [tc]
+        msg_fill.content = None
+
+        msg_done = MagicMock()
+        msg_done.tool_calls = None
+        msg_done.content = "Aborted due to DB error. Done."
+
+        mock_groq.chat.completions.create = AsyncMock(side_effect=[
+            MagicMock(choices=[MagicMock(message=msg_fill)]),
+            MagicMock(choices=[MagicMock(message=msg_done)]),
+        ])
+        agent._groq_client = mock_groq
+
+        result = await agent.run(goal="Create invoice for PO-ERR-FILL")
+        self.assertEqual(result["status"], "completed")
+
+        # Verify tools.fill was NEVER called
+        mock_tools.fill.assert_not_called()
+
+        # Verify idempotency_aborted event was emitted with error
+        aborted_events = [e for e in emitted_events if e.get("type") == "idempotency_aborted"]
+        self.assertEqual(len(aborted_events), 1)
+        self.assertEqual(aborted_events[0]["identifier"], "PO-ERR-FILL")
+        self.assertEqual(aborted_events[0]["action"], "fill")
+        self.assertEqual(aborted_events[0]["error"], "Neon DB connection timed out")
+
+        # Verify persist_step was called with aborted_error
+        agent.persist_step.assert_any_call(
+            action="idempotency_check",
+            result="aborted_error: Neon DB connection timed out",
         )
 
     async def test_04_idempotency_allows_fill_when_invoice_is_new(self):
@@ -201,6 +281,7 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
         emitted_events: List[Dict[str, Any]] = []
 
         async def on_evt(e):
+            """Capture emitted agent events for assertion."""
             emitted_events.append(e)
 
         agent = create_unit_agent(mock_tools, on_event=on_evt)
@@ -238,6 +319,64 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(aborted[0]["identifier"], "PO-EXISTING-99")
 
         # Form state was cleared
+        self.assertEqual(agent._active_form_state, {})
+
+    async def test_05b_idempotency_aborts_submit_on_check_error(self):
+        """
+        Phase 2.5: When check_exists fails with an error during submit guard,
+        submission must abort and not proceed with invoice creation.
+        """
+        mock_tools = MagicMock(spec=PlaywrightTools)
+        mock_tools.run_id = "test-run"
+        mock_tools.set_run_id = MagicMock()
+        mock_tools.check_exists = AsyncMock(return_value={
+            "success": False,
+            "exists": False,
+            "error": "Database connectivity loss",
+            "entity_type": "invoice",
+            "identifier": "PO-ERR-SUBMIT",
+        })
+        mock_tools.execute = AsyncMock()
+        mock_tools.read_page = AsyncMock(return_value={"success": True, "snapshot": ""})
+
+        emitted_events: List[Dict[str, Any]] = []
+
+        async def on_evt(e):
+            """Capture emitted agent events for assertion."""
+            emitted_events.append(e)
+
+        agent = create_unit_agent(mock_tools, on_event=on_evt)
+        agent._active_form_state = {"po_number": "PO-ERR-SUBMIT", "amount": "20000"}
+
+        mock_groq = MagicMock()
+        msg_click = MagicMock()
+        tc = MagicMock()
+        tc.id = "call_click_err"
+        tc.function.name = "click"
+        tc.function.arguments = json.dumps({"selector": "Create Invoice"})
+        msg_click.tool_calls = [tc]
+        msg_click.content = None
+
+        msg_done = MagicMock()
+        msg_done.tool_calls = None
+        msg_done.content = "Aborted due to DB error. Done."
+
+        mock_groq.chat.completions.create = AsyncMock(side_effect=[
+            MagicMock(choices=[MagicMock(message=msg_click)]),
+            MagicMock(choices=[MagicMock(message=msg_done)]),
+        ])
+        agent._groq_client = mock_groq
+
+        await agent.run(goal="Submit invoice form")
+
+        # Verify tools.execute was NOT called
+        mock_tools.execute.assert_not_called()
+
+        # Verify idempotency_aborted event emitted with error
+        aborted = [e for e in emitted_events if e.get("type") == "idempotency_aborted"]
+        self.assertEqual(len(aborted), 1)
+        self.assertEqual(aborted[0]["action"], "click_submit")
+        self.assertEqual(aborted[0]["error"], "Database connectivity loss")
         self.assertEqual(agent._active_form_state, {})
 
     async def test_06_idempotency_caches_explicit_check_exists_tool_call(self):
@@ -294,12 +433,14 @@ class TestPhase25Integration(unittest.IsolatedAsyncioTestCase):
     """Integration test suite verifying idempotency against live Neon database."""
 
     async def asyncSetUp(self):
+        """Initialize live Neon DB pool and Redis client for test run."""
         await init_db_pool()
         self.pool = await get_db_pool()
         self.redis = UpstashRedisClient()
         self.created_run_ids: List[str] = []
 
     async def asyncTearDown(self):
+        """Clean up all created test run records, Redis client, and DB pool."""
         if hasattr(self, "created_run_ids") and self.created_run_ids and self.pool:
             try:
                 valid_uuids = [uuid.UUID(str(r)) for r in self.created_run_ids]
@@ -352,6 +493,7 @@ class TestPhase25Integration(unittest.IsolatedAsyncioTestCase):
 
         # Delegate check_exists to actual check_exists against Neon DB
         async def real_check_exists(entity_type, identifier):
+            """Delegate existence check directly to live Neon DB pool."""
             return await check_exists(entity_type, identifier, pool=self.pool)
 
         mock_tools.check_exists = AsyncMock(side_effect=real_check_exists)
