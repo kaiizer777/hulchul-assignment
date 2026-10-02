@@ -59,10 +59,10 @@ Write-Host "Building Docker image..." -ForegroundColor Cyan
 docker build -t hulchul-backend -f ../../backend/Dockerfile ../../backend
 
 Write-Host "Tagging Docker image..." -ForegroundColor Cyan
-docker tag hulchul-backend:latest "$ecrUrl:latest"
+docker tag hulchul-backend:latest "${ecrUrl}:latest"
 
 Write-Host "Pushing Docker image to ECR..." -ForegroundColor Cyan
-docker push "$ecrUrl:latest"
+docker push "${ecrUrl}:latest"
 
 Write-Host "Applying remaining Terraform infrastructure..." -ForegroundColor Cyan
 & 'C:\Terraform\terraform.exe' apply -auto-approve
