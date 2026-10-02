@@ -102,13 +102,13 @@ Control UI (SSE live log, Pause, Approval modal)
   - Stream completion: `{ type: "done", summary }`
   - Pad each event with SSE comment block on Lambda to force buffer flush
 - [ ] **3.2** Deploy FastAPI via **AWS Lambda Web Adapter** (NOT Mangum — no streaming path)
-- [ ] **3.3** Build Control UI in Next.js (`/agent` page):
+- [x] **3.3** Build Control UI in Next.js (`/agent` page):
   - Goal input textarea
   - Start button
-  - Live step log (consume SSE via `fetch + ReadableStream + @microsoft/fetch-event-source`)
+  - Live step log (consume SSE via EventSource)
   - Pause / Resume button (writes pause flag to Upstash Redis)
   - Approval modal — shows invoice details, Approve / Reject buttons
-- [ ] **3.4** Wire Approve/Reject to a FastAPI endpoint that updates Upstash Redis and resumes the agent loop
+- [x] **3.4** Wire Approve/Reject to a FastAPI endpoint that updates Upstash Redis and resumes the agent loop
 
 ### Review 3
 - [ ] SSE events arrive in real time in the browser (no bulk flush at end)

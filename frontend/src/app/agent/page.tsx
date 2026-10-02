@@ -1,0 +1,615 @@
+'use client';
+
+import React, { useState, useEffect, useRef, useTransition } from 'react';
+import { StatusBadge } from '../components/StatusBadge';
+
+/**
+ * Interface representing a recorded agent step event.
+ */
+interface StepEvent {
+  type: string;
+  run_id: string;
+  step_id?: string;
+  step_index?: number;
+  action: string;
+  result?: string;
+  timestamp: string;
+  has_screenshot?: boolean;
+  error?: string;
+}
+
+/**
+ * Interface representing approval gate details.
+ */
+interface ApprovalData {
+  run_id: string;
+  status: string;
+  invoice_id?: string;
+  vendor?: string;
+  amount?: number;
+  po_number?: string;
+  threshold?: number;
+  nonce?: string;
+}
+
+const DEFAULT_GOALS = [
+  "Process all pending invoices",
+  "Process only invoices from Vendor Acme",
+  "Hold anything over ₹25,000 for approval"
+];
+
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000';
+
+/**
+ * AgentControlPage component provides the interactive UI for dispatching browser agent runs,
+ * streaming real-time execution steps, managing pause/resume/approval states, and viewing screenshots.
+ */
+export default function AgentControlPage() {
+  const [goal, setGoal] = useState("Process all pending invoices");
+  const [runId, setRunId] = useState<string | null>(null);
+  const [status, setStatus] = useState<string>("idle");
+  const [steps, setSteps] = useState<StepEvent[]>([]);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isPausingOrResuming, setIsPausingOrResuming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Approval Modal State
+  const [approvalData, setApprovalData] = useState<ApprovalData | null>(null);
+  const [isSubmittingApproval, setIsSubmittingApproval] = useState(false);
+  const submittedNonceRef = useRef<string | null>(null);
+
+  // Screenshot Modal State
+  const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
+  const [isFetchingScreenshot, setIsFetchingScreenshot] = useState(false);
+
+  // Auto-scroll log ref
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+
+  /**
+   * Handles manual scroll container interaction to pause or resume auto-scrolling of step logs.
+   */
+  const handleScroll = () => {
+    if (!logContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
+    setAutoScroll(isAtBottom);
+  };
+
+  // Auto-scroll effect
+  useEffect(() => {
+    if (autoScroll && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [steps, autoScroll]);
+
+  /**
+   * Dispatches a new agent run with the specified goal instruction.
+   * Prevents starting while running, paused, or awaiting approval.
+   */
+  const handleRunAgent = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!goal.trim() || isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval') return;
+
+    setIsStarting(true);
+    setError(null);
+    setSteps([]);
+    setStatus("running");
+    submittedNonceRef.current = null;
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/agent/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal: goal.trim() }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Failed to start agent run (${res.status})`);
+      }
+
+      const data = await res.json();
+      setRunId(data.run_id);
+      setStatus(data.status || "running");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to start agent run');
+      setStatus("failed");
+    } finally {
+      setIsStarting(false);
+    }
+  };
+
+  // If we have a runId, connect to SSE stream and poll approval status
+  useEffect(() => {
+    if (!runId) return;
+
+    let eventSource: EventSource | null = null;
+    let pollInterval: NodeJS.Timeout | null = null;
+    const abortController = new AbortController();
+
+    try {
+      eventSource = new EventSource(`${BACKEND_URL}/agent/runs/${runId}/stream`);
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'status_change') {
+            setStatus(data.status);
+          } else if (data.type === 'step_complete' || data.type === 'step_failed') {
+            setSteps((prev) => [...prev, data]);
+          } else if (data.type === 'done') {
+            setStatus('done');
+          }
+        } catch (e) {
+          console.error('Failed to parse SSE message', e);
+        }
+      };
+
+      eventSource.addEventListener('status_change', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.status) setStatus(data.status);
+        } catch (e) {}
+      });
+
+      eventSource.addEventListener('step_complete', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          setSteps((prev) => [...prev, data]);
+        } catch (e) {}
+      });
+
+      eventSource.addEventListener('step_failed', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          setSteps((prev) => [...prev, data]);
+        } catch (e) {}
+      });
+
+      eventSource.addEventListener('done', (event: MessageEvent) => {
+        setStatus('done');
+      });
+
+      eventSource.addEventListener('needs_approval', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.nonce && data.nonce === submittedNonceRef.current) {
+            return;
+          }
+          setStatus('awaiting_approval');
+          setApprovalData(data);
+        } catch (e) {}
+      });
+
+      eventSource.onerror = (err) => {
+        console.warn('SSE connection error or closed', err);
+      };
+    } catch (e) {
+      console.error('Failed to establish EventSource connection', e);
+    }
+
+    // Poll approval endpoint periodically while run is active or awaiting approval
+    pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`, {
+          signal: abortController.signal,
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.pending && data.approval_data) {
+            const nonce = data.approval_data.nonce;
+            if (nonce && nonce === submittedNonceRef.current) {
+              return;
+            }
+            setStatus('awaiting_approval');
+            setApprovalData(data.approval_data);
+          }
+        }
+      } catch (e: any) {
+        if (e.name !== 'AbortError') {
+          // ignore
+        }
+      }
+    }, 2500);
+
+    return () => {
+      abortController.abort();
+      if (eventSource) eventSource.close();
+      if (pollInterval) clearInterval(pollInterval);
+    };
+  }, [runId]);
+
+  /**
+   * Toggles the pause or resume state of the active agent run.
+   */
+  const handleTogglePause = async () => {
+    if (!runId || isPausingOrResuming) return;
+    setIsPausingOrResuming(true);
+    const isCurrentlyPaused = status === 'paused';
+    const endpoint = isCurrentlyPaused ? 'resume' : 'pause';
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/${endpoint}`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(`Failed to ${endpoint} run`);
+      setStatus(isCurrentlyPaused ? 'running' : 'paused');
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : `Failed to ${endpoint} agent run`);
+    } finally {
+      setIsPausingOrResuming(false);
+    }
+  };
+
+  /**
+   * Submits human approval decision ('approved' or 'rejected') for the pending approval gate.
+   * @param decision - The approval decision to submit.
+   */
+  const handleApprovalDecision = async (decision: 'approved' | 'rejected') => {
+    if (!runId || isSubmittingApproval || !approvalData?.nonce) return;
+    setIsSubmittingApproval(true);
+    submittedNonceRef.current = approvalData.nonce;
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/agent/runs/${runId}/approval`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          decision,
+          nonce: approvalData.nonce,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `Failed to submit decision: ${decision}`);
+      }
+
+      setApprovalData(null);
+      setStatus('running');
+    } catch (err: unknown) {
+      alert(err instanceof Error ? err.message : 'Failed to submit approval decision');
+    } finally {
+      setIsSubmittingApproval(false);
+    }
+  };
+
+  /**
+   * Fetches and displays the screenshot associated with a specific step ID or index.
+   * @param stepIdentifier - The unique step ID or step index identifier.
+   */
+  const handleViewScreenshot = async (stepIdentifier?: string) => {
+    if (!stepIdentifier) return;
+    setIsFetchingScreenshot(true);
+    try {
+      const res = await fetch(`${BACKEND_URL}/agent/steps/${stepIdentifier}`);
+      if (!res.ok) throw new Error('Failed to load screenshot');
+      const data = await res.json();
+      if (data.screenshot_b64) {
+        setSelectedScreenshot(data.screenshot_b64);
+      } else {
+        alert('No screenshot captured for this step.');
+      }
+    } catch (err) {
+      alert('Failed to retrieve step screenshot.');
+    } finally {
+      setIsFetchingScreenshot(false);
+    }
+  };
+
+  return (
+    <div className="space-y-6 pb-12">
+      {/* Page Header */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="flex items-center gap-3">
+            <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
+              Agent Control & Live Monitor
+            </h1>
+            <StatusBadge status={status} />
+          </div>
+          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+            Dispatch autonomous browser agents to process accounts payable, evaluate purchase orders, and manage approvals.
+          </p>
+        </div>
+
+        {runId && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleTogglePause}
+              disabled={isPausingOrResuming || status === 'done' || status === 'failed'}
+              className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-2 text-xs font-semibold shadow-xs transition-all active:translate-y-[0.5px] disabled:opacity-50 ${
+                status === 'paused'
+                  ? 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300'
+                  : 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-300'
+              }`}
+            >
+              {status === 'paused' ? (
+                <>
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span>Resume Agent</span>
+                </>
+              ) : (
+                <>
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span>Pause Agent</span>
+                </>
+              )}
+            </button>
+            <span className="font-mono text-xs text-zinc-400 dark:text-zinc-500">
+              Run: {runId.slice(0, 8)}...
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Goal Dispatch Section */}
+      <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60">
+        <form onSubmit={handleRunAgent} className="space-y-4">
+          <div>
+            <label htmlFor="goal-input" className="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400">
+              Agent Goal / Instruction
+            </label>
+            <div className="mt-2">
+              <textarea
+                id="goal-input"
+                rows={3}
+                value={goal}
+                onChange={(e) => setGoal(e.target.value)}
+                placeholder="Enter plain English goal for the browser agent..."
+                className="block w-full rounded-xl border border-zinc-200 bg-white p-3.5 text-sm text-zinc-900 placeholder-zinc-400 shadow-xs transition-colors focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700/80 dark:bg-zinc-950/70 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
+              />
+            </div>
+          </div>
+
+          {/* Preset Goal Suggestion Buttons */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Suggestions:</span>
+            {DEFAULT_GOALS.map((suggestion, idx) => (
+              <button
+                key={idx}
+                type="button"
+                onClick={() => setGoal(suggestion)}
+                className="rounded-lg border border-zinc-200/80 bg-zinc-50 px-2.5 py-1 text-xs font-medium text-zinc-700 transition-colors hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-800/60 dark:text-zinc-300 dark:hover:border-zinc-700 dark:hover:bg-zinc-800"
+              >
+                {suggestion}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex items-center justify-between pt-2">
+            <div className="text-xs text-zinc-500 dark:text-zinc-400">
+              Agent operates mock ERP via remote browser CDP.
+            </div>
+
+            <button
+              type="submit"
+              disabled={isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval'}
+              className="inline-flex items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-zinc-950 bg-gradient-to-b from-zinc-800 to-zinc-900 px-5 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_2px_4px_rgba(0,0,0,0.2)] transition-all hover:from-zinc-750 hover:to-zinc-850 active:translate-y-[0.5px] disabled:opacity-50 dark:border-t-white dark:border-x-zinc-200 dark:border-b-zinc-400 dark:from-zinc-100 dark:to-zinc-200 dark:text-zinc-900 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_2px_4px_rgba(0,0,0,0.1)]"
+            >
+              {isStarting ? (
+                <>
+                  <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  <span>Initializing...</span>
+                </>
+              ) : status === 'running' ? (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>Agent Running...</span>
+                </>
+              ) : (
+                <>
+                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span>Run Agent</span>
+                </>
+              )}
+            </button>
+          </div>
+        </form>
+
+        {error && (
+          <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-4 text-xs text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* Real-Time Step Log via SSE */}
+      <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60">
+        <div className="flex items-center justify-between pb-4 border-b border-zinc-200/80 dark:border-zinc-800">
+          <div>
+            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+              Live Step Execution Log
+            </h3>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              Real-time SSE events streaming agent observations, actions, and results.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {!autoScroll && (
+              <button
+                onClick={() => setAutoScroll(true)}
+                className="rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+              >
+                Resume Auto-scroll
+              </button>
+            )}
+            <span className="inline-flex items-center gap-1.5 font-mono text-xs text-zinc-500 dark:text-zinc-400">
+              <span className={`h-2 w-2 rounded-full ${status === 'running' ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-400'}`} />
+              {steps.length} {steps.length === 1 ? 'step' : 'steps'} logged
+            </span>
+          </div>
+        </div>
+
+        <div
+          ref={logContainerRef}
+          onScroll={handleScroll}
+          className="mt-4 max-h-[420px] min-h-[200px] overflow-y-auto space-y-3 font-mono text-xs pr-2"
+        >
+          {steps.length === 0 ? (
+            <div className="flex h-48 flex-col items-center justify-center text-center text-zinc-400 dark:text-zinc-600">
+              <svg className="h-8 w-8 mb-2 opacity-40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+              </svg>
+              <span>No execution steps recorded yet. Start an agent run above.</span>
+            </div>
+          ) : (
+            steps.map((st, idx) => {
+              const isFail = st.type === 'step_failed' || (st.result && st.result.toLowerCase().includes('failed'));
+              return (
+                <div
+                  key={idx}
+                  className={`rounded-xl border p-4 transition-all ${
+                    isFail
+                      ? 'border-red-200 bg-red-50/70 text-red-900 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200'
+                      : 'border-zinc-200/80 bg-zinc-50/70 text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950/50 dark:text-zinc-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between pb-2 border-b border-zinc-200/60 dark:border-zinc-800/80 text-[11px]">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-zinc-500 dark:text-zinc-400">
+                        #{st.step_index || idx + 1}
+                      </span>
+                      <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                        {st.action}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      {st.has_screenshot && (
+                        <button
+                          onClick={() => handleViewScreenshot(st.step_id || st.step_index?.toString() || (idx + 1).toString())}
+                          disabled={isFetchingScreenshot}
+                          className="inline-flex items-center gap-1 rounded bg-zinc-200/80 px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:bg-zinc-300 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                        >
+                          <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+                          </svg>
+                          <span>Screenshot</span>
+                        </button>
+                      )}
+                      <span className="text-zinc-400 dark:text-zinc-500">
+                        {new Date(st.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="mt-2.5 whitespace-pre-wrap text-xs font-mono leading-relaxed">
+                    {st.result || st.error || 'Success'}
+                  </div>
+                </div>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {/* Approval Modal */}
+      {status === 'awaiting_approval' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/60 backdrop-blur-xs p-4 animate-in fade-in duration-200">
+          <div className="w-full max-w-lg rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl dark:border-zinc-800 dark:bg-zinc-900">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-950/80 dark:text-amber-300">
+                <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">
+                  Human Approval Required
+                </h3>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                  Agent paused because invoice amount exceeds approval threshold.
+                </p>
+              </div>
+            </div>
+
+            <div className="my-5 rounded-xl border border-zinc-200/80 bg-zinc-50 p-4 space-y-2.5 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-950/60">
+              <div className="flex justify-between">
+                <span className="text-zinc-500 dark:text-zinc-400">Vendor:</span>
+                <span className="font-bold text-zinc-900 dark:text-zinc-100">{approvalData?.vendor || '—'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-zinc-500 dark:text-zinc-400">Invoice Amount:</span>
+                <span className="font-bold text-emerald-600 dark:text-emerald-400">
+                  {approvalData?.amount != null ? `₹${approvalData.amount.toLocaleString()}` : '—'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-zinc-500 dark:text-zinc-400">PO Number:</span>
+                <span className="text-zinc-900 dark:text-zinc-100">{approvalData?.po_number || '—'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-zinc-500 dark:text-zinc-400">Threshold:</span>
+                <span className="text-zinc-900 dark:text-zinc-100">
+                  {approvalData?.threshold != null ? `₹${approvalData.threshold.toLocaleString()}` : '—'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
+                onClick={() => handleApprovalDecision('rejected')}
+                className="rounded-xl border border-rose-300 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-800 hover:bg-rose-100 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-300 disabled:opacity-50"
+              >
+                Reject Invoice
+              </button>
+
+              <button
+                type="button"
+                disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
+                onClick={() => handleApprovalDecision('approved')}
+                className="rounded-xl border border-emerald-300 bg-emerald-600 px-5 py-2.5 text-xs font-semibold text-white shadow-md hover:bg-emerald-700 dark:border-emerald-700 dark:bg-emerald-600 dark:hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {isSubmittingApproval ? 'Processing...' : 'Approve & Continue'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Screenshot Preview Modal */}
+      {selectedScreenshot && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/70 backdrop-blur-xs p-4 animate-in fade-in duration-200">
+          <div className="w-full max-w-4xl rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
+              <h3 className="text-sm font-semibold text-zinc-100">
+                Step Screenshot Preview
+              </h3>
+              <button
+                onClick={() => setSelectedScreenshot(null)}
+                className="rounded-lg bg-zinc-800 p-1.5 text-zinc-400 hover:text-white"
+              >
+                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="overflow-hidden rounded-xl border border-zinc-800 bg-black flex items-center justify-center p-2">
+              <img
+                src={`data:image/png;base64,${selectedScreenshot}`}
+                alt="Agent Step Screenshot"
+                className="max-h-[70vh] w-auto object-contain rounded"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

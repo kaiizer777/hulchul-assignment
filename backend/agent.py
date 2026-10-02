@@ -263,6 +263,9 @@ class ReActAgent:
         # Track idempotency checks performed during this run (cache key: entity_type:identifier -> check_result)
         self._checked_entities: Dict[str, Dict[str, Any]] = {}
 
+        # Approval threshold extracted from goal or default
+        self.approval_threshold: float = settings.DEFAULT_APPROVAL_THRESHOLD
+
     async def get_groq_client(self) -> AsyncGroq:
         """Get or initialize the asynchronous Groq API client."""
         if self._groq_client is None:
@@ -341,6 +344,7 @@ class ReActAgent:
         result: Optional[str] = None,
         screenshot_b64: Optional[str] = None,
         timestamp: Optional[datetime] = None,
+        step_id: Optional[str] = None,
     ) -> str:
         """
         Persist an agent step to Neon agent_steps table (Phase 2.6).
@@ -348,32 +352,49 @@ class ReActAgent:
         Guarantees foreign key integrity by ensuring agent_runs record exists.
         """
         run_uuid = uuid.UUID(str(self.run_id))
+        step_uuid = uuid.UUID(str(step_id)) if step_id else None
         pool = await self.get_db()
 
         async def _execute_insert() -> uuid.UUID:
             """Executes SQL insert statement for agent step and returns step UUID."""
             async with pool.acquire() as conn:
-                return await conn.fetchval(
-                    """
-                    INSERT INTO agent_steps (run_id, action, result, screenshot_b64, timestamp)
-                    VALUES ($1, $2, $3, $4, COALESCE($5, now()))
-                    RETURNING step_id;
-                    """,
-                    run_uuid,
-                    action,
-                    result,
-                    screenshot_b64,
-                    timestamp,
-                )
+                if step_uuid:
+                    return await conn.fetchval(
+                        """
+                        INSERT INTO agent_steps (step_id, run_id, action, result, screenshot_b64, timestamp)
+                        VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
+                        ON CONFLICT (step_id) DO UPDATE SET result = EXCLUDED.result, screenshot_b64 = EXCLUDED.screenshot_b64
+                        RETURNING step_id;
+                        """,
+                        step_uuid,
+                        run_uuid,
+                        action,
+                        result,
+                        screenshot_b64,
+                        timestamp,
+                    )
+                else:
+                    return await conn.fetchval(
+                        """
+                        INSERT INTO agent_steps (run_id, action, result, screenshot_b64, timestamp)
+                        VALUES ($1, $2, $3, $4, COALESCE($5, now()))
+                        RETURNING step_id;
+                        """,
+                        run_uuid,
+                        action,
+                        result,
+                        screenshot_b64,
+                        timestamp,
+                    )
 
         try:
-            step_id = await _execute_insert()
-            return str(step_id)
+            sid = await _execute_insert()
+            return str(sid)
         except asyncpg.ForeignKeyViolationError:
             logger.info(f"Run {self.run_id} missing in agent_runs during persist_step; ensuring record...")
             await self.ensure_run_record()
-            step_id = await _execute_insert()
-            return str(step_id)
+            sid = await _execute_insert()
+            return str(sid)
 
     async def update_step(
         self,
@@ -565,6 +586,7 @@ class ReActAgent:
             "vendor": vendor,
             "amount": amount,
             "po_number": po_number,
+            "threshold": self.approval_threshold,
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -716,6 +738,7 @@ class ReActAgent:
 
         # 2. Extract constraints from goal
         threshold = extract_approval_threshold(clean_goal, default=settings.DEFAULT_APPROVAL_THRESHOLD)
+        self.approval_threshold = threshold
         vendor_filter = extract_vendor_filter(clean_goal)
         system_prompt = build_system_prompt(clean_goal, threshold=threshold, vendor_filter=vendor_filter)
 
@@ -1297,10 +1320,12 @@ class ReActAgent:
                             })
                             continue
 
+            step_id = str(uuid.uuid4())
             # Execute Tool with recovery wrap (Phase 2.8)
             await self.emit_event(
                 "step_start",
                 {
+                    "step_id": step_id,
                     "step_index": iteration,
                     "action": tool_name,
                     "arguments": tool_args,
@@ -1330,7 +1355,9 @@ class ReActAgent:
                 failed_step_id = await self.persist_step(
                     action=tool_name,
                     result=f"failed: {tool_result.get('error')}",
+                    step_id=step_id,
                 )
+                has_sc = False
                 try:
                     sc = await self.tools.take_screenshot(
                         step_id=failed_step_id,
@@ -1343,16 +1370,21 @@ class ReActAgent:
                                 sc["screenshot_b64"],
                                 uuid.UUID(failed_step_id),
                             )
+                        has_sc = True
+                    elif sc and sc.get("screenshot_b64"):
+                        has_sc = True
                 except Exception as sc_err:
                     logger.warning(f"Failure screenshot not captured: {sc_err}")
 
                 await self.emit_event(
                     "step_failed",
                     {
+                        "step_id": failed_step_id,
                         "step_index": iteration,
                         "action": tool_name,
                         "arguments": tool_args,
                         "error": tool_result.get("error"),
+                        "has_screenshot": has_sc,
                     },
                 )
             else:
@@ -1381,10 +1413,12 @@ class ReActAgent:
                         action=tool_name,
                         result=result_summary,
                         screenshot_b64=sc_b64,
+                        step_id=step_id,
                     )
                 await self.emit_event(
                     "step_complete",
                     {
+                        "step_id": step_id,
                         "step_index": iteration,
                         "action": tool_name,
                         "result": result_summary,
