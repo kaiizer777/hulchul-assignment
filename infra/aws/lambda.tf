@@ -54,11 +54,3 @@ resource "aws_lambda_permission" "allow_public_url" {
   principal              = "*"
   function_url_auth_type = "NONE"
 }
-
-resource "aws_lambda_permission" "allow_function_url_invocation" {
-  statement_id             = "AllowInvocationViaFunctionUrl"
-  action                   = "lambda:InvokeFunction"
-  function_name            = aws_lambda_function.backend.function_name
-  principal                = "*"
-  invoked_via_function_url = true
-}
