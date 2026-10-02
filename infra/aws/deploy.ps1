@@ -42,10 +42,15 @@ Write-Host "Initializing Terraform..." -ForegroundColor Cyan
 & 'C:\Terraform\terraform.exe' init
 
 Write-Host "Applying Terraform to create ECR repository..." -ForegroundColor Cyan
-& 'C:\Terraform\terraform.exe' apply -target=aws_ecr_repository.backend -auto-approve
+& 'C:\Terraform\terraform.exe' apply -target="aws_ecr_repository.backend" -auto-approve
 
-$ecrUrl = & 'C:\Terraform\terraform.exe' output -raw ecr_repository_url
+$ecrUrl = (& 'C:\Terraform\terraform.exe' output -raw ecr_repository_url).Trim()
 Write-Host "ECR Repository URL: $ecrUrl" -ForegroundColor Green
+
+if ([string]::IsNullOrWhiteSpace($ecrUrl)) {
+    Write-Error "Failed to retrieve ECR repository URL from Terraform output!"
+    exit 1
+}
 
 Write-Host "Logging into AWS ECR..." -ForegroundColor Cyan
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $ecrUrl
