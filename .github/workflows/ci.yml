@@ -29,7 +29,7 @@ jobs:
 
       - name: Install Dependencies
         working-directory: ./frontend
-        run: npm install --legacy-peer-deps
+        run: npm ci
 
       - name: Run Tests
         working-directory: ./frontend
