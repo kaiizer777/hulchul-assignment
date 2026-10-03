@@ -1220,16 +1220,23 @@ async def stream_agent_run_endpoint(
                         # Bounded like the queue wait above. A stalled reconcile
                         # read must not hold the generator open: it would stop the
                         # ping below and turn a database hiccup into a silently
-                        # frozen stream. asyncio.TimeoutError is an OSError, so the
-                        # handler catches it with any other read failure and leaves
-                        # the cursor where it was, and the next deadline re-reads
-                        # the gap.
+                        # frozen stream.
                         reconcile = await asyncio.wait_for(
                             _reconcile_durable_state(),
                             timeout=SSE_RECONCILE_TIMEOUT_SECONDS,
                         )
                         for frame in reconcile:
                             yield frame
+                    except asyncio.TimeoutError:
+                        # Logged apart from a read failure because the two mean
+                        # different things operationally: a timeout is the bound
+                        # above firing on a stalled connection, not a query that
+                        # returned an error. The cursor is untouched either way, so
+                        # the next deadline re-reads the gap.
+                        logger.warning(
+                            f"Timed out reconciling durable state for SSE stream {run_id_str} "
+                            f"after {SSE_RECONCILE_TIMEOUT_SECONDS}s"
+                        )
                     except Exception as db_err:
                         # A transient read must not close the stream. The cursor is
                         # left untouched, so the next deadline re-reads the gap.

@@ -55,7 +55,9 @@ def _mock_redis() -> MagicMock:
 
 
 def _fake_step_store_hanging_first_polls(
-    rows: List[Dict[str, Any]], hangs: int = 1
+    rows: List[Dict[str, Any]],
+    hangs: int = 1,
+    entered: List[str] | None = None,
 ):
     """Wrap the proven _fake_step_store so the first `hangs` cursor polls never return.
 
@@ -66,6 +68,13 @@ def _fake_step_store_hanging_first_polls(
     unchanged, so the (timestamp, step_id) cursor comparison is honoured exactly as
     in the unsuspended case and a test cannot pass against a fake that ignores the
     cursor.
+
+    Only a cursor query is ever hung, so a caller that wants the stream to reach
+    the hang must seed at least one replayed row: with no rows the stream's
+    ``step_cursor`` stays None and the poll reads _SSE_STEPS_ALL_SQL instead, so
+    the hang would never be entered. ``entered`` records each hang that was
+    actually reached, so a test can assert it stalled instead of passing without
+    ever doing so.
     """
     store = _fake_step_store(rows)
     never_set = asyncio.Event()
@@ -74,6 +83,8 @@ def _fake_step_store_hanging_first_polls(
     async def fetch_steps(query: str, run_uuid: Any, *args: Any) -> List[Any]:
         if query == _SSE_STEPS_AFTER_CURSOR_SQL and state["hangs"] > 0:
             state["hangs"] -= 1
+            if entered is not None:
+                entered.append(query)
             await never_set.wait()
         return await store(query, run_uuid, *args)
 
@@ -445,6 +456,7 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
         rows: List[Dict[str, Any]],
         hangs: int,
         run_status: Dict[str, str] | None = None,
+        entered: List[str] | None = None,
     ) -> MagicMock:
         mock_pool = _make_mock_pool()
         mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(
@@ -454,7 +466,9 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
             mock_pool._mock_conn.fetchval.return_value = "running"
         else:
             mock_pool._mock_conn.fetchval.side_effect = lambda *a, **kw: run_status["value"]
-        mock_pool._mock_conn.fetch.side_effect = _fake_step_store_hanging_first_polls(rows, hangs=hangs)
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store_hanging_first_polls(
+            rows, hangs=hangs, entered=entered
+        )
         return mock_pool
 
     async def test_hung_reconcile_does_not_stop_ping_and_does_not_skip_row(self) -> None:
@@ -600,14 +614,57 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
             "transition on the floor with the discarded frames",
         )
 
+    async def test_reconcile_timeout_is_logged_apart_from_a_read_failure(self) -> None:
+        """A timeout must be distinguishable in logs from a query that errored."""
+        run_id = uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(uuid.uuid4(), "navigate", "loaded", created_at)
+        ]
+        mock_pool = self._hanging_pool(run_id, rows, hangs=1)
+
+        with self.assertLogs(level="WARNING") as logs:
+            frames = await _open_stream(self, mock_pool, run_id)
+            try:
+                for _ in range(2):
+                    await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                # The generator only advances as frames are pulled, so keep pulling
+                # until the bound has abandoned the hanging poll.
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while not any("Timed out reconciling durable state" in m for m in logs.output):
+                    self.assertLess(
+                        asyncio.get_running_loop().time(),
+                        deadline,
+                        f"the reconcile timeout was never logged: {logs.output}",
+                    )
+                    await asyncio.wait_for(frames.__anext__(), timeout=1.0)
+            finally:
+                await frames.aclose()
+
+        self.assertFalse(
+            [m for m in logs.output if "Error reconciling durable state" in m],
+            f"a timeout must not be reported as a read failure: {logs.output}",
+        )
+        self.assertTrue(
+            any(str(run_id) in m for m in logs.output if "Timed out reconciling" in m),
+            f"the timeout log must identify the stream: {logs.output}",
+        )
+
     async def test_client_disconnect_tears_down_a_stream_with_a_hung_reconcile(self) -> None:
         """A disconnect must still close the stream while a reconcile read hangs."""
         run_id = uuid.uuid4()
         run_id_str = str(run_id)
-        rows: List[Dict[str, Any]] = []
+        created_at = datetime.now(timezone.utc)
+        # One replayed row is required: it is what leaves step_cursor non-None, so
+        # the poll reads the cursor query the fake hangs on. With an empty step
+        # list the stream would poll _SSE_STEPS_ALL_SQL and never stall.
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(uuid.uuid4(), "navigate", "loaded", created_at)
+        ]
+        entered: List[str] = []
         # Every cursor poll hangs, so the stream is wedged in the reconcile at the
         # moment the client goes away.
-        mock_pool = self._hanging_pool(run_id, rows, hangs=10_000)
+        mock_pool = self._hanging_pool(run_id, rows, hangs=10_000, entered=entered)
 
         async def fake_get_pool() -> MagicMock:
             return mock_pool
@@ -667,7 +724,17 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
                 while run_id_str not in run_event_hub._subscribers:
                     self.assertLess(loop.time(), deadline, "the stream never subscribed")
                     await asyncio.sleep(0.01)
-                await asyncio.sleep(0.2)
+                # The poll deadline has to have fired and reached the hanging read
+                # before the client leaves, otherwise this asserts nothing about a
+                # stalled reconcile.
+                deadline = loop.time() + 5.0
+                while not entered:
+                    self.assertLess(
+                        loop.time(),
+                        deadline,
+                        "the stream never entered the hanging cursor read",
+                    )
+                    await asyncio.sleep(0.01)
                 disconnect_now.set()
                 await asyncio.wait_for(serving, timeout=5.0)
             finally:
@@ -676,9 +743,14 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
                     with suppress(asyncio.CancelledError, Exception):
                         await serving
 
+        self.assertEqual(
+            entered,
+            [_SSE_STEPS_AFTER_CURSOR_SQL],
+            "the disconnect must have interrupted the bounded cursor read",
+        )
         self.assertTrue(
-            any(b"ping" in chunk for chunk in body),
-            f"expected a ping frame in the response body, got {body!r}",
+            any(b"status_change" in chunk for chunk in body),
+            f"expected the replayed status_change in the response body, got {body!r}",
         )
         self.assertNotIn(
             run_id_str,
