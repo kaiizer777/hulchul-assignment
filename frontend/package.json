@@ -7,7 +7,8 @@
     "build": "next build",
     "build:cloudflare": "opennextjs-cloudflare build",
     "verify:cloudflare": "node scripts/verify-cloudflare-bundle.mjs",
-    "deploy:cloudflare": "npm run build:cloudflare && npm run verify:cloudflare && wrangler deploy",
+    "verify:secrets": "node scripts/verify-worker-secrets.mjs",
+    "deploy:cloudflare": "npm run build:cloudflare && npm run verify:cloudflare && npm run verify:secrets && wrangler deploy",
     "start": "next start -p 3051",
     "lint": "eslint",
     "test": "vitest run"

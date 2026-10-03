@@ -25,3 +25,14 @@ UPSTASH_REDIS_REST_URL = "https://mature-doberman-225309.upstash.io"
 # absent), so a missed provisioning shows up as a 401 storm rather than a
 # security hole.
 
+# DATABASE_URL is likewise intentionally NOT in this file, for the same two reasons:
+# a secret in wrangler.toml is committed to git, and this one carries the Neon
+# account password. Provision it out of band:
+#
+#   npx wrangler secret put DATABASE_URL
+#
+# Without it getDb() (frontend/src/lib/db.ts) throws on every DB-backed /api route.
+# Both this secret and UPSTASH_REDIS_REST_TOKEN are asserted present by
+# `npm run verify:secrets` (scripts/verify-worker-secrets.mjs), which `npm run
+# deploy:cloudflare` runs before uploading so a missed provisioning cannot ship.
+

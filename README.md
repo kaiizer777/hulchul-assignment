@@ -150,13 +150,31 @@ npm run deploy:cloudflare
 
 This builds the OpenNext bundle, asserts that `NEXT_PUBLIC_BACKEND_URL` was actually
 inlined into a client chunk (`npm run verify:cloudflare`), and only then deploys with
-Wrangler. Run the three steps separately while iterating:
+Wrangler. Run the steps separately while iterating:
 
 ```bash
 npm run build:cloudflare
 npm run verify:cloudflare
+npm run verify:secrets
 npx wrangler deploy
 ```
+
+Both `DATABASE_URL` (Neon) and `UPSTASH_REDIS_REST_TOKEN` (Upstash Redis) must be
+provisioned on the Worker **before** deploying, because both are read from
+`process.env` at request time and a missing one is not a build error — it only shows
+up as `/api/*` routes failing once the deploy is live. `npm run deploy:cloudflare`
+now runs `npm run verify:secrets` between the bundle check and the upload and refuses
+to deploy if either secret is absent or unverifiable. Provision them out of band:
+
+```bash
+cd frontend
+npx wrangler secret put DATABASE_URL
+npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
+```
+
+`DATABASE_URL` must be a Worker **secret**, not a `[vars]` entry in `wrangler.toml`:
+it embeds the Neon account password, and `wrangler.toml` is committed to git. The
+check reads secret *names* only and never values.
 
 ### Backend (AWS Lambda via ECR)
 
