@@ -283,11 +283,23 @@ async def run_lease_heartbeat(
     exception; the lease window is sized with enough margin (see
     ``validate_run_lease_settings``) to absorb short outages.
 
-    Losing the lease is different from a failed renewal and is reported through
-    ``on_ownership_lost`` before the heartbeat returns. A renewal that matches zero
-    rows means this execution is no longer the owner: the run was reclaimed, or a
-    newer execution claimed it, and the caller is now driving someone else's run.
-    Stopping silently is not enough -- the owner-scoped fence in
+    Retrying is bounded by that same window. A renewal that keeps *raising* -- pool
+    acquire timeouts, an exhausted pool, a network partition on this host only --
+    never returns zero rows, so the "lease lost" branch below is never reached and the
+    retry would otherwise be unbounded. Meanwhile the lease in ``agent_runs`` expires
+    ``lease_seconds`` after the last renewal that actually landed, reconciliation on
+    another instance can fail the run, and a duplicate dispatch can claim it: the
+    double-run this module exists to prevent, reached through the one path the
+    owner-scoped fence does not cover. So the elapsed time since the last successful
+    renewal is tracked on a monotonic clock and reaching ``lease_seconds`` reports
+    ownership loss. The run stops instead of continuing to act on a lease it can no
+    longer prove it holds -- which is the correct direction to be wrong in, since a
+    premature stop leaves a resumable run while an unfenced run duplicates invoices.
+
+    Losing the lease is reported through ``on_ownership_lost`` before the heartbeat
+    returns, on either path: a renewal that matches zero rows (the run was reclaimed,
+    or a newer execution claimed it) or a renewal that could not be completed inside
+    the window. Stopping silently is not enough -- the owner-scoped fence in
     ``ReActAgent.update_run_status`` only drops a status write, it does not stop
     ``tools.execute``, step persistence, Redis writes or the ``done`` event, so the
     loop has to be told to unwind. The callback is invoked at most once and its own
@@ -302,6 +314,12 @@ async def run_lease_heartbeat(
             logger.warning(
                 f"Run lease ownership-lost callback for {run_id} raised: {cb_err}"
             )
+
+    # Monotonic, so an NTP step or a wall-clock change cannot extend or collapse the
+    # window. Seeded here because the lease was claimed by ensure_run_record
+    # immediately before this task was created.
+    loop = asyncio.get_event_loop()
+    last_renewed_at = loop.time()
 
     try:
         while True:
@@ -322,6 +340,13 @@ async def run_lease_heartbeat(
                 raise
             except Exception as e:
                 logger.warning(f"Run lease heartbeat renewal failed for {run_id}: {e}")
+                if loop.time() - last_renewed_at >= lease_seconds:
+                    logger.error(
+                        f"Run lease for {run_id} could not be renewed within its "
+                        f"{lease_seconds}s window; treating ownership as lost."
+                    )
+                    _report_ownership_lost()
+                    return
                 continue
             if not renewed:
                 logger.error(
@@ -329,6 +354,7 @@ async def run_lease_heartbeat(
                 )
                 _report_ownership_lost()
                 return
+            last_renewed_at = loop.time()
     except asyncio.CancelledError:
         logger.info(f"Run lease heartbeat for {run_id} cancelled.")
         raise

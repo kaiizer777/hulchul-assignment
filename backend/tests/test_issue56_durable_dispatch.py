@@ -364,6 +364,17 @@ async def _await_renewals(pool: "_FakePool", minimum: int) -> bool:
         await asyncio.sleep(0.005)
 
 
+async def _await_call_count(state: Dict[str, int], minimum: int) -> bool:
+    """Yield until a counter reaches `minimum`.
+
+    Bounded by the caller's wait_for: a heartbeat that stops early freezes the counter,
+    and that has to surface as a failure rather than as a hung test.
+    """
+    while state["n"] < minimum:
+        await asyncio.sleep(0.005)
+    return True
+
+
 class TestRunLeaseClaim(unittest.IsolatedAsyncioTestCase):
     """claim_run_lease: the property that makes a duplicate request harmless."""
 
@@ -1050,6 +1061,128 @@ class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
         agent._mark_run_lease_lost()
         agent._mark_run_lease_lost()
         self.assertTrue(agent._lease_ownership_lost)
+
+    async def test_06_sustained_renewal_failure_reports_ownership_loss(self) -> None:
+        """A renewal that keeps RAISING never returns zero rows, so the "lease lost"
+        branch is unreachable and an unbounded retry would let the lease lapse
+        silently while the run keeps acting on it.
+
+        The heartbeat must give up once ``lease_seconds`` has passed with no renewal
+        actually landing, which is the point at which another instance's reconciliation
+        or a duplicate dispatch can take the run.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)],
+            fail_on=[_RENEW_QUERY_MARKER],
+        )
+        reported: List[str] = []
+
+        with self.assertLogs("backend.run_lease", level="ERROR"):
+            await asyncio.wait_for(
+                run_lease_heartbeat(
+                    pool, run_id, "owner-a", 0.01, 0.05,
+                    on_ownership_lost=lambda: reported.append("lost"),
+                ),
+                timeout=5.0,
+            )
+
+        self.assertEqual(reported, ["lost"])
+        self.assertGreater(len(pool.find(_RENEW_QUERY_MARKER)), 1, "the retry must not be a no-op")
+
+    async def test_07_transient_renewal_failure_is_retried_without_reporting(self) -> None:
+        """A blip shorter than the window must not be mistaken for a lost lease.
+
+        validate_run_lease_settings sizes the window with margin precisely so a short
+        outage does not stop a live run; giving up on the first failure would
+        reintroduce the bug this callback was added to fix.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)]
+        )
+        reported: List[str] = []
+        real_renew = renew_run_lease
+        calls = {"n": 0}
+
+        async def _flaky(*args: Any, **kwargs: Any) -> bool:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError("pool acquire timeout")
+            return await real_renew(*args, **kwargs)
+
+        with patch("backend.run_lease.renew_run_lease", new=_flaky):
+            task = asyncio.create_task(
+                run_lease_heartbeat(
+                    pool, run_id, "owner-a", 0.01, 900.0,
+                    on_ownership_lost=lambda: reported.append("lost"),
+                )
+            )
+            try:
+                await asyncio.wait_for(_await_renewals(pool, minimum=1), timeout=5.0)
+                self.assertFalse(task.done(), "a short outage must not stop the heartbeat")
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        self.assertEqual(reported, [])
+        self.assertGreaterEqual(calls["n"], 3)
+
+    async def test_08_long_healthy_run_still_tolerates_a_later_failure(self) -> None:
+        """The window is measured from the last renewal, not from the heartbeat's start.
+
+        Seeding the clock once and never resetting it would stop any run that has been
+        executing longer than one lease window the first time a single renewal blipped
+        -- which is the heartbeat-during-a-pause bug all over again, and it would fire
+        on long healthy runs where it matters most.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)]
+        )
+        reported: List[str] = []
+        real_renew = renew_run_lease
+        state = {"n": 0, "failing": False}
+        # 8 renewals at a 10ms interval is comfortably more than one 200ms window,
+        # so the clock has to be reset per renewal for this to pass.
+        healthy_needed = 8
+        failures_needed = 3
+
+        async def _fail_after_healthy(*args: Any, **kwargs: Any) -> bool:
+            state["n"] += 1
+            if state["failing"]:
+                raise RuntimeError("pool acquire timeout")
+            renewed = await real_renew(*args, **kwargs)
+            if state["n"] >= healthy_needed:
+                state["failing"] = True
+            return renewed
+
+        with patch("backend.run_lease.renew_run_lease", new=_fail_after_healthy):
+            task = asyncio.create_task(
+                run_lease_heartbeat(
+                    pool, run_id, "owner-a", 0.01, 0.2,
+                    on_ownership_lost=lambda: reported.append("lost"),
+                )
+            )
+            try:
+                # Bounded: if the heartbeat gives up early, `state["n"]` stops
+                # advancing and this must fail rather than spin forever.
+                await asyncio.wait_for(
+                    _await_call_count(state, minimum=healthy_needed + failures_needed),
+                    timeout=5.0,
+                )
+                await asyncio.sleep(0.05)
+                self.assertFalse(
+                    task.done(),
+                    "a healthy run was stopped by a failure well inside its own window",
+                )
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        self.assertEqual(reported, [])
 
 
 class _LoopHarness:
