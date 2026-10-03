@@ -455,7 +455,10 @@ def test_eleventh_failed_attempt_in_a_window_is_rate_limited(
 
         assert blocked.status_code == 429
         assert blocked.headers["Retry-After"] == "900"
-        assert redis.record_login_failure.call_count == 10
+        # Atomic INCR-first gate: the blocked 11th attempt also consumes a slot
+        # (gate INCR is the failure record), so 11 INCRs for 11 attempts vs the
+        # old GET-gate's 10. Hasher stays at 10: the block happens pre-hash.
+        assert redis.record_login_failure.call_count == 11
         # The limit is applied before hashing, so a blocked attempt costs no argon2 work.
         assert hasher.verify.call_count == 10
 
@@ -503,6 +506,80 @@ def test_rate_limiter_buckets_by_forwarded_for(client: TestClient, configured_pa
             headers={"X-Forwarded-For": "198.51.100.4"},
         )
         assert other.status_code == 401
+
+
+def test_concurrent_login_burst_is_bounded_by_atomic_incr(
+    configured_password: str,
+) -> None:
+    """Regression: N concurrent same-bucket attempts must not each burn a hash.
+
+    Sequential tests cannot catch the old GET-count -> verify -> INCR race: N
+    concurrent requests all read the same stale count and each burns a full
+    argon2 verify. With the INCR-first gate the INCR is server-atomic, so only
+    the remaining budget slots reach the hasher and the excess 429s pre-hash.
+    """
+    import asyncio
+
+    burst_size = 20
+    failures: dict[str, int] = {}
+    redis = MagicMock(spec=UpstashRedisClient)
+    redis.is_configured = True
+
+    async def _count(ip: str) -> int:
+        await asyncio.sleep(0)
+        return failures.get(ip, 0)
+
+    async def _record(ip: str, window_seconds: int) -> int:
+        # Atomic like real Redis INCR: mutate before yielding, so concurrent
+        # callers still observe distinct sequential counts.
+        failures[ip] = failures.get(ip, 0) + 1
+        count = failures[ip]
+        await asyncio.sleep(0)
+        return count
+
+    async def _clear(ip: str) -> None:
+        failures.pop(ip, None)
+
+    redis.get_login_failure_count = AsyncMock(side_effect=_count)
+    redis.record_login_failure = AsyncMock(side_effect=_record)
+    redis.clear_login_failures = AsyncMock(side_effect=_clear)
+
+    hasher = MagicMock(spec=PasswordHasher)
+    hasher.verify.return_value = False
+
+    async def _burst() -> list:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as async_client:
+            return await asyncio.gather(
+                *[
+                    async_client.post(
+                        "/auth/login",
+                        json={"password": "wrong"},
+                        headers={"X-Forwarded-For": "203.0.113.99"},
+                    )
+                    for _ in range(burst_size)
+                ]
+            )
+
+    with (
+        patch.object(auth_module, "get_redis_client", return_value=redis),
+        patch.object(auth_module, "_password_hasher", hasher),
+    ):
+        responses = _run(_burst())
+
+    statuses = [response.status_code for response in responses]
+    assert len(statuses) == burst_size
+    assert set(statuses) <= {401, 429}
+    # Only the remaining budget slots may burn a hash; the excess 429s pre-hash.
+    assert hasher.verify.call_count <= auth.LOGIN_MAX_FAILURES
+    assert statuses.count(429) >= burst_size - auth.LOGIN_MAX_FAILURES
+    # Single increment per attempt: the gate INCR is the failure record.
+    assert redis.record_login_failure.call_count == burst_size
+    for response in responses:
+        if response.status_code == 429:
+            assert response.headers["Retry-After"] == "900"
+            assert response.json() == {"detail": auth.RATE_LIMITED_DETAIL}
 
 
 def _unconfigured_redis() -> UpstashRedisClient:
@@ -561,6 +638,8 @@ def test_login_returns_503_when_redis_fails_mid_write(
     broken = MagicMock(spec=UpstashRedisClient)
     broken.is_configured = True
     broken.get_login_failure_count = AsyncMock(return_value=0)
+    # Atomic INCR-first gate consumes via record_login_failure, not GET.
+    broken.record_login_failure = AsyncMock(return_value=1)
     broken.clear_login_failures = AsyncMock(return_value=None)
     broken.create_auth_session = AsyncMock(side_effect=UpstashRedisError("connection refused"))
 
