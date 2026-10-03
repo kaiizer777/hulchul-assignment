@@ -758,6 +758,75 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         )
         return response.body_iterator
 
+    async def test_setup_failure_releases_reservation_and_accepts_retry(self) -> None:
+        """A setup failure must free the run_id so the operator can retry it."""
+        run_id = "99999999-9999-4999-8999-999999999999"
+
+        async def exploding_get_pool() -> MagicMock:
+            raise RuntimeError("database pool unavailable")
+
+        mock_redis = AsyncMock()
+
+        async def healthy_get_pool() -> MagicMock:
+            return mock_pool
+
+        mock_pool = _make_mock_pool()
+
+        async def quick_run(self_agent, goal: str) -> Dict[str, Any]:
+            return {
+                "run_id": self_agent.run_id,
+                "status": "completed",
+                "iterations": 0,
+                "goal": goal,
+                "threshold": 50000.0,
+                "summary": "done",
+            }
+
+        # raise_app_exceptions off so the 500 is observable rather than raised
+        # through the transport.
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        with (
+            patch("backend.main.get_db_pool", new=exploding_get_pool),
+            patch("backend.db.get_db_pool", new=exploding_get_pool),
+        ):
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                failed = await ac.post(
+                    "/agent/run",
+                    json={"goal": "Process all pending invoices", "run_id": run_id},
+                )
+
+        self.assertGreaterEqual(failed.status_code, 500)
+        self.assertNotIn(
+            run_id,
+            _reserved_agent_runs,
+            "a failed setup must not leave the run_id reserved",
+        )
+
+        # The retry must be accepted and dispatched, not short-circuited as a
+        # duplicate of the run that never started.
+        with (
+            patch("backend.main.get_db_pool", new=healthy_get_pool),
+            patch("backend.db.get_db_pool", new=healthy_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=_fake_browser_session),
+            patch("backend.agent.ReActAgent.run", new=quick_run),
+        ):
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+                retried = await ac.post(
+                    "/agent/run",
+                    json={"goal": "Process all pending invoices", "run_id": run_id},
+                )
+                self.assertEqual(retried.status_code, 202)
+                self.assertEqual(retried.json()["run_id"], run_id)
+
+                task = _active_agent_tasks.get(run_id)
+                self.assertIsNotNone(task, "the retry must actually dispatch a run")
+                if task is not None:
+                    await asyncio.wait_for(task, timeout=10.0)
+
+        self.assertEqual(mock_pool._mock_conn.execute.await_count, 1)
+        self.assertNotIn(run_id, _reserved_agent_runs)
+
     async def test_cancelled_run_still_drains_browser_sessions_during_teardown(self) -> None:
         """A cancellation during teardown must not skip the browser session close."""
         mock_pool = _make_mock_pool()
