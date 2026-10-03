@@ -785,7 +785,10 @@ class ReActAgent:
 
     async def _abort_session_lost(self, iteration: int, error: str, threshold: float, clean_goal: str) -> Dict[str, Any]:
         """Persist and broadcast terminal session_lost distinct from step_failed."""
-        await self.persist_step(
+        # Carry the row's step_id so the SSE stream can correlate this frame with
+        # the durable poll's read of the same row: a duplicate session_lost would
+        # re-fire the frontend's terminal-status branch.
+        session_lost_step_id = await self.persist_step(
             action="session_lost",
             result=f"session_lost: {error} after {self._reattach_attempts} reattach attempt(s)",
         )
@@ -793,6 +796,7 @@ class ReActAgent:
         await self.emit_event(
             "session_lost",
             {
+                "step_id": session_lost_step_id,
                 "step": iteration,
                 "error": error,
                 "terminal": True,
@@ -973,11 +977,20 @@ class ReActAgent:
                 response_msg = choice.message
             except Exception as llm_err:
                 logger.error(f"Groq LLM completion failed on iteration {iteration}: {llm_err}")
-                await self.persist_step(
+                llm_fail_step_id = await self.persist_step(
                     action="llm_think",
                     result=f"failed: {llm_err}",
                 )
-                await self.emit_event("step_failed", {"action": "llm_think", "error": str(llm_err)})
+                # Carry the row's step_id so the SSE stream can correlate this frame
+                # with the durable poll's read of the same row and deliver it once.
+                await self.emit_event(
+                    "step_failed",
+                    {
+                        "step_id": llm_fail_step_id,
+                        "action": "llm_think",
+                        "error": str(llm_err),
+                    },
+                )
                 # Wait briefly and retry next iteration
                 await asyncio.sleep(2.0)
                 continue

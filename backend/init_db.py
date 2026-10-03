@@ -56,7 +56,12 @@ CREATE TABLE IF NOT EXISTS agent_steps (
 
 -- Foreign key & query performance indexes
 DROP INDEX IF EXISTS idx_agent_steps_run_id;
-CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp ON agent_steps(run_id, timestamp ASC);
+-- Leading (run_id, timestamp) serves every per-run step listing and their
+-- ORDER BY timestamp. The trailing step_id completes the key the SSE durable
+-- poll needs: its row comparison (timestamp, step_id) > ($2, $3) spans two
+-- columns, so it can only become an index qual if both are in the index.
+-- Without it the comparison degrades to a filter over the run's steps.
+CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp ON agent_steps(run_id, timestamp ASC, step_id ASC);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_po_number ON invoices(po_number);
 """
