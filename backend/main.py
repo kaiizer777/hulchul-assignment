@@ -735,9 +735,9 @@ async def submit_approval_decision(
             detail=f"No active pending approval request for run '{run_id}'",
         )
 
-    # Validate per-request nonce if provided or expected
+    # Validate per-request nonce (fail closed: pending must carry a nonce and it must match)
     pending_nonce = pending.get("nonce")
-    if pending_nonce and (payload.nonce is None or payload.nonce != pending_nonce):
+    if not pending_nonce or payload.nonce is None or payload.nonce != pending_nonce:
         raise HTTPException(
             status_code=400,
             detail="Invalid or missing approval nonce for the current pending request",

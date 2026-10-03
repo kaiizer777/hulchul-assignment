@@ -4,17 +4,33 @@ const LOCAL_BACKEND_URL = 'http://localhost:8051';
 const LOCAL_HOSTNAMES = ['localhost', '127.0.0.1'];
 
 /**
- * Resolves the backend base URL used by every agent control request.
+ * Server-only backend base URL resolver for the same-origin proxy.
  *
- * Resolution order:
- *   1. `NEXT_PUBLIC_BACKEND_URL`, inlined into the client bundle by Next.js at
- *      build time. This is the only tier that works for a deployed bundle.
- *   2. `http://localhost:8051`, but only when the page is actually being served
- *      from a local development host.
+ * Only imported by server routes (`src/app/api/agent/[...path]/route.ts`,
+ * `src/app/api/auth/login/route.ts`, `src/app/api/auth/logout/route.ts`).
+ * Never import this module from a client component: the browser talks to the
+ * same-origin `/api/agent` proxy (see `AGENT_API_BASE` in
+ * `src/app/agent/page.tsx`), never to the backend host directly, because
+ * `EventSource` cannot attach the session cookie cross-origin.
+ *
+ * Resolution order (unchanged; do not reorder):
+ *   1. `NEXT_PUBLIC_BACKEND_URL`, read server-side at runtime. The name is
+ *      intentional and must not be renamed: live server routes and the deploy
+ *      read this exact variable. Note the `NEXT_PUBLIC_` prefix still inlines
+ *      into any client bundle that imports this module, so the client import
+ *      ban above is load-bearing — `scripts/verify-cloudflare-bundle.mjs`
+ *      fails the build if the backend host leaks into client chunks.
+ *   2. `http://localhost:8051`, but only when `window` exists and the page is
+ *      actually served from a local development host (`localhost`/`127.0.0.1`).
+ *      Dormant on the server (no `window`) and in the proxy routes, retained
+ *      for local browser contexts and covered by jsdom tests — do not delete.
  *   3. `http://localhost:8051` for server-side calls outside production
- *      (`NODE_ENV !== 'production'`, inlined at build time), so a local dev
- *      login never POSTs a real password to the production backend.
- *   4. The production Lambda Function URL, as an explicit default.
+ *      (`NODE_ENV !== 'production'`), so a local dev login never POSTs a real
+ *      password to the production backend.
+ *   4. The production Lambda Function URL, as an explicit default. The
+ *      `PRODUCTION_BACKEND_URL` const name is coupled to the literal regex in
+ *      `scripts/verify-cloudflare-bundle.mjs` — renaming it silently disables
+ *      the leak scan, so do not rename.
  *
  * The last tier is deliberately not `localhost`. A browser that resolves to
  * `http://localhost:8051` sends the request to the visitor's own machine, which
@@ -34,39 +50,4 @@ export const getBackendUrl = (): string => {
     return LOCAL_BACKEND_URL;
   }
   return PRODUCTION_BACKEND_URL;
-};
-
-/**
- * Builds the user-facing message for a request that failed below the HTTP layer
- * (connection refused, DNS failure, TLS failure or a CORS rejection), so the UI
- * reports which backend was unreachable instead of a bare "Failed to fetch".
- *
- * The message deliberately does not claim the server never saw the request. A
- * rejected fetch() cannot distinguish "never arrived" from "arrived, but the
- * browser refused the response" (CORS), and POST /agent/run returns 202 + run
- * id immediately while the agent loop continues in the background. Asserting "no run
- * started" would invite a duplicate submission of side-effecting work, so the
- * operator is told to check the run status instead.
- *
- * Credentials embedded in the URL are stripped: this string is rendered on
- * screen and must never carry a secret.
- */
-export const unreachableBackendMessage = (backendUrl: string): string => {
-  let displayed = backendUrl;
-  try {
-    const parsed = new URL(backendUrl);
-    if (parsed.username || parsed.password) {
-      parsed.username = '';
-      parsed.password = '';
-      displayed = parsed.toString().replace(/\/$/, '');
-    }
-  } catch {
-    displayed = backendUrl;
-  }
-  return (
-    `Cannot read a response from the backend at ${displayed}. ` +
-    'The request may have reached the server, so the run status may be unknown: ' +
-    'check it before retrying. The backend may be down, or this origin may not be ' +
-    'allowed by its CORS policy.'
-  );
 };
