@@ -78,6 +78,13 @@ run_event_hub = RunEventHub()
 # freeze/thaw can suspend a warm-container task and the 15-min Lambda ceiling
 # applies; cross-instance loss is tracked separately (#33).
 _active_agent_tasks: Dict[str, asyncio.Task] = {}
+# Synchronous reservation guard closing the check-then-act race between the
+# existing-task check in run_agent_endpoint and asyncio.create_task: the first
+# await (get_db_pool) would otherwise let a second POST with the same run_id
+# pass the check and start a duplicate side-effecting loop. Reserved
+# synchronously before the first await; released on setup failure or when the
+# background task finishes.
+_reserved_agent_runs: Set[str] = set()
 
 
 async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
@@ -120,7 +127,10 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         except Exception:
             pass
     finally:
-        _active_agent_tasks.pop(run_id_str, None)
+        current = asyncio.current_task()
+        if current is not None and _active_agent_tasks.get(run_id_str) is current:
+            _active_agent_tasks.pop(run_id_str, None)
+        _reserved_agent_runs.discard(run_id_str)
 
 
 logging.basicConfig(
@@ -482,37 +492,50 @@ async def run_agent_endpoint(
             threshold=threshold,
             summary=None,
         )
-
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO agent_runs (run_id, goal, status, created_at)
-            VALUES ($1, $2, 'running', now())
-            ON CONFLICT (run_id) DO UPDATE SET status = 'running';
-            """,
-            uuid.UUID(run_id_str),
-            goal,
+    if run_id_str in _reserved_agent_runs:
+        return AgentRunResponse(
+            run_id=run_id_str,
+            status="running",
+            iterations=0,
+            goal=goal,
+            threshold=threshold,
+            summary=None,
         )
-
+    _reserved_agent_runs.add(run_id_str)
     try:
-        from backend.redis_client import get_redis_client
-        redis = get_redis_client()
-        await redis.set_session_state(
-            run_id_str,
-            {
-                "run_id": run_id_str,
-                "goal": goal,
-                "threshold": threshold,
-                "current_step": 0,
-                "status": "running",
-            },
-        )
-    except Exception as redis_err:
-        logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO agent_runs (run_id, goal, status, created_at)
+                VALUES ($1, $2, 'running', now())
+                ON CONFLICT (run_id) DO UPDATE SET status = 'running';
+                """,
+                uuid.UUID(run_id_str),
+                goal,
+            )
 
-    task = asyncio.create_task(_execute_agent_run_background(run_id_str, goal))
-    _active_agent_tasks[run_id_str] = task
+        try:
+            from backend.redis_client import get_redis_client
+            redis = get_redis_client()
+            await redis.set_session_state(
+                run_id_str,
+                {
+                    "run_id": run_id_str,
+                    "goal": goal,
+                    "threshold": threshold,
+                    "current_step": 0,
+                    "status": "running",
+                },
+            )
+        except Exception as redis_err:
+            logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
+
+        task = asyncio.create_task(_execute_agent_run_background(run_id_str, goal))
+        _active_agent_tasks[run_id_str] = task
+    except BaseException:
+        _reserved_agent_runs.discard(run_id_str)
+        raise
 
     return AgentRunResponse(
         run_id=run_id_str,

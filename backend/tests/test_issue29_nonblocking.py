@@ -11,7 +11,7 @@ from httpx import AsyncClient, ASGITransport
 
 from backend.auth import Session
 from backend.auth import require_session as require_session_dep
-from backend.main import app, run_event_hub, _active_agent_tasks
+from backend.main import app, run_event_hub, _active_agent_tasks, _reserved_agent_runs
 
 
 def _make_mock_pool() -> MagicMock:
@@ -55,6 +55,7 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
                 except Exception:
                     pass
         _active_agent_tasks.clear()
+        _reserved_agent_runs.clear()
 
     async def test_post_returns_202_fast_while_work_continues(self) -> None:
         mock_pool = _make_mock_pool()
@@ -210,3 +211,73 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
                 task = _active_agent_tasks.get(run_id)
                 if task is not None:
                     self.assertFalse(task.done(), "run should still be active mid-stream")
+
+    async def test_concurrent_same_run_id_single_execution(self) -> None:
+        mock_pool = _make_mock_pool()
+
+        async def slow_execute(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.2)
+            return "INSERT 1"
+
+        mock_pool._mock_conn.execute.side_effect = slow_execute
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        mock_redis = AsyncMock()
+
+        async def slow_set_state(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.sleep(0.2)
+            return True
+
+        mock_redis.set_session_state.side_effect = slow_set_state
+
+        run_count = 0
+
+        async def counting_run(self_agent, goal: str) -> Dict[str, Any]:
+            nonlocal run_count
+            run_count += 1
+            await asyncio.sleep(1.0)
+            return {
+                "run_id": self_agent.run_id,
+                "status": "completed",
+                "iterations": 1,
+                "goal": goal,
+                "threshold": 50000.0,
+                "summary": "done",
+            }
+
+        run_id = str(uuid.uuid4())
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=_fake_browser_session),
+            patch("backend.agent.ReActAgent.run", new=counting_run),
+        ):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as ac:
+
+                async def _post_once() -> Any:
+                    return await ac.post(
+                        "/agent/run",
+                        json={"goal": "Process all pending invoices", "run_id": run_id},
+                    )
+
+                resp_a, resp_b = await asyncio.gather(_post_once(), _post_once())
+
+                self.assertEqual(resp_a.status_code, 202)
+                self.assertEqual(resp_b.status_code, 202)
+                self.assertEqual(resp_a.json()["run_id"], run_id)
+                self.assertEqual(resp_b.json()["run_id"], run_id)
+                self.assertEqual(resp_a.json()["status"], "running")
+                self.assertEqual(resp_b.json()["status"], "running")
+
+                task = _active_agent_tasks.get(run_id)
+                self.assertIsNotNone(task)
+                if task is not None:
+                    await asyncio.wait_for(task, timeout=10.0)
+
+                self.assertEqual(run_count, 1)
+                self.assertEqual(mock_pool._mock_conn.execute.await_count, 1)
+                self.assertNotIn(run_id, _reserved_agent_runs)
