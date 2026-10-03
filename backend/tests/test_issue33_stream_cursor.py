@@ -2,11 +2,10 @@
 Regression coverage for issue #33: SSE live events must be delivered durably.
 
 `agent_steps` is the authoritative live-event source for
-`GET /agent/runs/{run_id}/stream`. History playback seeds a `(timestamp, step_id)`
-cursor and the stream tails that cursor every time the in-process
-`RunEventHub` queue goes quiet, so a step committed by a *different* Lambda
-execution environment -- which the local hub never saw -- still reaches an
-already-open stream.
+`GET /agent/runs/{run_id}/stream`. History playback seeds a `timestamp` cursor and
+the stream tails that cursor on a fixed interval, so a step committed by a
+*different* Lambda execution environment -- which the local hub never saw -- still
+reaches an already-open stream even while the hub is busy.
 
 `RunEventHub` stays as the low-latency warm path; the cursor tail is what makes
 delivery correct regardless of which instance produced the step.
@@ -30,7 +29,13 @@ from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 
 from backend.auth import Session
-from backend.main import app, run_event_hub, stream_agent_run_endpoint
+from backend.main import (
+    _QUEUE_POLL_TIMEOUT_S,
+    _STEP_TAIL_INTERVAL_S,
+    app,
+    run_event_hub,
+    stream_agent_run_endpoint,
+)
 
 T0 = datetime(2026, 3, 1, 9, 0, 0, tzinfo=timezone.utc)
 
@@ -83,7 +88,7 @@ class _Statement:
 
     @property
     def is_cursor_tail(self) -> bool:
-        return "(timestamp, step_id) > ($2, $3)" in self.sql
+        return "timestamp >= $2" in self.sql
 
     def __repr__(self) -> str:
         return f"_Statement(sql={self.sql!r}, args={self.args!r})"
@@ -95,9 +100,9 @@ class _FakeStreamConn:
     records every statement it received.
 
     The cursor predicate and the ordering are enforced, not merely tolerated: a
-    generator that dropped `(timestamp, step_id) > ($2, $3)` or the
-    `step_id` tiebreak raises here, so a regression in either fails loudly
-    instead of silently reading the wrong window.
+    generator that dropped `timestamp >= $2` or the `step_id` tiebreak raises
+    here, so a regression in either fails loudly instead of silently reading the
+    wrong window.
     """
 
     def __init__(self, db: "_FakeStreamDB") -> None:
@@ -125,19 +130,15 @@ class _FakeStreamConn:
             raise RuntimeError("agent_steps read failed")
 
         rows = list(self._db.rows)
-        if self._db.strict_cursor and "(timestamp, step_id) > ($2, $3)" in normalized:
-            if len(args) != 3:
-                raise AssertionError(
-                    "the cursor tail must bind (run_id, timestamp, step_id); "
-                    f"got {len(args)} parameters"
-                )
-            cursor = (args[1], str(args[2]))
-            rows = [r for r in rows if _order_key(r) > cursor]
-        elif "(timestamp, step_id) > ($2, $3)" in normalized and len(args) != 3:
+        if "timestamp >= $2" in normalized and len(args) != 2:
             raise AssertionError(
-                "the cursor tail must bind (run_id, timestamp, step_id); "
-                f"got {len(args)} parameters"
+                "the cursor tail must bind (run_id, timestamp) on an inclusive "
+                f"window; got {len(args)} parameters"
             )
+        if self._db.strict_cursor and "timestamp >= $2" in normalized:
+            # Inclusive, so the tie group at the cursor timestamp is re-read on
+            # purpose: `seen_step_ids` is what makes re-reading harmless.
+            rows = [r for r in rows if r["timestamp"] >= args[1]]
 
         rows.sort(key=_order_key)
         return rows
@@ -191,6 +192,11 @@ class _FastQueueTimeoutAsyncio:
     Stands in for the `asyncio` module inside `backend.main` for the duration of
     a test so the SSE loop's 15s `wait_for(queue.get())` expires immediately.
 
+    Only the queue poll is accelerated. The tail's own `wait_for` must keep its
+    real timeout, because compressing it would turn a slow in-test fake read into a
+    spurious `asyncio.TimeoutError` and the tail would silently return nothing --
+    exactly the kind of harness-induced flake this is meant to avoid.
+
     Patching the module attribute rather than `asyncio.wait_for` itself keeps the
     test's own safety timeouts real: `backend.db` and the test body import
     `asyncio` independently and are unaffected.
@@ -201,9 +207,9 @@ class _FastQueueTimeoutAsyncio:
 
     @staticmethod
     async def wait_for(awaitable: Any, timeout: Optional[float] = None, **kwargs: Any) -> Any:
-        if timeout is not None:
+        if timeout is not None and timeout == _QUEUE_POLL_TIMEOUT_S:
             return await asyncio.wait_for(awaitable, timeout=0.01)
-        return await asyncio.wait_for(awaitable, **kwargs)
+        return await asyncio.wait_for(awaitable, timeout=timeout, **kwargs)
 
 
 @contextlib.contextmanager
@@ -474,8 +480,154 @@ class TestIssue33StreamCursor(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(len(set(tally)), len(tally))
 
-    async def test_tail_query_pins_the_tuple_cursor_predicate_and_ordering(self) -> None:
-        """The tail reads past `(timestamp, step_id)`, never past `timestamp` alone."""
+    async def test_hub_delivered_row_is_not_repeated_by_the_tail(self) -> None:
+        """
+        The hub<->tail overlap: a row delivered by the hub must not come back.
+
+        The existing handoff test only covers hub<->history -- it republishes a
+        step history already replayed, which `seen_step_ids` catches before the
+        hub frame is even yielded. The gap is the other direction. Here `third` is
+        committed *after* the history read and *not* in `seen_step_ids`, so the
+        hub frame is the first delivery, and the tail's very next read returns the
+        same row because the agent commits before it publishes.
+
+        Without the hub branch claiming the delivered id, the tail sees `third` as
+        new and emits it a second time -- and the client appends blindly, so the
+        step renders and is numbered twice.
+        """
+        first = str(uuid.uuid4())
+        second = str(uuid.uuid4())
+        third = str(uuid.uuid4())
+        db = _FakeStreamDB(
+            rows=[
+                _step_row(first, T0),
+                _step_row(second, T0 + timedelta(seconds=1)),
+            ]
+        )
+
+        with _stream_env(db):
+            response = await stream_agent_run_endpoint(
+                uuid.UUID(self.run_id), _session=_session()
+            )
+            frames = response.body_iterator
+            try:
+                for _ in range(2):
+                    await _next_frame(frames)
+
+                # The ping is the barrier proving the generator reached the live
+                # loop and subscribed, so the publish below cannot be dropped.
+                name, _ = await _next_frame(frames)
+                self.assertEqual(name, "ping")
+                self.assertIn(self.run_id, run_event_hub._subscribers)
+
+                # A step committed after the history read: in the tail's window,
+                # and absent from seen_step_ids.
+                db.rows.append(_step_row(third, T0 + timedelta(seconds=2)))
+                await run_event_hub.publish(
+                    self.run_id,
+                    {
+                        "type": "step_complete",
+                        "run_id": self.run_id,
+                        "step_id": third,
+                        "step_index": 3,
+                        "action": "navigate",
+                        "result": "ok",
+                        "timestamp": (T0 + timedelta(seconds=2)).isoformat(),
+                    },
+                )
+
+                name, payload = await _next_frame(frames)
+                self.assertEqual(name, "step_complete")
+                self.assertEqual(payload["step_id"], third)
+
+                # The hub queue is now empty, so every subsequent poll runs the
+                # tail against a table that still contains `third`. Only
+                # keep-alives may cross.
+                trailing: List[str] = []
+                for _ in range(4):
+                    name, _ = await _next_frame(frames)
+                    trailing.append(name)
+            finally:
+                await frames.aclose()
+
+        self.assertEqual(
+            trailing,
+            ["ping"] * 4,
+            "the tail must not re-deliver a row the hub already delivered",
+        )
+
+    async def test_tail_polls_on_a_deadline_while_the_hub_stays_busy(self) -> None:
+        """
+        The tail must not be coupled to hub idleness.
+
+        Cross-instance loss matters most while a run is producing frames, which is
+        exactly when the hub never goes quiet for 15s and a tail driven by
+        `wait_for` expiry would never run. The queue is pre-loaded here so
+        `wait_for` never expires, and the tail interval is zeroed so the deadline
+        is due on the first delivered frame.
+        """
+        replayed = str(uuid.uuid4())
+        cross_instance = str(uuid.uuid4())
+        db = _FakeStreamDB(rows=[_step_row(replayed, T0)])
+
+        with _stream_env(db), patch(
+            "backend.main._STEP_TAIL_INTERVAL_S", new=0.0
+        ):
+            response = await stream_agent_run_endpoint(
+                uuid.UUID(self.run_id), _session=_session()
+            )
+            frames = response.body_iterator
+            try:
+                await _next_frame(frames)
+                # The ping is the barrier proving the generator has subscribed.
+                # Publishing before that would be a silent drop -- the very
+                # failure issue #33 is about.
+                name, _ = await _next_frame(frames)
+                self.assertEqual(name, "ping")
+                self.assertIn(self.run_id, run_event_hub._subscribers)
+
+                # Committed on another execution environment: no local publish.
+                db.rows.append(_step_row(cross_instance, T0 + timedelta(seconds=1)))
+                # Two frames queued up front, so the queue still holds one when
+                # the generator comes back around and `wait_for` cannot expire.
+                for n in (1, 2):
+                    await run_event_hub.publish(
+                        self.run_id,
+                        {
+                            "type": "status_change",
+                            "run_id": self.run_id,
+                            "status": f"running-{n}",
+                        },
+                    )
+
+                # The generator may still be draining keep-alives emitted before
+                # the publish, so skip to the first queued frame.
+                name, _ = await _next_frame(frames)
+                while name == "ping":
+                    name, _ = await _next_frame(frames)
+                self.assertEqual(name, "status_change")
+
+                # Driven by hub idleness alone, the next frame would be the
+                # *second* queued hub frame. The tail runs on its deadline instead,
+                # while `wait_for` never expired.
+                name, payload = await _next_frame(frames)
+                self.assertEqual(
+                    name,
+                    "step_complete",
+                    "the tail must run on its deadline even while the hub is busy",
+                )
+                self.assertEqual(payload["step_id"], cross_instance)
+            finally:
+                await frames.aclose()
+
+    async def test_tail_query_pins_the_inclusive_timestamp_window_and_ordering(self) -> None:
+        """
+        The tail reads an inclusive `timestamp >=` window, never a strict window.
+
+        A strict window can skip a row sharing the cursor's timestamp, and a skip
+        is unrecoverable because the cursor only moves forward. Inclusive re-reads
+        the tie group instead, which `seen_step_ids` suppresses.
+        """
         first = str(uuid.uuid4())
         second = str(uuid.uuid4())
         third = str(uuid.uuid4())
@@ -499,28 +651,30 @@ class TestIssue33StreamCursor(unittest.IsolatedAsyncioTestCase):
         history = db.step_statements[0]
         self.assertEqual(history.args, (uuid.UUID(self.run_id),))
         self.assertIn("ORDER BY timestamp ASC, step_id ASC", history.sql)
-        self.assertNotIn("timestamp, step_id) >", history.sql)
+        self.assertNotIn("timestamp >= $2", history.sql)
 
         self.assertEqual(len(db.tail_statements), 1)
         tail = db.tail_statements[0]
-        self.assertIn("(timestamp, step_id) > ($2, $3)", tail.sql)
+        self.assertIn("timestamp >= $2", tail.sql)
         self.assertIn("ORDER BY timestamp ASC, step_id ASC", tail.sql)
+        self.assertNotIn("(timestamp, step_id)", tail.sql)
         self.assertEqual(
             tail.args,
-            (uuid.UUID(self.run_id), T0 + timedelta(seconds=1), uuid.UUID(second)),
-            "the tail cursor must be the last row history replayed",
+            (uuid.UUID(self.run_id), T0 + timedelta(seconds=1)),
+            "the tail cursor must be the last timestamp history replayed",
         )
 
     async def test_rows_sharing_a_timestamp_emit_once_each_in_step_id_order(self) -> None:
         """
-        `timestamp` alone is not a total order: steps committed inside the same
-        clock tick tie. `step_id` breaks the tie, so no step is replayed and a step
-        landing in the tied window at the cursor boundary is still delivered.
+        Rows sharing the cursor's timestamp are re-read and then suppressed.
+
+        The inclusive window deliberately re-reads the tie group on every poll, so
+        `seen_step_ids` -- not the cursor -- is what guarantees each tied row is
+        delivered exactly once, in `step_id` order.
         """
-        # Derived, not drawn at random: the cursor after history is the step_id
-        # Postgres orders last, and only a step_id above that one is inside the
-        # tail's window. Random uuids land on either side of it, which would make
-        # this test a coin flip rather than a regression test. The low two bits are
+        # Derived, not drawn at random: with an inclusive window any later
+        # timestamp is enough, and this keeps the cursor row's own tie group
+        # populated so the suppression path is exercised. The low two bits are
         # cleared so base + 2 cannot overflow a 128-bit uuid.
         base = uuid.uuid4().int >> 2 << 2
         low = str(uuid.UUID(int=base))
@@ -661,9 +815,14 @@ class TestIssue33StreamCursor(unittest.IsolatedAsyncioTestCase):
                 uuid.UUID(self.run_id), _session=_session()
             )
             frames = response.body_iterator
-            await _next_frame(frames)
-            self.assertIn(self.run_id, run_event_hub._subscribers)
-            await frames.aclose()
+            try:
+                await _next_frame(frames)
+                self.assertIn(self.run_id, run_event_hub._subscribers)
+            finally:
+                # An assertion failure above must not strand the generator: a live
+                # body_iterator keeps its hub subscription for the rest of the
+                # process and the next test's frames get mixed into this queue.
+                await frames.aclose()
 
         self.assertEqual(released, [self.run_id])
         self.assertNotIn(

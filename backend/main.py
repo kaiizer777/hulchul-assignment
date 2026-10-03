@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -749,11 +750,27 @@ async def get_agent_state(
 # a row is durable evidence of a step in a way the in-process hub never is: the
 # hub is per-Lambda-execution-environment, this table is shared.
 #
-# `(timestamp, step_id)` is the cursor. `timestamp` alone is not a total order --
-# steps committed inside the same clock tick tie -- so the row comparison and the
-# ORDER BY must agree, or the tail either replays or skips a tied step.
+# `timestamp` is the cursor. The window is inclusive (`timestamp >=`) rather than a
+# strict `(timestamp, step_id) >` row comparison: inclusive re-reads the group of
+# rows sharing the cursor's timestamp, which `seen_step_ids` suppresses, so the
+# window cannot silently skip a row that shares a timestamp with the cursor.
+# Skipping one is unrecoverable -- the cursor only ever moves forward -- whereas
+# re-reading is idempotent and bounded by one run's step count.
 _STEP_COLUMNS = "step_id, action, result, screenshot_b64, timestamp"
 _STEP_CURSOR_ORDER = "ORDER BY timestamp ASC, step_id ASC"
+
+# How long the live loop waits on the hub queue before emitting a keep-alive ping
+# and polling the durable table.
+_QUEUE_POLL_TIMEOUT_S = 15.0
+
+# Upper bound on how long the durable tail may go unpolled. Driven by elapsed time
+# rather than hub idleness: a hub that never goes quiet would otherwise starve the
+# tail for as long as the stream lives.
+_STEP_TAIL_INTERVAL_S = 15.0
+
+# Bound on one tail query, so a slow database cannot wedge the generator and stop
+# the keep-alive pings that are the only client-visible liveness signal.
+_STEP_TAIL_QUERY_TIMEOUT_S = 5.0
 
 # Whole-run read. Shared by history replay and by the cursor tail's "no row was
 # replayed yet" case, which must read from the start rather than invent a
@@ -765,11 +782,13 @@ _STEP_ALL_FOR_RUN_SQL = f"""
     {_STEP_CURSOR_ORDER};
     """
 
-# Incremental read strictly past the last row this connection already emitted.
+# Incremental read covering every row committed at or after the last timestamp this
+# connection read. `idx_agent_steps_run_timestamp_step` serves both the predicate
+# and the ORDER BY, so no sort is added.
 _STEP_TAIL_SQL = f"""
     SELECT {_STEP_COLUMNS}
     FROM agent_steps
-    WHERE run_id = $1 AND (timestamp, step_id) > ($2, $3)
+    WHERE run_id = $1 AND timestamp >= $2
     {_STEP_CURSOR_ORDER};
     """
 
@@ -848,8 +867,8 @@ async def stream_agent_run_endpoint(
         # appends blindly, so every durable frame is gated on this set.
         seen_step_ids: Set[str] = set()
         step_index = 0
-        # (timestamp, step_id) of the last durable row emitted on this connection,
-        # or None while nothing has been replayed yet.
+        # (timestamp, step_id) of the last durable row this connection read, or
+        # None while nothing has been replayed yet.
         cursor: Optional[tuple] = None
 
         # 1. History playback from Neon database
@@ -882,52 +901,55 @@ async def stream_agent_run_endpoint(
 
         # 2. Live event queue subscription
         queue = run_event_hub.subscribe(run_id_str)
+
+        async def tail_frames():
+            """
+            Yield one frame per `agent_steps` row this connection has not delivered.
+
+            Every row read advances the read cursor whether or not it is emitted:
+            the cursor tracks the table, not the client. `seen_step_ids` is what
+            keeps one step from reaching the client twice, so it must be populated
+            by *every* delivery path -- history replay, this tail, and the hub.
+            """
+            nonlocal cursor, step_index
+            try:
+                if cursor is None:
+                    tail_rows = await asyncio.wait_for(
+                        _fetch_step_rows(_STEP_ALL_FOR_RUN_SQL, run_id),
+                        timeout=_STEP_TAIL_QUERY_TIMEOUT_S,
+                    )
+                else:
+                    tail_rows = await asyncio.wait_for(
+                        _fetch_step_rows(_STEP_TAIL_SQL, run_id, cursor[0]),
+                        timeout=_STEP_TAIL_QUERY_TIMEOUT_S,
+                    )
+            except Exception as tail_err:
+                logger.warning(
+                    f"Error tailing agent_steps for SSE stream "
+                    f"{run_id_str}: {tail_err}"
+                )
+                tail_rows = []
+            for r in tail_rows:
+                cursor = (r["timestamp"], r["step_id"])
+                step_id = str(r["step_id"])
+                if step_id in seen_step_ids:
+                    continue
+                seen_step_ids.add(step_id)
+                step_index += 1
+                yield _step_row_to_event(r, run_id_str, step_index)
+
+        last_tail = time.monotonic()
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    event_type = event.get("type", "message")
-                    hub_step_id = event.get("step_id")
-                    if (
-                        event_type in _DURABLE_STEP_EVENT_TYPES
-                        and hub_step_id is not None
-                        and str(hub_step_id) in seen_step_ids
-                    ):
-                        # Already delivered from agent_steps on this connection.
-                        continue
-                    yield {
-                        "event": event_type,
-                        "data": json.dumps(event)
-                    }
+                    event = await asyncio.wait_for(queue.get(), timeout=_QUEUE_POLL_TIMEOUT_S)
                 except asyncio.TimeoutError:
                     # The hub went quiet. Before the keep-alive, tail the durable
                     # table past the cursor: this is what makes live delivery
                     # independent of which execution environment produced the step.
-                    try:
-                        if cursor is None:
-                            tail_rows = await _fetch_step_rows(
-                                _STEP_ALL_FOR_RUN_SQL, run_id
-                            )
-                        else:
-                            tail_rows = await _fetch_step_rows(
-                                _STEP_TAIL_SQL, run_id, cursor[0], cursor[1]
-                            )
-                    except Exception as tail_err:
-                        logger.warning(
-                            f"Error tailing agent_steps for SSE stream "
-                            f"{run_id_str}: {tail_err}"
-                        )
-                        tail_rows = []
-                    for r in tail_rows:
-                        step_id = str(r["step_id"])
-                        # Advance the read cursor for every row read, emitted or
-                        # not: the cursor tracks the table, not the client.
-                        cursor = (r["timestamp"], r["step_id"])
-                        if step_id in seen_step_ids:
-                            continue
-                        seen_step_ids.add(step_id)
-                        step_index += 1
-                        yield _step_row_to_event(r, run_id_str, step_index)
+                    async for frame in tail_frames():
+                        yield frame
+                    last_tail = time.monotonic()
                     # Keep-alive ping event / comment
                     yield {
                         "event": "ping",
@@ -937,6 +959,40 @@ async def stream_agent_run_endpoint(
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
                     }
+                    continue
+
+                event_type = event.get("type", "message")
+                hub_step_id = event.get("step_id")
+                is_durable = (
+                    event_type in _DURABLE_STEP_EVENT_TYPES and hub_step_id is not None
+                )
+                hub_step_id_str = str(hub_step_id) if hub_step_id is not None else None
+
+                if not (is_durable and hub_step_id_str in seen_step_ids):
+                    if is_durable:
+                        # Claim the id before yielding. The agent commits the row
+                        # before publishing the event, so the tail's next read
+                        # returns that same row; without this the step reaches the
+                        # client twice, once from each path, and a client that
+                        # appends blindly renders it twice. The read cursor is
+                        # deliberately NOT advanced here: the hub payload's
+                        # timestamp is the agent's wall clock, not the row's, so
+                        # only the row itself may move the cursor.
+                        seen_step_ids.add(hub_step_id_str)
+                    yield {
+                        "event": event_type,
+                        "data": json.dumps(event)
+                    }
+
+                # Poll the table on elapsed time, not on hub idleness: a busy hub
+                # never times out, so coupling the tail to `wait_for` expiry
+                # starves it exactly while a run is producing frames -- which is
+                # when a step committed on another execution environment matters
+                # most.
+                if time.monotonic() - last_tail >= _STEP_TAIL_INTERVAL_S:
+                    last_tail = time.monotonic()
+                    async for frame in tail_frames():
+                        yield frame
         finally:
             run_event_hub.unsubscribe(run_id_str, queue)
 
