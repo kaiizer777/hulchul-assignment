@@ -249,28 +249,42 @@ class UpstashRedisClient:
         return bool(res)
 
     async def get_login_failure_count(self, ip: str) -> int:
-        """Read the failed-login counter for an IP bucket. Missing key counts as zero."""
+        """Read the failed-login counter for an IP bucket. Missing key counts as zero.
+
+        Any present-but-unparseable value is treated as unconfirmed and raises
+        rather than coercing to 0 (fail closed: a corrupt counter must never
+        read as "no failures").
+        """
         key = f"{AUTH_LOGIN_FAIL_KEY_PREFIX}{ip}"
         raw = await self.execute_command("GET", key)
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
+        if raw is None:
             return 0
+        try:
+            return int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logger.error(f"Corrupt login failure counter for {ip!r}: {raw!r}")
+            raise UpstashRedisError(f"Corrupt login failure counter for {ip!r}")
 
-    async def record_login_failure(self, ip: str, window_seconds: int) -> int:
+    async def record_login_failure(self, ip: str, window_seconds: int, max_failures: int) -> int:
         """
-        Increment the failed-login counter and (re)arm its window.
+        Increment the failed-login counter, re-arming its window only while
+        the post-INCR count is still within budget.
 
-        INCR is the atomic part; EXPIRE on every failure only ever extends how
-        long an exhausted bucket stays blocked, it cannot lower the count.
+        Blocked (over-budget) increments are plain INCR with no EXPIRE, so
+        sustained blocked probes cannot extend the lockout indefinitely (fixed
+        expiry anchored at the last counted failure). A non-integer INCR
+        result is unconfirmed and raises instead of coercing to 0.
         """
         key = f"{AUTH_LOGIN_FAIL_KEY_PREFIX}{ip}"
         count = await self.execute_command("INCR", key)
-        await self.execute_command("EXPIRE", key, window_seconds)
         try:
-            return int(count)
+            failures = int(count)  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            return 0
+            logger.error(f"Corrupt INCR result for login failure counter {ip!r}: {count!r}")
+            raise UpstashRedisError(f"Corrupt INCR result for login failure counter {ip!r}")
+        if failures <= max_failures:
+            await self.execute_command("EXPIRE", key, window_seconds)
+        return failures
 
     async def clear_login_failures(self, ip: str) -> None:
         """Reset the failed-login counter after a successful authentication."""

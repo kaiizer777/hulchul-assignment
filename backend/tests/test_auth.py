@@ -422,7 +422,7 @@ def _throttled_redis() -> MagicMock:
     async def _count(ip: str) -> int:
         return failures.get(ip, 0)
 
-    async def _record(ip: str, window_seconds: int) -> int:
+    async def _record(ip: str, window_seconds: int, max_failures: int) -> int:
         failures[ip] = failures.get(ip, 0) + 1
         return failures[ip]
 
@@ -529,7 +529,7 @@ def test_concurrent_login_burst_is_bounded_by_atomic_incr(
         await asyncio.sleep(0)
         return failures.get(ip, 0)
 
-    async def _record(ip: str, window_seconds: int) -> int:
+    async def _record(ip: str, window_seconds: int, max_failures: int) -> int:
         # Atomic like real Redis INCR: mutate before yielding, so concurrent
         # callers still observe distinct sequential counts.
         failures[ip] = failures.get(ip, 0) + 1
@@ -571,9 +571,13 @@ def test_concurrent_login_burst_is_bounded_by_atomic_incr(
     statuses = [response.status_code for response in responses]
     assert len(statuses) == burst_size
     assert set(statuses) <= {401, 429}
-    # Only the remaining budget slots may burn a hash; the excess 429s pre-hash.
-    assert hasher.verify.call_count <= auth.LOGIN_MAX_FAILURES
-    assert statuses.count(429) >= burst_size - auth.LOGIN_MAX_FAILURES
+    # Exact oracle: a fresh bucket holds exactly MAX slots, so exactly MAX
+    # concurrent attempts may burn a hash and the remaining burst_size - MAX
+    # must 429 pre-hash. Bounds (<=, >=) would still pass if every attempt
+    # 429d (premature blocking) or fewer hashes burned than the budget allows.
+    assert hasher.verify.call_count == auth.LOGIN_MAX_FAILURES
+    assert statuses.count(429) == burst_size - auth.LOGIN_MAX_FAILURES
+    assert statuses.count(401) == auth.LOGIN_MAX_FAILURES
     # Single increment per attempt: the gate INCR is the failure record.
     assert redis.record_login_failure.call_count == burst_size
     for response in responses:
@@ -860,22 +864,125 @@ def test_session_commands_serialise_every_argument_as_a_string() -> None:
     assert all(isinstance(arg, str) for arg in command["body"])
 
 
-def test_login_failure_counter_uses_incr_and_expire() -> None:
-    """The rate-limit counter is INCR + EXPIRE, as the auth contract specifies."""
+def test_login_failure_counter_rearms_window_only_while_under_budget() -> None:
+    """INCR always runs; EXPIRE runs only for counted (under-budget) increments.
+
+    Prior behaviour EXPIREd after every INCR, so sustained blocked probes
+    re-armed the 900s window indefinitely (an attacker sharing/spoofing the
+    bucket could lock the victim out forever while Retry-After: 900 stayed a
+    lie). Over-budget increments are now plain INCR with no EXPIRE, keeping
+    the window anchored at the last counted failure.
+    """
+    under_budget: list[list] = []
+
+    def under_handler(request: httpx.Request) -> httpx.Response:
+        under_budget.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": 3})
+
+    under_http = httpx.AsyncClient(transport=httpx.MockTransport(under_handler))
+    under_redis = UpstashRedisClient(url="https://example.upstash.io", token="t", http_client=under_http)
+
+    assert _run(under_redis.record_login_failure("203.0.113.9", 900, 10)) == 3
+    assert under_budget == [
+        ["INCR", "hulchul:auth:login_fail:203.0.113.9"],
+        ["EXPIRE", "hulchul:auth:login_fail:203.0.113.9", "900"],
+    ]
+
+    over_budget: list[list] = []
+
+    def over_handler(request: httpx.Request) -> httpx.Response:
+        over_budget.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": 11})
+
+    over_http = httpx.AsyncClient(transport=httpx.MockTransport(over_handler))
+    over_redis = UpstashRedisClient(url="https://example.upstash.io", token="t", http_client=over_http)
+
+    assert _run(over_redis.record_login_failure("203.0.113.9", 900, 10)) == 11
+    assert over_budget == [
+        ["INCR", "hulchul:auth:login_fail:203.0.113.9"],
+    ], "over-budget increments must not re-arm the window"
+
+
+def test_login_failure_counter_with_corrupt_incr_result_fails_closed() -> None:
+    """A non-integer INCR result is unconfirmed and must raise, never coerce to 0."""
+    from backend.redis_client import UpstashRedisError
+
     captured: list[list] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(json.loads(request.content))
-        return httpx.Response(200, json={"result": 3})
+        return httpx.Response(200, json={"result": "not-an-integer"})
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     redis = UpstashRedisClient(url="https://example.upstash.io", token="t", http_client=http_client)
 
-    assert _run(redis.record_login_failure("203.0.113.9", 900)) == 3
+    with pytest.raises(UpstashRedisError):
+        _run(redis.record_login_failure("203.0.113.9", 900, 10))
     assert captured == [
         ["INCR", "hulchul:auth:login_fail:203.0.113.9"],
-        ["EXPIRE", "hulchul:auth:login_fail:203.0.113.9", "900"],
-    ]
+    ], "no EXPIRE may follow an unconfirmed increment"
+
+
+def test_login_failure_count_with_corrupt_value_fails_closed() -> None:
+    """A present-but-unparseable counter must raise; only a missing key reads as 0."""
+    from backend.redis_client import UpstashRedisError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"result": "garbage"})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    redis = UpstashRedisClient(url="https://example.upstash.io", token="t", http_client=http_client)
+
+    with pytest.raises(UpstashRedisError):
+        _run(redis.get_login_failure_count("203.0.113.9"))
+
+
+def test_login_gate_redis_error_fails_closed_without_burning_a_hash(
+    client: TestClient, configured_password: str
+) -> None:
+    """A gate INCR transport failure is 503 with no argon2 work and no session."""
+    from backend.redis_client import UpstashRedisError
+
+    broken = MagicMock(spec=UpstashRedisClient)
+    broken.is_configured = True
+    broken.record_login_failure = AsyncMock(side_effect=UpstashRedisError("connection refused"))
+    hasher = MagicMock(spec=PasswordHasher)
+    hasher.verify.return_value = False
+
+    with (
+        patch.object(auth_module, "get_redis_client", return_value=broken),
+        patch.object(auth_module, "_password_hasher", hasher),
+    ):
+        response = client.post("/auth/login", json={"password": "wrong"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": auth.AUTH_UNAVAILABLE_DETAIL}
+    assert "set-cookie" not in response.headers
+    assert hasher.verify.call_count == 0, "an unconfirmed gate must not burn a hash"
+    assert _session_keys() == []
+
+
+def test_login_gate_with_corrupt_counter_fails_closed_without_burning_a_hash(
+    client: TestClient, configured_password: str
+) -> None:
+    """A corrupt gate count fails closed as 503, never as budget-zero-then-hash."""
+    broken = MagicMock(spec=UpstashRedisClient)
+    broken.is_configured = True
+    broken.record_login_failure = AsyncMock(return_value="not-an-integer")
+    hasher = MagicMock(spec=PasswordHasher)
+    hasher.verify.return_value = False
+
+    with (
+        patch.object(auth_module, "get_redis_client", return_value=broken),
+        patch.object(auth_module, "_password_hasher", hasher),
+    ):
+        response = client.post("/auth/login", json={"password": "wrong"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": auth.AUTH_UNAVAILABLE_DETAIL}
+    assert "set-cookie" not in response.headers
+    assert hasher.verify.call_count == 0, "a corrupt count must not fall through to hashing"
+    assert _session_keys() == []
 
 
 def test_login_failure_counter_treats_a_missing_key_as_zero() -> None:

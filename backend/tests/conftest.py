@@ -50,6 +50,29 @@ async def upstash_mock(request: Request):
                     result = 1
                 else:
                     result = 0
+        elif cmd == "INCR":
+            # The login rate-limit gate is INCR-first, so the mock must be
+            # faithful here: real Redis INCR always returns an integer and
+            # creates a missing key at 1. (Previously unimplemented, the mock
+            # returned null and the old fail-open coercion masked it as 0.)
+            if len(args) >= 2:
+                key = str(args[1])
+                current = storage.get(key)
+                if current is None:
+                    storage[key] = "1"
+                    result = 1
+                else:
+                    try:
+                        result = int(current) + 1
+                    except (TypeError, ValueError):
+                        return {"error": "ERR value is not an integer or out of range"}
+                    storage[key] = str(result)
+        elif cmd == "EXPIRE":
+            # No TTL machinery in the mock; per-test isolation comes from the
+            # auth-key wipe in test_auth. Only the existence reply matters.
+            if len(args) >= 3:
+                key = str(args[1])
+                result = 1 if key in storage else 0
     return {"result": result}
 
 @pytest.fixture(scope="session", autouse=True)
