@@ -424,6 +424,7 @@ async def run_agent_endpoint(
     session_stack: list = []
 
     async def _enter_cdp_session():
+        """Enter a browser session context manager and track it for later release."""
         cm = get_browser_session()
         sess = await cm.__aenter__()
         session_stack.append(cm)
@@ -434,6 +435,7 @@ async def run_agent_endpoint(
         tools = PlaywrightTools(page=session.page, run_id=run_id_str)
 
         async def _reattach_page():
+            """Release the current browser session and return a freshly acquired page."""
             if session_stack:
                 old_cm = session_stack.pop()
                 try:

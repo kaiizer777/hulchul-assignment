@@ -326,21 +326,27 @@ export default function AgentControlPage() {
         try {
           const data = JSON.parse(event.data);
           if (data.status) setStatus(data.status);
-        } catch {}
+        } catch (e) {
+          console.warn('Failed to parse status_change SSE frame, ignoring', e);
+        }
       });
 
       eventSource.addEventListener('step_complete', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, data]);
-        } catch {}
+        } catch (e) {
+          console.warn('Failed to parse step_complete SSE frame, ignoring', e);
+        }
       });
 
       eventSource.addEventListener('step_failed', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, data]);
-        } catch {}
+        } catch (e) {
+          console.warn('Failed to parse step_failed SSE frame, ignoring', e);
+        }
       });
 
       eventSource.addEventListener('step_unknown', (event: MessageEvent) => {
@@ -385,7 +391,9 @@ export default function AgentControlPage() {
           }
           setStatus('awaiting_approval');
           setApprovalData(data);
-        } catch {}
+        } catch (e) {
+          console.warn('Failed to parse needs_approval SSE frame, ignoring', e);
+        }
       });
 
       eventSource.onerror = (err) => {
@@ -417,8 +425,9 @@ export default function AgentControlPage() {
           }
         }
       } catch (e) {
-        if (e instanceof Error && e.name !== 'AbortError') {
-          // ignore
+        // Teardown aborts this poll on purpose, so only a real fault is reported.
+        if (!(e instanceof Error && e.name === 'AbortError')) {
+          console.warn('Approval status poll failed', e);
         }
       }
     }, 2500);

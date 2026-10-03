@@ -20,18 +20,23 @@ from backend.agent import ReActAgent
 
 
 class TestClosedTargetClassifier(unittest.TestCase):
+    """Test suite for the closed-target / session-lost error string classifier."""
+
     def test_exact_playwright_closed_message(self):
+        """Verify the verbatim Playwright closed-target message classifies as session lost."""
         self.assertTrue(
             is_session_lost_error("Target page, context or browser has been closed")
         )
 
     def test_variants(self):
+        """Verify transport and browser-level variants also classify as session lost."""
         self.assertTrue(is_session_lost_error("Target closed"))
         self.assertTrue(is_session_lost_error(Exception("Browser has been closed")))
         self.assertTrue(is_session_lost_error("Connection closed while reading"))
         self.assertTrue(is_session_lost_error("Protocol error: Session closed"))
 
     def test_narrowed_excludes_broad_patterns(self):
+        """Verify narrowed patterns reject lookalike non-session errors."""
         self.assertFalse(is_session_lost_error("websocket connection failed"))
         self.assertFalse(is_session_lost_error("websocket"))
         self.assertFalse(is_session_lost_error("Protocol error: timeout exceeded"))
@@ -39,10 +44,12 @@ class TestClosedTargetClassifier(unittest.TestCase):
         self.assertFalse(is_session_lost_error("Element not found: Submit"))
 
     def test_exact_transport_strings(self):
+        """Verify exact WebSocket transport strings classify as session lost."""
         self.assertTrue(is_session_lost_error("websocket is not open: readyState 3 (CLOSED)"))
         self.assertTrue(is_session_lost_error("websocket closed: connection dropped"))
 
     def test_non_session_errors(self):
+        """Verify ordinary failures, empty input, and None do not classify as session lost."""
         self.assertFalse(is_session_lost_error("Element not found: Submit"))
         self.assertFalse(is_session_lost_error("Timeout 5000ms exceeded"))
         self.assertFalse(is_session_lost_error(""))
@@ -51,7 +58,10 @@ class TestClosedTargetClassifier(unittest.TestCase):
 
 
 class TestBrowserToolsTagSessionLost(unittest.IsolatedAsyncioTestCase):
+    """Test suite for session_lost tagging on Playwright tool failure dicts."""
+
     async def test_navigate_marks_session_lost(self):
+        """Verify navigate tags its failure dict session_lost on a closed target."""
         page = MagicMock()
         page.goto = AsyncMock(
             side_effect=Exception("Target page, context or browser has been closed")
@@ -62,6 +72,7 @@ class TestBrowserToolsTagSessionLost(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.get("session_lost"))
 
     async def test_navigate_generic_not_session_lost(self):
+        """Verify navigate omits the session_lost tag for generic failures."""
         page = MagicMock()
         page.goto = AsyncMock(side_effect=Exception("Element not found"))
         page.url = "about:blank"
@@ -70,6 +81,7 @@ class TestBrowserToolsTagSessionLost(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res.get("session_lost"))
 
     async def test_read_page_marks_session_lost(self):
+        """Verify read_page tags its failure dict session_lost on a closed target."""
         page = MagicMock()
         page.aria_snapshot = AsyncMock(
             side_effect=Exception("Target page, context or browser has been closed")
@@ -80,7 +92,10 @@ class TestBrowserToolsTagSessionLost(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBrowserSessionHealth(unittest.IsolatedAsyncioTestCase):
+    """Test suite for synchronous liveness and async health checks on a CDP session."""
+
     async def test_alive_false_when_page_closed(self):
+        """Verify a closed page reports the session dead and unhealthy."""
         page = MagicMock()
         page.is_closed.return_value = True
         browser = MagicMock()
@@ -90,6 +105,7 @@ class TestBrowserSessionHealth(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await check_browser_session_health(sess))
 
     async def test_alive_false_when_disconnected(self):
+        """Verify a disconnected browser reports the session dead despite an open page."""
         page = MagicMock()
         page.is_closed.return_value = False
         browser = MagicMock()
@@ -98,6 +114,7 @@ class TestBrowserSessionHealth(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(is_browser_session_alive(sess))
 
     async def test_alive_true_when_healthy(self):
+        """Verify an open page on a connected browser reports the session alive and healthy."""
         page = MagicMock()
         page.is_closed.return_value = False
         page.evaluate = AsyncMock(return_value="complete")
@@ -108,6 +125,7 @@ class TestBrowserSessionHealth(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await check_browser_session_health(sess))
 
     async def test_health_false_on_closed_target_evaluate(self):
+        """Verify the health check fails when the readyState probe hits a closed target."""
         page = MagicMock()
         page.is_closed.return_value = False
         page.evaluate = AsyncMock(
@@ -120,6 +138,7 @@ class TestBrowserSessionHealth(unittest.IsolatedAsyncioTestCase):
 
 
 def _mock_redis():
+    """Build an unconfigured mock Redis client so agent runs skip pause and resume handling."""
     redis = MagicMock()
     redis.is_configured = False
     redis.set_session_state = AsyncMock(return_value=True)
@@ -151,10 +170,14 @@ def _groq_for_tool_calls(calls):
 
 
 class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
+    """Test suite for bounded CDP reattach, replay policy, and terminal session_lost in ReActAgent."""
+
     async def _make_agent(self, mock_tools, mock_groq, reconnect, events, max_reattaches=2, max_iterations=10):
+        """Build a ReActAgent wired to mocks with its persistence and event side effects stubbed out."""
         run_id = str(uuid.uuid4())
 
         async def _on_event(evt):
+            """Append each emitted agent event to the captured events list."""
             events.append(evt)
 
         agent = ReActAgent(
@@ -174,6 +197,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         return agent
 
     async def test_act_session_loss_reattaches_and_resumes(self):
+        """Verify a session loss on an idempotent tool reattaches once, replays, and completes without step_failed."""
         events = []
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.page = MagicMock()
@@ -210,6 +234,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed_navigates, [])
 
     async def test_transient_reattach_failure_then_success_resumes(self):
+        """Verify a failed reattach attempt that later succeeds consumes budget without a terminal abort."""
         events = []
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.page = MagicMock()
@@ -242,6 +267,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(terminal, [])
 
     async def test_click_session_loss_does_not_replay(self):
+        """Verify a session loss on click is never redispatched and is recorded as outcome unknown."""
         events = []
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.page = MagicMock()
@@ -283,6 +309,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_tools.take_screenshot.await_count, 0)
 
     async def test_observe_session_loss_reattaches_and_resumes(self):
+        """Verify a session loss during read_page reattaches and resumes the run with a fresh snapshot."""
         events = []
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.page = MagicMock()
@@ -309,6 +336,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         self.assertIn("session_lost", [e["type"] for e in events])
 
     async def test_reattach_cap_aborts_with_distinct_session_lost(self):
+        """Verify exhausting the reattach cap aborts the run with a terminal session_lost status."""
         events = []
         mock_tools = MagicMock(spec=PlaywrightTools)
         mock_tools.page = MagicMock()
