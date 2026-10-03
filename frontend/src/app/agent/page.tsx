@@ -305,7 +305,7 @@ export default function AgentControlPage() {
           const data = JSON.parse(event.data);
           if (data.type === 'status_change') {
             setStatus(data.status);
-          } else if (data.type === 'step_complete' || data.type === 'step_failed') {
+          } else if (data.type === 'step_complete' || data.type === 'step_failed' || data.type === 'step_unknown') {
             setSteps((prev) => [...prev, data]);
           } else if (data.type === 'session_lost') {
             setSteps((prev) => [...prev, { ...data, action: data.action || 'session_lost' }]);
@@ -341,6 +341,15 @@ export default function AgentControlPage() {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, data]);
         } catch {}
+      });
+
+      eventSource.addEventListener('step_unknown', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          setSteps((prev) => [...prev, data]);
+        } catch (e) {
+          console.warn('Failed to parse step_unknown SSE frame, ignoring', e);
+        }
       });
 
       eventSource.addEventListener('session_lost', (event: MessageEvent) => {

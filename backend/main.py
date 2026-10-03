@@ -767,9 +767,12 @@ async def stream_agent_run_endpoint(
                     lowered = res_str.lower()
                     persisted_action = r["action"] or ""
                     is_terminal_session_lost = persisted_action == "session_lost"
-                    is_fail = "failed" in lowered or "aborted" in lowered
+                    is_unknown = lowered.startswith("outcome unknown")
+                    is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
                     if is_terminal_session_lost:
                         event_type = "session_lost"
+                    elif is_unknown:
+                        event_type = "step_unknown"
                     else:
                         event_type = "step_failed" if is_fail else "step_complete"
                     event_data = {
@@ -785,7 +788,7 @@ async def stream_agent_run_endpoint(
                     if is_terminal_session_lost:
                         event_data["terminal"] = True
                         event_data["reattached"] = False
-                    if is_fail:
+                    if is_fail or is_unknown:
                         event_data["error"] = res_str
                     yield {
                         "event": event_type,

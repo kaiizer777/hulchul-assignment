@@ -274,6 +274,13 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         terminal = [e for e in events if e["type"] == "session_lost" and e.get("terminal") is True]
         self.assertEqual(terminal, [])
         self.assertNotEqual(result["status"], "session_lost")
+        # Outcome-unknown, not failure: step_unknown emitted, no step_failed, no failure screenshot.
+        unknown = [e for e in events if e["type"] == "step_unknown" and e.get("action") == "click"]
+        self.assertEqual(len(unknown), 1)
+        self.assertTrue(unknown[0].get("outcome_unknown"))
+        failed_clicks = [e for e in events if e["type"] == "step_failed" and e.get("action") == "click"]
+        self.assertEqual(failed_clicks, [])
+        self.assertEqual(mock_tools.take_screenshot.await_count, 0)
 
     async def test_observe_session_loss_reattaches_and_resumes(self):
         events = []

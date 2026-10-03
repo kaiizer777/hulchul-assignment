@@ -1474,6 +1474,7 @@ class ReActAgent:
                     tool_result["session_lost"] = True
                 tool_success = False
 
+            outcome_unknown = False
             if not tool_success and self._result_is_session_lost(tool_result):
                 last_err = str(tool_result.get("error", "session lost"))
                 recovered_act = False
@@ -1485,7 +1486,11 @@ class ReActAgent:
                             break
                         continue
                     if is_mutating_tool:
+                        # Non-idempotent: do not replay on the fresh page; the
+                        # first attempt may already have taken effect. Record
+                        # outcome-unknown instead of success/failure.
                         recovered_act = True
+                        outcome_unknown = True
                         break
                     try:
                         retry_res = await self.tools.execute(tool_name, tool_args)
@@ -1523,7 +1528,27 @@ class ReActAgent:
                 if e_ident and tool_result.get("exists") and not tool_result.get("error"):
                     self._checked_entities[f"{e_type}:{e_ident.lower()}"] = tool_result
 
-            if not tool_success:
+            if not tool_success and outcome_unknown:
+                # Mutating action reattached without replay: outcome is unknown,
+                # not failed. Persist distinctly; skip the failure screenshot
+                # (the fresh page would mislead) and step_failed emission.
+                unknown_step_id = await self.persist_step(
+                    action=tool_name,
+                    result=f"outcome unknown after CDP reattach (not replayed): {tool_result.get('error')}",
+                    step_id=step_id,
+                )
+                await self.emit_event(
+                    "step_unknown",
+                    {
+                        "step_id": unknown_step_id,
+                        "step_index": iteration,
+                        "action": tool_name,
+                        "arguments": tool_args,
+                        "error": tool_result.get("error"),
+                        "outcome_unknown": True,
+                    },
+                )
+            elif not tool_success:
                 # Capture diagnostic screenshot on failure without creating duplicate rows (Phase 2.8)
                 failed_step_id = await self.persist_step(
                     action=tool_name,
