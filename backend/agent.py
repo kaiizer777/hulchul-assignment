@@ -1469,7 +1469,7 @@ class ReActAgent:
 
             screenshot_on_fail: Optional[str] = None
             try:
-                tool_result = await self.tools.execute(tool_name, tool_args)
+                tool_result = await self.tools.execute(tool_name, tool_args, step_id=step_id)
                 tool_success = tool_result.get("success", False)
                 if "exists" in tool_result and not tool_result.get("error"):
                     tool_success = True
@@ -1499,7 +1499,7 @@ class ReActAgent:
                         outcome_unknown = True
                         break
                     try:
-                        retry_res = await self.tools.execute(tool_name, tool_args)
+                        retry_res = await self.tools.execute(tool_name, tool_args, step_id=step_id)
                         retry_ok = retry_res.get("success", False)
                         if "exists" in retry_res and not retry_res.get("error"):
                             retry_ok = True
@@ -1612,6 +1612,8 @@ class ReActAgent:
                     sc_b64 = tool_result.get("screenshot_b64")
 
                 # If take_screenshot was already persisted by tools.take_screenshot, avoid duplicate row
+                # (that row was written under this same step_id, so the live event below still
+                # identifies the one durable row)
                 if not (tool_name == "take_screenshot" and tool_result.get("persisted")):
                     await self.persist_step(
                         action=tool_name,
