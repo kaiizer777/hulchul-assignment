@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useTransition } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useTransition } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
 
 /**
@@ -287,6 +287,26 @@ export default function AgentControlPage() {
     }
   };
 
+  /**
+   * Appends a step event unless that step_id is already rendered.
+   *
+   * `GET /agent/runs/{run_id}/stream` replays the whole `agent_steps` history on
+   * every connection, and the agent persists a step before it emits the matching
+   * live event, so a step can arrive both from history playback and from the live
+   * queue. EventSource also reconnects on its own whenever the stream drops, and
+   * the run now outlives the POST request, so mid-run reconnects are routine. Both
+   * paths would otherwise re-append every earlier step. Events without a step_id
+   * cannot be correlated and are always appended.
+   */
+  const appendStep = useCallback((step: StepEvent) => {
+    setSteps((prev) => {
+      if (step.step_id && prev.some((existing) => existing.step_id === step.step_id)) {
+        return prev;
+      }
+      return [...prev, step];
+    });
+  }, []);
+
   // If we have a runId, connect to SSE stream and poll approval status
   useEffect(() => {
     if (!runId) return;
@@ -306,7 +326,7 @@ export default function AgentControlPage() {
           if (data.type === 'status_change') {
             setStatus(data.status);
           } else if (data.type === 'step_complete' || data.type === 'step_failed') {
-            setSteps((prev) => [...prev, data]);
+            appendStep(data);
           } else if (data.type === 'done') {
             setStatus('done');
           }
@@ -325,14 +345,14 @@ export default function AgentControlPage() {
       eventSource.addEventListener('step_complete', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, data]);
+          appendStep(data);
         } catch {}
       });
 
       eventSource.addEventListener('step_failed', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, data]);
+          appendStep(data);
         } catch {}
       });
 
@@ -391,7 +411,7 @@ export default function AgentControlPage() {
       if (eventSource) eventSource.close();
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, [runId]);
+  }, [runId, appendStep]);
 
   /**
    * Toggles the pause or resume state of the active agent run.
