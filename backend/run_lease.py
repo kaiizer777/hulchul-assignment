@@ -27,7 +27,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import asyncpg
 
@@ -263,6 +263,7 @@ async def run_lease_heartbeat(
     interval_seconds: float,
     lease_seconds: float,
     owner_task: Optional[asyncio.Task] = None,
+    on_ownership_lost: Optional[Callable[[], None]] = None,
 ) -> None:
     """Renew ``run_id``'s lease every ``interval_seconds`` until cancelled.
 
@@ -281,7 +282,27 @@ async def run_lease_heartbeat(
     from a helper task, and a transient blip must not become an unhandled task
     exception; the lease window is sized with enough margin (see
     ``validate_run_lease_settings``) to absorb short outages.
+
+    Losing the lease is different from a failed renewal and is reported through
+    ``on_ownership_lost`` before the heartbeat returns. A renewal that matches zero
+    rows means this execution is no longer the owner: the run was reclaimed, or a
+    newer execution claimed it, and the caller is now driving someone else's run.
+    Stopping silently is not enough -- the owner-scoped fence in
+    ``ReActAgent.update_run_status`` only drops a status write, it does not stop
+    ``tools.execute``, step persistence, Redis writes or the ``done`` event, so the
+    loop has to be told to unwind. The callback is invoked at most once and its own
+    failure is logged rather than raised: the heartbeat is already returning.
     """
+    def _report_ownership_lost() -> None:
+        if on_ownership_lost is None:
+            return
+        try:
+            on_ownership_lost()
+        except Exception as cb_err:
+            logger.warning(
+                f"Run lease ownership-lost callback for {run_id} raised: {cb_err}"
+            )
+
     try:
         while True:
             if owner_task is not None and owner_task.done():
@@ -303,9 +324,10 @@ async def run_lease_heartbeat(
                 logger.warning(f"Run lease heartbeat renewal failed for {run_id}: {e}")
                 continue
             if not renewed:
-                logger.warning(
+                logger.error(
                     f"Run lease heartbeat lost ownership of {run_id}; stopping renewal."
                 )
+                _report_ownership_lost()
                 return
     except asyncio.CancelledError:
         logger.info(f"Run lease heartbeat for {run_id} cancelled.")

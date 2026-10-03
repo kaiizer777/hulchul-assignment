@@ -282,6 +282,10 @@ class ReActAgent:
         # and the second one is refused rather than silently joining the first.
         self._run_owner_id: str = uuid.uuid4().hex
         self._run_heartbeat_task: Optional[asyncio.Task] = None
+        # Set by the heartbeat once a renewal matches zero rows, i.e. this execution
+        # no longer owns the run. Checked by run() at each point where it would
+        # otherwise execute a tool or write state (issue #56).
+        self._lease_ownership_lost: bool = False
 
         # Approval threshold extracted from goal or default
         self.approval_threshold: float = settings.DEFAULT_APPROVAL_THRESHOLD
@@ -388,6 +392,46 @@ class ReActAgent:
             self._start_run_lease_heartbeat(pool)
         return True
 
+    def _mark_run_lease_lost(self) -> None:
+        """Record that the heartbeat lost this run's lease.
+
+        Invoked from the heartbeat task, so it must stay synchronous and must never
+        raise: an exception here would surface as an unhandled task exception. Idempotent
+        because the heartbeat reports the loss once but ``run()`` reads the flag at
+        several checkpoints.
+        """
+        if self._lease_ownership_lost:
+            return
+        self._lease_ownership_lost = True
+        logger.error(
+            f"Agent {self.run_id} lost its run lease to another execution; "
+            "this execution will stop acting on the run."
+        )
+
+    def _lease_lost_result(self, iteration: int, goal: str, threshold: float) -> Dict[str, Any]:
+        """Terminal result returned by ``run()`` when ownership of the run was lost.
+
+        Reported as ``failed`` for the same reason the lease-refused branch of ``run()``
+        does: this execution produced no outcome of its own, and a status the durable
+        store does not hold would only be contradicted by the owner's next write. The
+        distinction lives in the summary, which is what a log reader needs.
+
+        Returned rather than raised on purpose. Raising would unwind into the caller's
+        cancellation/exception handler, whose terminal-status write is not owner-scoped
+        and would then stamp ``failed`` over the run the newer owner is executing.
+        """
+        return {
+            "run_id": self.run_id,
+            "status": "failed",
+            "iterations": iteration,
+            "goal": goal,
+            "threshold": threshold,
+            "summary": (
+                "Run lease was lost to another execution; this execution stopped "
+                "without executing further steps."
+            ),
+        }
+
     def _start_run_lease_heartbeat(self, pool: asyncpg.Pool) -> None:
         """Start the out-of-band lease renewal task for this run, if not already running."""
         if self._run_heartbeat_task is not None and not self._run_heartbeat_task.done():
@@ -401,6 +445,7 @@ class ReActAgent:
                     interval_seconds=settings.RUN_HEARTBEAT_SECONDS,
                     lease_seconds=settings.RUN_LEASE_SECONDS,
                     owner_task=asyncio.current_task(),
+                    on_ownership_lost=self._mark_run_lease_lost,
                 )
             )
         except RuntimeError as e:
@@ -675,9 +720,20 @@ class ReActAgent:
         Pauses the agent loop and waits for human approval via Upstash Redis (Phase 2.7).
         Emits 'needs_approval' SSE event, writes awaiting state to Redis, polls every 2 seconds,
         and on rejection marks the invoice as 'skipped' in Neon before moving to the next invoice.
-        Returns 'approved', 'rejected', or 'stalled'.
+        Returns 'approved', 'rejected', 'stalled', or 'lease_lost'.
+
+        'lease_lost' is not a decision about the invoice: it means the run's lease was
+        taken over while this gate was polling, so this execution no longer owns the
+        run and must not clear the approval keys, mark the invoice skipped, or publish
+        a gate outcome. ``run()`` maps it to the lease-lost terminal result.
         """
         logger.info(f"Agent {self.run_id}: Triggering approval gate for invoice {invoice_id or po_number} (Amount: {amount})")
+
+        if self._lease_ownership_lost:
+            logger.error(
+                f"Agent {self.run_id}: run lease already lost; not opening the approval gate."
+            )
+            return "lease_lost"
 
         redis = await self.get_redis()
         # Fail fast if Redis is not configured
@@ -755,6 +811,17 @@ class ReActAgent:
 
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(2.0)
+            # The gate blocks for up to APPROVAL_TIMEOUT_SECONDS, which is long enough
+            # for the lease to be reclaimed underneath it. Everything below this point
+            # writes durable state (approval keys, agent_steps, invoices.status) and
+            # publishes a gate outcome, so the check belongs here rather than at the
+            # gate's entry only.
+            if self._lease_ownership_lost:
+                logger.error(
+                    f"Agent {self.run_id}: run lease lost while awaiting approval; "
+                    "abandoning the gate without touching its state."
+                )
+                return "lease_lost"
             try:
                 dec_record = await redis.get_approval_decision_record(self.run_id)
             except Exception as poll_err:
@@ -908,6 +975,11 @@ class ReActAgent:
 
     async def _abort_session_lost(self, iteration: int, error: str, threshold: float, clean_goal: str) -> Dict[str, Any]:
         """Persist and broadcast terminal session_lost distinct from step_failed."""
+        # Reached from deep inside an iteration (after OBSERVE or after ACT), so the
+        # top-of-loop guard has already passed. Losing the lease must not turn into a
+        # second, competing terminal announcement.
+        if self._lease_ownership_lost:
+            return self._lease_lost_result(iteration, clean_goal, threshold)
         await self.persist_step(
             action="session_lost",
             result=f"session_lost: {error} after {self._reattach_attempts} reattach attempt(s)",
@@ -1012,6 +1084,14 @@ class ReActAgent:
             self._current_iteration = iteration
             logger.info(f"Agent {self.run_id}: Iteration {iteration}/{self.max_iterations}")
 
+            # Ownership check at the iteration boundary. This is the guard that stops a
+            # superseded execution from resuming anything the heartbeat observed while
+            # the previous iteration was running, including the pause wait below --
+            # a pause polls Redis once a second for up to PAUSE_TIMEOUT_SECONDS, which
+            # is more than enough time for the lease to be reclaimed.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
+
             # Check pause flag in Redis (Phase 2.9 & Phase 3)
             if redis.is_configured:
                 is_paused = await redis.get_pause_flag(self.run_id)
@@ -1021,6 +1101,12 @@ class ReActAgent:
                     await self.emit_event("paused", {"step": iteration})
                     pause_deadline = asyncio.get_running_loop().time() + settings.PAUSE_TIMEOUT_SECONDS
                     while await redis.get_pause_flag(self.run_id):
+                        # Re-checked on every poll rather than only at the iteration
+                        # boundary: the wait below runs up to PAUSE_TIMEOUT_SECONDS, and
+                        # a superseded execution must not sit there holding the pause
+                        # open while a newer owner drives the same run.
+                        if self._lease_ownership_lost:
+                            return self._lease_lost_result(iteration, clean_goal, threshold)
                         if asyncio.get_running_loop().time() > pause_deadline:
                             logger.warning(f"Agent {self.run_id}: Pause wait timed out after {settings.PAUSE_TIMEOUT_SECONDS}s. Stalling run.")
                             await self.update_run_status("stalled")
@@ -1125,6 +1211,12 @@ class ReActAgent:
             if parsed_call is None:
                 # No tool call returned; inspect if model says 'done'
                 if is_goal_done(response_msg):
+                    # The model saying "done" is not this execution's to publish once
+                    # the run belongs to somebody else: the durable status write below
+                    # is fenced, but the step row, the Redis snapshot and the `done`
+                    # event are not, and a client would read them as this run's outcome.
+                    if self._lease_ownership_lost:
+                        return self._lease_lost_result(iteration, clean_goal, threshold)
                     logger.info(f"Agent {self.run_id}: Goal finished successfully.")
                     final_summary = response_msg.content or "Task completed successfully."
                     run_status = "completed"
@@ -1175,6 +1267,8 @@ class ReActAgent:
                                 "threshold": threshold,
                                 "summary": "Approval gate did not receive a decision or timed out.",
                             }
+                        if gate_outcome == "lease_lost":
+                            return self._lease_lost_result(iteration, clean_goal, threshold)
                         messages.append({"role": "assistant", "content": text_content})
                         if gate_outcome == "approved":
                             messages.append({
@@ -1552,6 +1646,12 @@ class ReActAgent:
                                 "threshold": threshold,
                                 "summary": "Approval gate did not receive a decision or timed out.",
                             }
+                        if gate_outcome == "lease_lost":
+                            # Checked before the `!= "approved"` arm below, which treats
+                            # any other outcome as a rejection and marks the invoice
+                            # skipped in Neon -- a durable ERP write by an execution
+                            # that no longer owns the run.
+                            return self._lease_lost_result(iteration, clean_goal, threshold)
                         if gate_outcome != "approved":
                             # Rejection: skip submission, reset active form, inform LLM (Phase 2.7)
                             tool_result = {
@@ -1585,6 +1685,15 @@ class ReActAgent:
                                 "content": json.dumps(tool_result),
                             })
                             continue
+
+            # The load-bearing guard. Everything above this point in the iteration
+            # (OBSERVE, the Groq THINK call, the approval gate) can take long enough
+            # for the heartbeat to observe that the lease is gone, and
+            # `tools.execute` on click/fill/select is the side-effecting ERP action the
+            # lease exists to keep single-owner. It also runs ahead of the `step_start`
+            # event so the stream never shows a step that was not taken.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
 
             step_id = str(uuid.uuid4())
             # Execute Tool with recovery wrap (Phase 2.8)
@@ -1807,6 +1916,11 @@ class ReActAgent:
 
         # Check if hard cap was reached
         if iteration >= self.max_iterations and run_status != "completed":
+            # Outside the loop, so the iteration-boundary guard cannot cover it. A
+            # `stalled` written here over a run another owner now holds would end that
+            # owner's run, and the Redis snapshot and `stalled` event would announce it.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
             logger.warning(f"Agent {self.run_id} hit hard cap of {self.max_iterations} iterations. Marking as stalled.")
             run_status = "stalled"
             await self.update_run_status("stalled")

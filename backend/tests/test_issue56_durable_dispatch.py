@@ -14,6 +14,7 @@ rather than asserting on mock call counts alone.
 
 import asyncio
 import contextlib
+import json
 import os
 import unittest
 import uuid
@@ -307,6 +308,62 @@ def _agent(pool: Any, run_id: str) -> ReActAgent:
     return ReActAgent(run_id=run_id, tools=MagicMock(spec=PlaywrightTools), pool=pool)
 
 
+def _unconfigured_redis() -> MagicMock:
+    """Redis stub with no Upstash configuration, so run() skips the pause/resume branch."""
+    redis = MagicMock()
+    redis.is_configured = False
+    redis.set_session_state = AsyncMock(return_value=True)
+    redis.get_pause_flag = AsyncMock(return_value=False)
+    return redis
+
+
+def _groq_returning(messages: List[Any]) -> MagicMock:
+    """Groq stub replaying one assistant message per planned iteration."""
+    responses = [MagicMock(choices=[MagicMock(message=m)]) for m in messages]
+    mock_completions = MagicMock()
+    mock_completions.create = AsyncMock(side_effect=responses)
+    mock_groq = MagicMock()
+    mock_groq.chat = MagicMock(completions=mock_completions)
+    return mock_groq
+
+
+def _tool_call_message(call_id: str, name: str, args: Dict[str, Any]) -> MagicMock:
+    """Assistant message carrying a single tool call."""
+    msg = MagicMock()
+    tc = MagicMock()
+    tc.id = call_id
+    tc.function.name = name
+    tc.function.arguments = json.dumps(args)
+    msg.tool_calls = [tc]
+    msg.content = None
+    return msg
+
+
+def _text_message(text: str) -> MagicMock:
+    """Assistant message with prose only and no tool call."""
+    msg = MagicMock()
+    msg.tool_calls = None
+    msg.content = text
+    return msg
+
+
+_RENEW_QUERY_MARKER = "lease_expires_at = now()"
+
+
+async def _await_renewals(pool: "_FakePool", minimum: int) -> bool:
+    """Yield to the loop until the heartbeat has issued at least `minimum` renewals.
+
+    Returns False if it stops early, which is how a heartbeat that gave up on a paused
+    run is distinguished from one that is merely slow. Counting observed statements
+    instead of sleeping a fixed interval keeps the assertion on the behaviour rather
+    than on the machine's timer resolution.
+    """
+    while True:
+        if len(pool.find(_RENEW_QUERY_MARKER)) >= minimum:
+            return True
+        await asyncio.sleep(0.005)
+
+
 class TestRunLeaseClaim(unittest.IsolatedAsyncioTestCase):
     """claim_run_lease: the property that makes a duplicate request harmless."""
 
@@ -442,19 +499,57 @@ class TestRunLeaseRenewRelease(unittest.IsolatedAsyncioTestCase):
 
     async def test_07_heartbeat_survives_a_pause(self) -> None:
         """End-to-end version of test_05: the heartbeat task itself keeps renewing."""
+        for status in ("paused", "awaiting_approval"):
+            with self.subTest(status=status):
+                run_id = str(uuid.uuid4())
+                pool = _FakePool(
+                    [_row(status=status, owner_id="owner-a", lease_expires_at=_expired(), run_id=run_id)]
+                )
+
+                task = asyncio.create_task(run_lease_heartbeat(pool, run_id, "owner-a", 0.01, 900.0))
+                try:
+                    # Waiting on the observed renewal rather than on a wall-clock
+                    # sleep: an `await asyncio.sleep(0.08)` assertion passed or failed
+                    # depending on how long the interpreter took to get through its
+                    # first iterations, which made this test fail on a cold run while
+                    # the heartbeat was behaving correctly. The bounded loop keeps the
+                    # failure mode honest -- a heartbeat that stops on a pause never
+                    # reaches the timeout.
+                    renewed = await asyncio.wait_for(
+                        _await_renewals(pool, minimum=2), timeout=5.0
+                    )
+                    self.assertTrue(renewed)
+                    self.assertFalse(
+                        task.done(), f"the heartbeat must not treat {status} as a lost lease"
+                    )
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+                self.assertGreater(pool.row(run_id)["lease_expires_at"], _now())
+
+    async def test_08_two_concurrent_claims_yield_exactly_one_winner(self) -> None:
+        """The dispatch-level race: two agents racing the same run_id.
+
+        Distinct from claim_run_lease's own test: this is the statement run() actually
+        depends on, and it asserts that exactly one execution is ACCEPTED rather than
+        merely that one claim statement won.
+        """
         run_id = str(uuid.uuid4())
-        pool = _FakePool(
-            [_row(status="paused", owner_id="owner-a", lease_expires_at=_expired(), run_id=run_id)]
+        pool = _FakePool([_row(status="running", run_id=run_id)])
+        first = _agent(pool, run_id)
+        second = _agent(pool, run_id)
+
+        accepted = await asyncio.gather(
+            first.ensure_run_record("goal"), second.ensure_run_record("goal")
         )
 
-        task = asyncio.create_task(run_lease_heartbeat(pool, run_id, "owner-a", 0.01, 900.0))
-        await asyncio.sleep(0.08)
-        self.assertFalse(task.done(), "the heartbeat must not treat a pause as a lost lease")
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-
-        self.assertGreater(pool.row(run_id)["lease_expires_at"], _now())
+        self.assertEqual(
+            sorted(accepted), [False, True], "two dispatches of one run_id must not both execute"
+        )
+        self.assertEqual(pool.row(run_id)["attempt"], 1)
+        self.assertIn(pool.row(run_id)["owner_id"], {first._run_owner_id, second._run_owner_id})
 
     async def test_03_release_is_owner_scoped(self) -> None:
         """A stale releaser must not clear the lease a newer owner is holding."""
@@ -842,6 +937,451 @@ class TestRunStatusFencing(unittest.IsolatedAsyncioTestCase):
         await agent.update_run_status("running")
 
         self.assertIn(STATUS_FENCE_GUARD, pool.find("SET status = $1")[0][0])
+
+    async def test_06_fenced_non_terminal_write_is_dropped_and_not_announced(self) -> None:
+        """The fence is not terminal-only.
+
+        A superseded execution can also try to write 'running' or 'paused' on its way
+        out. Broadcasting a status_change for a write that never landed would leave the
+        client showing a transition the durable store does not have, and the SSE poll
+        would then walk it back on the next pass.
+        """
+        for status in ("running", "paused", "awaiting_approval"):
+            with self.subTest(status=status):
+                pool, agent = self._leased_agent("owner-new", "owner-old")
+
+                await agent.update_run_status(status)
+
+                self.assertEqual(pool.row(agent.run_id)["status"], "running")
+                self.assertEqual(pool.row(agent.run_id)["owner_id"], "owner-new")
+                agent.emit_event.assert_not_awaited()
+
+    async def test_07_fenced_write_does_not_disturb_the_new_owner_s_lease(self) -> None:
+        """release_run_lease was already owner-scoped; the status fence must match."""
+        pool, agent = self._leased_agent("owner-new", "owner-old")
+
+        await agent.update_run_status("completed")
+
+        row = pool.row(agent.run_id)
+        self.assertEqual(row["owner_id"], "owner-new")
+        self.assertEqual(row["status"], "running")
+
+
+class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
+    """Losing the lease has to reach the loop, not just the log."""
+
+    async def test_01_reports_the_loss_once_when_renewal_matches_no_rows(self) -> None:
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-new", lease_expires_at=_live(), run_id=run_id)]
+        )
+        reported: List[str] = []
+
+        await asyncio.wait_for(
+            run_lease_heartbeat(
+                pool, run_id, "owner-old", 0.01, 900.0, on_ownership_lost=lambda: reported.append("lost")
+            ),
+            timeout=2.0,
+        )
+
+        self.assertEqual(reported, ["lost"], "the heartbeat must report the loss exactly once")
+        self.assertEqual(pool.row(run_id)["owner_id"], "owner-new")
+
+    async def test_02_survives_a_raising_callback(self) -> None:
+        """The heartbeat is already returning; a bad callback must not raise out of it."""
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-new", lease_expires_at=_live(), run_id=run_id)]
+        )
+
+        def _boom() -> None:
+            raise RuntimeError("callback exploded")
+
+        with self.assertLogs("backend.run_lease", level="WARNING"):
+            await asyncio.wait_for(
+                run_lease_heartbeat(pool, run_id, "owner-old", 0.01, 900.0, on_ownership_lost=_boom),
+                timeout=2.0,
+            )
+
+    async def test_03_not_reported_while_the_lease_is_held(self) -> None:
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)]
+        )
+        reported: List[str] = []
+
+        task = asyncio.create_task(
+            run_lease_heartbeat(
+                pool, run_id, "owner-a", 0.01, 900.0, on_ownership_lost=lambda: reported.append("lost")
+            )
+        )
+        try:
+            await asyncio.wait_for(_await_renewals(pool, minimum=2), timeout=5.0)
+            self.assertFalse(task.done())
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(reported, [], "a held lease is not a lost lease")
+
+    async def test_04_agent_flag_is_set_end_to_end(self) -> None:
+        """The agent's own marker is what run() reads, so wire the real two together."""
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-new", lease_expires_at=_live(), run_id=run_id)]
+        )
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = "owner-old"
+        self.assertFalse(agent._lease_ownership_lost)
+
+        await asyncio.wait_for(
+            run_lease_heartbeat(
+                pool, run_id, agent._run_owner_id, 0.01, 900.0,
+                on_ownership_lost=agent._mark_run_lease_lost,
+            ),
+            timeout=2.0,
+        )
+
+        self.assertTrue(agent._lease_ownership_lost)
+
+    async def test_05_marker_is_idempotent(self) -> None:
+        agent = _agent(_FakePool([]), str(uuid.uuid4()))
+        agent._mark_run_lease_lost()
+        agent._mark_run_lease_lost()
+        self.assertTrue(agent._lease_ownership_lost)
+
+
+class _LoopHarness:
+    """A ReActAgent wired for run() with every durable side effect stubbed out."""
+
+    def __init__(
+        self,
+        groq_messages: List[Any],
+        max_iterations: int = 5,
+    ) -> None:
+        self.events: List[Dict[str, Any]] = []
+        self.tools = MagicMock(spec=PlaywrightTools)
+        self.tools.page = MagicMock()
+        self.tools.page.is_closed = MagicMock(return_value=False)
+        self.tools.set_run_id = MagicMock()
+        self.tools.set_page = MagicMock()
+        self.tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})
+        self.redis = _unconfigured_redis()
+
+        async def _on_event(evt: Dict[str, Any]) -> None:
+            self.events.append(evt)
+
+        self.agent = ReActAgent(
+            run_id=str(uuid.uuid4()),
+            tools=self.tools,
+            groq_client=_groq_returning(groq_messages),
+            redis_client=self.redis,
+            max_iterations=max_iterations,
+            on_event=_on_event,
+        )
+        # Accepted by this execution: these cases are about what happens AFTER the
+        # lease is granted, so the claim itself is stubbed.
+        self.agent.ensure_run_record = AsyncMock(return_value=True)
+        self.agent.get_last_successful_step_index = AsyncMock(return_value=0)
+        self.agent.persist_step = AsyncMock(return_value=str(uuid.uuid4()))
+        self.agent.update_run_status = AsyncMock(return_value=None)
+
+    def event_types(self) -> List[str]:
+        return [str(e.get("type")) for e in self.events]
+
+    def read_page_ok(self, on_read: Optional[Any] = None) -> None:
+        """Successful OBSERVE, optionally flipping a callback (e.g. lease loss) first."""
+
+        async def _read_page() -> Dict[str, Any]:
+            if on_read is not None:
+                on_read()
+            return {
+                "success": True,
+                "snapshot": "- button 'Submit'",
+                "url": "http://x",
+                "title": "T",
+            }
+
+        self.tools.read_page = AsyncMock(side_effect=_read_page)
+
+
+class TestOwnershipLossStopsTheRun(unittest.IsolatedAsyncioTestCase):
+    """A superseded execution must stop before it acts or writes anything.
+
+    The owner-scoped fence on update_run_status only drops the agent_runs.status
+    write. Without these guards the lost owner keeps calling tools.execute (the
+    side-effecting click/fill/select that creates an invoice), keeps persisting steps,
+    keeps writing Redis state and still emits `done`.
+    """
+
+    async def _run(self, harness: _LoopHarness) -> Dict[str, Any]:
+        return await asyncio.wait_for(harness.agent.run("create invoices"), timeout=10.0)
+
+    def _assert_no_state_writes(self, harness: _LoopHarness) -> None:
+        harness.agent.persist_step.assert_not_awaited()
+        harness.agent.update_run_status.assert_not_awaited()
+        self.assertNotIn("done", harness.event_types())
+        self.assertNotIn("step_complete", harness.event_types())
+        self.assertNotIn("step", harness.event_types())
+
+    async def test_01_stops_before_tools_execute_when_the_lease_goes_mid_iteration(self) -> None:
+        harness = _LoopHarness([_tool_call_message("c1", "click", {"selector": "Create Invoice"})])
+        agent = harness.agent
+        # Ownership is lost while OBSERVE is running, i.e. after the iteration-boundary
+        # guard has already passed and before the action is taken.
+        harness.read_page_ok(on_read=agent._mark_run_lease_lost)
+        harness.tools.execute = AsyncMock(return_value={"success": True})
+
+        result = await self._run(harness)
+
+        harness.tools.execute.assert_not_awaited()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self.assertNotIn("step_start", harness.event_types(), "a step was announced but not taken")
+        self._assert_no_state_writes(harness)
+
+    async def test_02_iteration_boundary_stops_before_any_tool_runs(self) -> None:
+        harness = _LoopHarness([_tool_call_message("c1", "click", {"selector": "Create Invoice"})])
+        harness.tools.execute = AsyncMock(return_value={"success": True})
+        harness.tools.read_page = AsyncMock(
+            return_value={"success": True, "snapshot": "", "url": "http://x", "title": "T"}
+        )
+        harness.agent._lease_ownership_lost = True
+
+        result = await self._run(harness)
+
+        harness.tools.read_page.assert_not_awaited()
+        harness.tools.execute.assert_not_awaited()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self._assert_no_state_writes(harness)
+
+    async def test_03_done_is_not_emitted_after_ownership_loss(self) -> None:
+        harness = _LoopHarness([_text_message("Task completed successfully.")])
+        agent = harness.agent
+        harness.read_page_ok(on_read=agent._mark_run_lease_lost)
+        harness.tools.execute = AsyncMock(return_value={"success": True})
+
+        result = await self._run(harness)
+
+        self.assertEqual(result["status"], "failed", "a lost lease must not report completion")
+        self.assertNotIn("done", harness.event_types())
+        agent.update_run_status.assert_not_awaited()
+        for call in agent.persist_step.await_args_list:
+            self.assertNotEqual(call.kwargs.get("action"), "done")
+
+    async def test_04_session_lost_abort_is_suppressed(self) -> None:
+        """_abort_session_lost is reached from inside an iteration, past the boundary."""
+        harness = _LoopHarness([_text_message("still working")])
+        agent = harness.agent
+        harness.tools.read_page = AsyncMock(
+            side_effect=Exception("Target page, context or browser has been closed")
+        )
+        agent._mark_run_lease_lost()
+
+        result = await self._run(harness)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self.assertNotEqual(result["status"], "session_lost")
+        agent.update_run_status.assert_not_awaited()
+        self.assertNotIn("session_lost", harness.event_types())
+
+    async def test_05_hard_cap_stall_is_suppressed(self) -> None:
+        """The hard-cap block runs after the loop, so no boundary guard covers it."""
+        harness = _LoopHarness(
+            [_tool_call_message("c1", "navigate", {"url": "/invoices"})],
+            max_iterations=1,
+        )
+        agent = harness.agent
+        harness.read_page_ok()
+        harness.tools.execute = AsyncMock(return_value={"success": True, "url": "http://x"})
+
+        # Ownership is lost on the last thing the loop body does, so the hard-cap
+        # check is the first code to run after the loop exits.
+        async def _persist(*args: Any, **kwargs: Any) -> str:
+            agent._mark_run_lease_lost()
+            return str(uuid.uuid4())
+
+        agent.persist_step = AsyncMock(side_effect=_persist)
+
+        result = await self._run(harness)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self.assertNotIn("stalled", harness.event_types())
+        agent.update_run_status.assert_not_awaited()
+
+    async def test_06_approval_gate_does_not_open_once_ownership_is_lost(self) -> None:
+        harness = _LoopHarness([_text_message("still working")])
+        agent = harness.agent
+        agent.get_redis = AsyncMock(return_value=harness.redis)
+        agent._lease_ownership_lost = True
+
+        outcome = await agent.handle_approval_gate(
+            vendor="Acme", amount=60000.0, invoice_id="inv-1", po_number="PO-1"
+        )
+
+        self.assertEqual(outcome, "lease_lost")
+        agent.get_redis.assert_not_awaited()
+        harness.redis.set_session_state.assert_not_awaited()
+        harness.redis.set_approval_pending.assert_not_called()
+        agent.persist_step.assert_not_awaited()
+        agent.update_run_status.assert_not_awaited()
+
+    async def test_07_approval_gate_abandons_a_wait_it_no_longer_owns(self) -> None:
+        """The rejection path marks the invoice skipped in Neon -- a durable ERP write.
+
+        Checking only at the gate's entry would not help: the gate blocks for up to
+        APPROVAL_TIMEOUT_SECONDS, so the lease can be taken over while it polls.
+        """
+        harness = _LoopHarness([_text_message("still working")])
+        agent = harness.agent
+        redis = _unconfigured_redis()
+        redis.is_configured = True
+        redis.execute_command = AsyncMock(return_value=True)
+        redis.set_approval_pending = AsyncMock(return_value=True)
+        redis.get_approval_decision_record = AsyncMock(return_value=None)
+        redis.clear_approval = AsyncMock(return_value=True)
+
+        async def _set_state(*args: Any, **kwargs: Any) -> bool:
+            # Reported once the gate has announced itself and is about to poll.
+            agent._mark_run_lease_lost()
+            return True
+
+        redis.set_session_state = AsyncMock(side_effect=_set_state)
+        agent.get_redis = AsyncMock(return_value=redis)
+
+        outcome = await asyncio.wait_for(
+            agent.handle_approval_gate(
+                vendor="Acme", amount=60000.0, invoice_id="inv-1", po_number="PO-1"
+            ),
+            timeout=20.0,
+        )
+
+        self.assertEqual(outcome, "lease_lost")
+        redis.clear_approval.assert_not_awaited(), "a lost owner must not clear the approval keys"
+        redis.get_approval_decision_record.assert_not_awaited()
+        # Only the writes the gate legitimately made while it still held the lease.
+        self.assertEqual(agent.update_run_status.await_count, 1)
+        self.assertEqual(agent.update_run_status.await_args.args[0], "awaiting_approval")
+        self.assertEqual(agent.persist_step.await_count, 1)
+
+    async def test_08_gate_outcome_lease_lost_is_not_treated_as_a_rejection(self) -> None:
+        """A 'lease_lost' gate outcome must not fall into the rejection branch.
+
+        Anything that is not 'approved' drives the rejection path, which clears the
+        tracked form state and tells the model the human rejected the invoice.
+        """
+        harness = _LoopHarness(
+            [_text_message("Invoice PO-9 for Acme requires approval of ₹60,000.")]
+        )
+        agent = harness.agent
+        harness.read_page_ok()
+        harness.tools.execute = AsyncMock(return_value={"success": True})
+        agent._active_form_state.update({"amount": "60000", "po_number": "PO-9", "vendor": "Acme"})
+
+        async def _gate(**kwargs: Any) -> str:
+            agent._mark_run_lease_lost()
+            return "lease_lost"
+
+        agent.handle_approval_gate = AsyncMock(side_effect=_gate)
+
+        result = await self._run(harness)
+
+        agent.handle_approval_gate.assert_awaited_once()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self.assertIn(
+            "po_number",
+            agent._active_form_state,
+            "the rejection branch cleared the tracked form state",
+        )
+        harness.tools.execute.assert_not_awaited()
+
+    async def test_09_pause_wait_stops_when_ownership_is_lost(self) -> None:
+        """The pause poll blocks up to PAUSE_TIMEOUT_SECONDS on a human.
+
+        Its guard is separate from the iteration-boundary one because the boundary has
+        already passed by the time the run parks itself, and staying parked would hold
+        the pause open against whichever owner actually holds the run.
+        """
+        harness = _LoopHarness([_tool_call_message("c1", "navigate", {"url": "/invoices"})])
+        agent = harness.agent
+        redis = harness.redis
+        redis.is_configured = True
+        redis.get_pause_flag = AsyncMock(return_value=True)
+        harness.read_page_ok()
+        harness.tools.execute = AsyncMock(return_value={"success": True, "url": "http://x"})
+
+        async def _paused(status: str) -> None:
+            agent._mark_run_lease_lost()
+
+        agent.update_run_status = AsyncMock(side_effect=_paused)
+
+        result = await self._run(harness)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        agent.update_run_status.assert_awaited_once_with("paused")
+        self.assertNotIn("resumed", harness.event_types())
+        self.assertNotIn("stalled", harness.event_types())
+        harness.tools.execute.assert_not_awaited()
+
+    async def test_10_session_lost_abort_does_not_announce_a_second_terminal(self) -> None:
+        """_abort_session_lost is entered from inside the iteration, flag set mid-OBSERVE."""
+        harness = _LoopHarness([_text_message("still working")])
+        agent = harness.agent
+
+        async def _read_page() -> Dict[str, Any]:
+            agent._mark_run_lease_lost()
+            raise Exception("Target page, context or browser has been closed")
+
+        harness.tools.read_page = AsyncMock(side_effect=_read_page)
+
+        result = await self._run(harness)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self.assertNotIn("session_lost", harness.event_types())
+        agent.update_run_status.assert_not_awaited()
+        agent.persist_step.assert_not_awaited()
+
+    async def test_11_submit_gate_lease_lost_skips_the_invoice_skipped_write(self) -> None:
+        """The submit gate's rejection branch writes invoices.status = 'skipped'.
+
+        Reaching it needs the amount to clear the approval threshold, so this is the
+        path where a lost lease would otherwise mark a live owner's invoice skipped.
+        """
+        harness = _LoopHarness(
+            [_tool_call_message("c1", "click", {"selector": "Create Invoice"})]
+        )
+        agent = harness.agent
+        harness.read_page_ok()
+        harness.tools.execute = AsyncMock(return_value={"success": True})
+        agent.check_idempotency = AsyncMock(return_value={"exists": False, "error": None})
+        agent._active_form_state.update(
+            {"amount": "60000", "po_number": "PO-9", "vendor": "Acme"}
+        )
+
+        async def _gate(**kwargs: Any) -> str:
+            agent._mark_run_lease_lost()
+            return "lease_lost"
+
+        agent.handle_approval_gate = AsyncMock(side_effect=_gate)
+
+        result = await self._run(harness)
+
+        agent.handle_approval_gate.assert_awaited_once()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("lease", result["summary"])
+        self.assertIn(
+            "po_number",
+            agent._active_form_state,
+            "the rejection branch cleared the tracked form state",
+        )
+        harness.tools.execute.assert_not_awaited()
 
 
 class TestStartupReconciliationHook(unittest.IsolatedAsyncioTestCase):
