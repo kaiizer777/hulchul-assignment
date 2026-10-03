@@ -156,7 +156,21 @@ class TestAgentDurableFrameCorrelation(unittest.IsolatedAsyncioTestCase):
         async def _on_event(evt: Dict[str, Any]) -> None:
             events.append(evt)
 
-        tools = mock_tools if mock_tools is not None else MagicMock(spec=PlaywrightTools)
+        if mock_tools is None:
+            # read_page must be an explicit AsyncMock: a bare spec'd MagicMock
+            # child is not awaitable, so the observe step would raise instead of
+            # returning a snapshot and the run would take a different path.
+            mock_tools = MagicMock(spec=PlaywrightTools)
+            mock_tools.page = MagicMock()
+            mock_tools.page.is_closed = MagicMock(return_value=False)
+            mock_tools.read_page = AsyncMock(
+                return_value={
+                    "success": True,
+                    "snapshot": "x",
+                    "url": "http://x",
+                    "title": "T",
+                }
+            )
 
         async def fake_persist_step(**kwargs: Any) -> str:
             step_id = str(uuid.uuid4())
@@ -165,7 +179,7 @@ class TestAgentDurableFrameCorrelation(unittest.IsolatedAsyncioTestCase):
 
         agent = ReActAgent(
             run_id=str(uuid.uuid4()),
-            tools=tools,
+            tools=mock_tools,
             groq_client=mock_groq,
             redis_client=_mock_redis(),
             max_iterations=max_iterations,
