@@ -91,12 +91,21 @@ if (Test-Path "terraform.tfvars") {
     Write-Host "WARNING: infra/aws/terraform.tfvars exists and is shadowed by the generated terraform.tfvars.json. Edits to it have no effect." -ForegroundColor Yellow
 }
 
+# AUTH_PASSWORD_HASH is required: without it every login 503s by design and the
+# deployed app can never mint a session. Refuse to deploy rather than ship a
+# locked-out backend. The value itself is never echoed.
+if (-not $envDict.ContainsKey("auth_password_hash") -or [string]::IsNullOrWhiteSpace($envDict["auth_password_hash"])) {
+    Write-Error "backend/.env has no auth_password_hash. Generate one (argon2id PHC) and add AUTH_PASSWORD_HASH to backend/.env before deploying."
+    exit 1
+}
+
 $tfvarsObj = @{
     database_url             = $envDict["database_url"]
     groq_api_key             = $envDict["groq_api_key"]
     upstash_redis_rest_url   = $envDict["upstash_redis_rest_url"]
     upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
     browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
+    auth_password_hash       = $envDict["auth_password_hash"]
     frontend_url             = $frontendUrl
     cors_origins             = $corsOrigins
 }

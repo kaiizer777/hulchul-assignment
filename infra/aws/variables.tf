@@ -23,6 +23,11 @@ variable "browser_ws_endpoint" {
   sensitive = true
 }
 
+variable "auth_password_hash" {
+  type      = string
+  sensitive = true
+}
+
 variable "cors_origins" {
   type    = string
   default = "http://localhost:3051,http://127.0.0.1:3051"
