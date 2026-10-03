@@ -392,3 +392,92 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_publish.await_count, 3)
         published_run_ids = [c.args[0] for c in mock_publish.call_args_list]
         self.assertEqual(published_run_ids, [run_id, run_id, run_id])
+
+    async def test_cancelled_background_run_reaches_terminal_state(self) -> None:
+        """Cancelling the task must mark DB + Redis terminal and re-raise CancelledError."""
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = "44444444-4444-4444-8444-444444444444"
+        stored = {
+            "run_id": run_id,
+            "goal": "Process invoices",
+            "current_step": 2,
+            "last_action": "navigate",
+            "status": "running",
+        }
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = dict(stored)
+        mock_redis.set_session_state.return_value = True
+
+        started = asyncio.Event()
+
+        async def blocking_run(self_agent, goal: str) -> Dict[str, Any]:
+            started.set()
+            await asyncio.sleep(30.0)
+            raise AssertionError("run should have been cancelled")
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=_fake_browser_session),
+            patch("backend.agent.ReActAgent.run", new=blocking_run),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            task = asyncio.create_task(_execute_agent_run_background(run_id, "Process invoices"))
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(task.cancelled())
+
+        db_statuses = [
+            c.args[1]
+            for c in mock_pool._mock_conn.execute.call_args_list
+            if c.args and c.args[0].startswith("UPDATE agent_runs")
+        ]
+        self.assertTrue(db_statuses, "cancellation must mark the run failed in the database")
+        self.assertEqual(db_statuses[-1], "failed")
+
+        failed_writes = [
+            c.args[1]
+            for c in mock_redis.set_session_state.call_args_list
+            if c.args[1].get("status") == "failed"
+        ]
+        self.assertTrue(failed_writes, "cancellation must mark the run failed in Redis")
+        self.assertEqual(failed_writes[-1]["goal"], "Process invoices")
+        self.assertEqual(failed_writes[-1]["current_step"], 2)
+        self.assertEqual(failed_writes[-1]["last_action"], "navigate")
+
+        statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
+        self.assertIn("failed", statuses)
+
+    async def test_cancelled_run_still_releases_reservation(self) -> None:
+        """A cancelled background task must not leave the run_id reserved."""
+        run_id = "55555555-5555-4555-8555-555555555555"
+
+        @asynccontextmanager
+        async def hanging_browser(*args: Any, **kwargs: Any):
+            started.set()
+            await asyncio.Event().wait()
+            yield
+
+        started = asyncio.Event()
+
+        with patch("backend.browser.get_browser_session", new=hanging_browser):
+            task = asyncio.create_task(_execute_agent_run_background(run_id, "Process invoices"))
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            _reserved_agent_runs.add(run_id)
+            _active_agent_tasks[run_id] = task
+
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertNotIn(run_id, _reserved_agent_runs)
+        self.assertNotIn(run_id, _active_agent_tasks)

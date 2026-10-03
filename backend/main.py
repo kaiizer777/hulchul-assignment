@@ -87,6 +87,47 @@ _active_agent_tasks: Dict[str, asyncio.Task] = {}
 _reserved_agent_runs: Set[str] = set()
 
 
+async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
+    """Record a terminal run status in the database, Redis, and the event hub.
+
+    Each target is written in its own try/except so a failure in one cannot
+    prevent the others from recording the terminal status.
+    """
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agent_runs SET status = $1 WHERE run_id = $2;",
+                status,
+                uuid.UUID(run_id_str),
+            )
+    except Exception as db_err:
+        logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
+
+    try:
+        from backend.redis_client import get_redis_client
+        redis = get_redis_client()
+        state = await redis.get_session_state(run_id_str)
+        if state is not None:
+            state["status"] = status
+            await redis.set_session_state(run_id_str, state)
+    except Exception as redis_err:
+        logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
+
+    try:
+        await run_event_hub.publish(
+            run_id_str,
+            {
+                "type": "status_change",
+                "run_id": run_id_str,
+                "status": status,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as hub_err:
+        logger.warning(f"Could not publish terminal status for run {run_id_str}: {hub_err}")
+
+
 async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     """Run the full ReAct loop off-request; publish live events via run_event_hub."""
     from backend.browser import get_browser_session
@@ -101,38 +142,17 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
             # delivered each event to SSE subscribers twice.
             agent = ReActAgent(run_id=run_id_str, tools=tools)
             await agent.run(goal=goal)
+    except asyncio.CancelledError:
+        # CancelledError is a BaseException since 3.8, so the `except Exception`
+        # arm below never sees a cancelled run. Without this branch the task
+        # unwinds without recording a terminal status and the run stays
+        # 'running' in the database and Redis forever.
+        logger.warning(f"Background agent run {run_id_str} was cancelled")
+        await _mark_agent_run_terminal(run_id_str, "failed")
+        raise
     except Exception as e:
         logger.exception(f"Background agent run {run_id_str} failed: {e}")
-        try:
-            pool = await get_db_pool()
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE agent_runs SET status = 'failed' WHERE run_id = $1;",
-                    uuid.UUID(run_id_str),
-                )
-        except Exception as db_err:
-            logger.warning(f"Could not mark run {run_id_str} as failed: {db_err}")
-        try:
-            from backend.redis_client import get_redis_client
-            redis = get_redis_client()
-            state = await redis.get_session_state(run_id_str)
-            if state is not None:
-                state["status"] = "failed"
-                await redis.set_session_state(run_id_str, state)
-        except Exception as redis_err:
-            logger.warning(f"Could not mark run {run_id_str} as failed in Redis: {redis_err}")
-        try:
-            await run_event_hub.publish(
-                run_id_str,
-                {
-                    "type": "status_change",
-                    "run_id": run_id_str,
-                    "status": "failed",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-        except Exception:
-            pass
+        await _mark_agent_run_terminal(run_id_str, "failed")
     finally:
         current = asyncio.current_task()
         if current is not None and _active_agent_tasks.get(run_id_str) is current:
