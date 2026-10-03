@@ -7,6 +7,8 @@ fails closed: anything not positively confirmed against Redis is unauthenticated
 """
 
 import hashlib
+import ipaddress
+import json
 import logging
 import re
 import secrets
@@ -38,10 +40,16 @@ AUTH_UNAVAILABLE_DETAIL = "Authentication is temporarily unavailable"
 INVALID_CREDENTIALS_DETAIL = "Invalid credentials"
 RATE_LIMITED_DETAIL = "Too many failed login attempts"
 
-# Bucketing key material is attacker-influenced via X-Forwarded-For, so it is
-# bounded and charset-restricted to stop a hostile header fanning out Redis keys.
+# Bucketing key material feeds Redis keys, so it stays bounded and
+# charset-restricted even though the trusted source below is AWS-set.
 _UNSAFE_IP_CHARS = re.compile(r"[^A-Za-z0-9.:_-]")
 MAX_IP_BUCKET_LENGTH = 64
+
+# Fail-closed bucket used when the Lambda adapter context header is absent or
+# malformed (local dev, unit tests). A fixed key on purpose: request.client.host
+# is loopback behind the adapter, so keying on it would silently share one
+# bucket across all clients while looking per-IP.
+GLOBAL_LOGIN_BUCKET = "global"
 
 _password_hasher = PasswordHasher()
 
@@ -78,20 +86,60 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _trusted_source_ip(request: Request) -> Optional[str]:
+    """
+    Extract the AWS-set client IP from the Lambda adapter context header.
+
+    The adapter overwrites ``x-amzn-request-context`` with the real Lambda event
+    JSON, so a client-forged value never survives. Prefer the payload v2.0 shape
+    ``requestContext.http.sourceIp``, fall back to the v1 shape
+    ``requestContext.identity.sourceIp``. Return None when the header is absent,
+    malformed, or not a real IP.
+    """
+    raw_context = request.headers.get("x-amzn-request-context")
+    if not raw_context:
+        return None
+    try:
+        event = json.loads(raw_context)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    request_context = event.get("requestContext")
+    if not isinstance(request_context, dict):
+        return None
+    candidate: object = None
+    http = request_context.get("http")
+    if isinstance(http, dict):
+        candidate = http.get("sourceIp")
+    if not candidate:
+        identity = request_context.get("identity")
+        if isinstance(identity, dict):
+            candidate = identity.get("sourceIp")
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    candidate = candidate.strip()
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    return candidate
+
+
 def client_ip(request: Request) -> str:
     """
     Best-effort client identity used *only* to bucket the login rate limiter.
 
+    The bucket key is the trusted ``sourceIp`` from the ``x-amzn-request-context``
+    header set by AWS infrastructure. ``X-Forwarded-For`` passes through the
+    adapter verbatim (fully attacker-controlled) and ``request.client.host`` is
+    loopback behind the adapter, so neither is consulted here. Without a usable
+    context header the limiter fails closed into a single coarse GLOBAL bucket.
+
     X-Forwarded-For is client-controlled, so it must never gate authorization.
     """
-    forwarded = request.headers.get("x-forwarded-for")
-    candidate = ""
-    if forwarded:
-        candidate = forwarded.split(",")[0].strip()
-    if not candidate and request.client and request.client.host:
-        candidate = request.client.host
-    if not candidate:
-        candidate = "unknown"
+    source_ip = _trusted_source_ip(request)
+    candidate = source_ip if source_ip is not None else GLOBAL_LOGIN_BUCKET
     return _UNSAFE_IP_CHARS.sub("_", candidate)[:MAX_IP_BUCKET_LENGTH]
 
 

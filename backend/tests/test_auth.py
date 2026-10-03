@@ -476,8 +476,19 @@ def test_successful_login_resets_the_failure_counter(
         redis.clear_login_failures.assert_called_once()
 
 
-def test_rate_limiter_buckets_by_forwarded_for(client: TestClient, configured_password: str) -> None:
-    """X-Forwarded-For only selects the bucket; it must not be trusted for authorization."""
+def _source_ip_headers(source_ip: str, *, v1: bool = False) -> dict[str, str]:
+    """Build the Lambda adapter context header carrying a trusted sourceIp."""
+    if v1:
+        payload = {"requestContext": {"identity": {"sourceIp": source_ip}}}
+    else:
+        payload = {"requestContext": {"http": {"sourceIp": source_ip}}}
+    return {"X-Amzn-Request-Context": json.dumps(payload)}
+
+
+def test_rate_limiter_buckets_by_request_context_source_ip(
+    client: TestClient, configured_password: str
+) -> None:
+    """The trusted sourceIp selects the bucket; distinct sourceIps are isolated."""
     redis = _throttled_redis()
 
     with patch.object(auth_module, "get_redis_client", return_value=redis):
@@ -485,9 +496,130 @@ def test_rate_limiter_buckets_by_forwarded_for(client: TestClient, configured_pa
             response = client.post(
                 "/auth/login",
                 json={"password": "wrong"},
-                headers={"X-Forwarded-For": "203.0.113.9"},
+                headers=_source_ip_headers("203.0.113.9"),
             )
             assert response.status_code == 401
+
+        blocked = client.post(
+            "/auth/login",
+            json={"password": "wrong"},
+            headers=_source_ip_headers("203.0.113.9"),
+        )
+        assert blocked.status_code == 429
+        assert blocked.headers["Retry-After"] == "900"
+        assert blocked.json() == {"detail": auth.RATE_LIMITED_DETAIL}
+
+        # A different sourceIp is unaffected by the exhausted bucket.
+        other = client.post(
+            "/auth/login",
+            json={"password": "wrong"},
+            headers=_source_ip_headers("198.51.100.4"),
+        )
+        assert other.status_code == 401
+
+
+def test_rate_limiter_supports_v1_identity_source_ip(
+    client: TestClient, configured_password: str
+) -> None:
+    """Payload v1 shape (requestContext.identity.sourceIp) buckets the same way."""
+    redis = _throttled_redis()
+
+    with patch.object(auth_module, "get_redis_client", return_value=redis):
+        for _ in range(10):
+            response = client.post(
+                "/auth/login",
+                json={"password": "wrong"},
+                headers=_source_ip_headers("203.0.113.9", v1=True),
+            )
+            assert response.status_code == 401
+
+        blocked = client.post(
+            "/auth/login",
+            json={"password": "wrong"},
+            headers=_source_ip_headers("203.0.113.9", v1=True),
+        )
+        assert blocked.status_code == 429
+
+
+def test_rate_limiter_ignores_forwarded_for(client: TestClient, configured_password: str) -> None:
+    """Rotating X-Forwarded-For must not escape an exhausted sourceIp bucket."""
+    redis = _throttled_redis()
+
+    with patch.object(auth_module, "get_redis_client", return_value=redis):
+        for i in range(10):
+            response = client.post(
+                "/auth/login",
+                json={"password": "wrong"},
+                headers={
+                    **_source_ip_headers("203.0.113.9"),
+                    "X-Forwarded-For": f"198.51.100.{i}",
+                },
+            )
+            assert response.status_code == 401, f"attempt {i + 1} should be a plain 401"
+
+        # Same trusted sourceIp, brand-new XFF: still blocked.
+        blocked = client.post(
+            "/auth/login",
+            json={"password": "wrong"},
+            headers={
+                **_source_ip_headers("203.0.113.9"),
+                "X-Forwarded-For": "192.0.2.1",
+            },
+        )
+        assert blocked.status_code == 429
+        assert blocked.headers["Retry-After"] == "900"
+
+        # XFF alone (no trusted sourceIp) never selects a bucket either: covered
+        # by the global-fallback test below.
+
+
+def test_rate_limiter_falls_back_to_global_bucket_without_context(
+    client: TestClient, configured_password: str
+) -> None:
+    """Without the adapter context header every client shares one coarse bucket."""
+    redis = _throttled_redis()
+
+    with patch.object(auth_module, "get_redis_client", return_value=redis):
+        for i in range(10):
+            response = client.post(
+                "/auth/login",
+                json={"password": "wrong"},
+                headers={"X-Forwarded-For": f"198.51.100.{i}"},
+            )
+            assert response.status_code == 401, f"attempt {i + 1} should be a plain 401"
+
+        blocked = client.post(
+            "/auth/login",
+            json={"password": "wrong"},
+            headers={"X-Forwarded-For": "192.0.2.99"},
+        )
+        assert blocked.status_code == 429
+        assert blocked.headers["Retry-After"] == "900"
+
+
+def test_rate_limiter_treats_invalid_source_ip_as_global(
+    client: TestClient, configured_password: str
+) -> None:
+    """Garbage or malformed context content fails closed into the global bucket."""
+    redis = _throttled_redis()
+
+    with patch.object(auth_module, "get_redis_client", return_value=redis):
+        bad_contexts = [
+            {"X-Amzn-Request-Context": "not-json"},
+            {"X-Amzn-Request-Context": json.dumps({"requestContext": {"http": {"sourceIp": "not-an-ip"}}})},
+            {"X-Amzn-Request-Context": json.dumps({"requestContext": {}})},
+            {"X-Amzn-Request-Context": json.dumps({"nope": 1})},
+        ]
+        for i, headers in enumerate(bad_contexts):
+            response = client.post("/auth/login", json={"password": "wrong"}, headers=headers)
+            assert response.status_code == 401, f"bad context {i} should be a plain 401"
+
+        # Four failures above plus six more unauthenticated-context failures exhaust
+        # the shared global bucket: the 11th is blocked regardless of XFF.
+        for _ in range(6):
+            assert (
+                client.post("/auth/login", json={"password": "wrong"}).status_code == 401
+            )
 
         blocked = client.post(
             "/auth/login",
@@ -495,14 +627,6 @@ def test_rate_limiter_buckets_by_forwarded_for(client: TestClient, configured_pa
             headers={"X-Forwarded-For": "203.0.113.9"},
         )
         assert blocked.status_code == 429
-
-        # A different client is unaffected by the exhausted bucket.
-        other = client.post(
-            "/auth/login",
-            json={"password": "wrong"},
-            headers={"X-Forwarded-For": "198.51.100.4"},
-        )
-        assert other.status_code == 401
 
 
 def _unconfigured_redis() -> UpstashRedisClient:
