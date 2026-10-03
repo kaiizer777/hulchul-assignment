@@ -213,5 +213,21 @@ describe('API Route Unit Tests', () => {
       expect(customVendor).toBeDefined();
       expect(customVendor?.id).toBe('custom-supplier-inc');
     });
+
+    it('returns status 500 with error body when the database fails', async () => {
+      const dbModule = await import('@/lib/db');
+      vi.spyOn(dbModule, 'getDb').mockImplementationOnce(() => {
+        throw new Error('DATABASE_URL environment variable is missing.');
+      });
+
+      const { GET } = await import('@/app/api/vendors/route');
+      const response = await GET(request('/api/vendors'));
+
+      expect(response.status).toBe(500);
+
+      const data = await response.json();
+      expect(Array.isArray(data)).toBe(false);
+      expect(data.error).toBeDefined();
+    });
   });
 });

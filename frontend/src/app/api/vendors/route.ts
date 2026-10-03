@@ -67,12 +67,9 @@ export async function GET(request: Request) {
     return NextResponse.json(vendors);
   } catch (err: unknown) {
     console.error('GET /api/vendors error:', err);
-
-    // Fallback gracefully to canonical vendors if DB is temporarily unreachable
-    const fallbackVendors: VendorDTO[] = CANONICAL_VENDORS.map((name) => ({
-      id: toVendorId(name),
-      name,
-    }));
-    return NextResponse.json(fallbackVendors);
+    return NextResponse.json(
+      { error: 'Internal server error' },
+      { status: 500 }
+    );
   }
 }
