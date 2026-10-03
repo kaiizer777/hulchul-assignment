@@ -74,9 +74,17 @@ run_event_hub = RunEventHub()
 # In-memory registry of background agent executions keyed by run_id.
 # asyncio.create_task is used (not Starlette BackgroundTasks) so POST /agent/run
 # can return 202 immediately: BackgroundTasks are awaited before the ASGI app
-# returns, which would keep the client waiting. The tradeoff is Lambda
-# freeze/thaw can suspend a warm-container task and the 15-min Lambda ceiling
-# applies; cross-instance loss is tracked separately (#33).
+# returns, which would keep the client waiting.
+#
+# Accepted tradeoff: this task has no durable owner. Lambda freeze/thaw can
+# suspend a warm-container task, the 15-min Lambda ceiling applies, and
+# container replacement loses the run with no startup path reclaiming it, so an
+# accepted run can stay 'running' without progressing. Durable dispatch needs a
+# worker plus queue, IAM and deploy plumbing and is tracked in #56; cross-instance
+# event-hub loss is tracked in #33. In-PR mitigations only narrow the window: a
+# cancelled task records a terminal status in the database and Redis
+# (_mark_agent_run_terminal), and the SSE stream subscribes before reading
+# history so no live event is lost across the handoff.
 _active_agent_tasks: Dict[str, asyncio.Task] = {}
 # Synchronous reservation guard closing the check-then-act race between the
 # existing-task check in run_agent_endpoint and asyncio.create_task: the first
