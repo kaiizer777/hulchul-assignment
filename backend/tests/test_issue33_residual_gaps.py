@@ -54,6 +54,23 @@ def _mock_redis() -> MagicMock:
     return redis
 
 
+def _sse_mock_pool() -> MagicMock:
+    """Build the shared mock pool with asyncpg's real terminate() shape.
+
+    The shared _make_mock_pool builds its connection as an AsyncMock, so every
+    attribute returns a coroutine. asyncpg's Connection.terminate() is
+    synchronous, and backend/main.py calls it without awaiting inside the
+    reconcile's CancelledError path, so on an AsyncMock that line would build a
+    coroutine nobody awaits: nothing is terminated and the suite emits
+    "coroutine ... was never awaited" RuntimeWarnings that mask a genuine
+    unawaited-coroutine bug elsewhere. Pin the synchronous shape here so the
+    cancellation path is exercised exactly as written.
+    """
+    pool = _make_mock_pool()
+    pool._mock_conn.terminate = MagicMock(return_value=None)
+    return pool
+
+
 def _fake_step_store_hanging_first_polls(
     rows: List[Dict[str, Any]],
     hangs: int = 1,
@@ -312,7 +329,7 @@ class TestSseDedupeOfCorrelatedFrames(unittest.IsolatedAsyncioTestCase):
             _fake_step_row(history_step_id, "navigate", "loaded", created_at)
         ]
 
-        mock_pool = _make_mock_pool()
+        mock_pool = _sse_mock_pool()
         mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
         mock_pool._mock_conn.fetchval.return_value = "running"
         store = _fake_step_store(rows)
@@ -458,7 +475,7 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
         run_status: Dict[str, str] | None = None,
         entered: List[str] | None = None,
     ) -> MagicMock:
-        mock_pool = _make_mock_pool()
+        mock_pool = _sse_mock_pool()
         mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(
             run_id, (run_status or {}).get("value", "running"), datetime.now(timezone.utc)
         )
@@ -628,10 +645,8 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
             _fake_step_row(uuid.uuid4(), "navigate", "loaded", created_at)
         ]
         mock_pool = self._hanging_pool(run_id, rows, hangs=1)
+        # _sse_mock_pool already pinned terminate() to asyncpg's synchronous shape.
         conn = mock_pool._mock_conn
-        # asyncpg's Connection.terminate is synchronous, but an AsyncMock would
-        # auto-create it as a coroutine function and never run the call.
-        conn.terminate = MagicMock()
 
         frames = await _open_stream(self, mock_pool, run_id)
         try:
