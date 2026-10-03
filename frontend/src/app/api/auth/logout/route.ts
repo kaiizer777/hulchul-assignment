@@ -30,7 +30,6 @@ export async function POST(request: Request) {
         Accept: 'application/json',
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
       },
-      cache: 'no-store',
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)]),
     });
     return await relayAuthResponse(upstream);

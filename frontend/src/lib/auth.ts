@@ -107,7 +107,6 @@ const redisCommand = async (
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(args.map((arg) => String(arg))),
-    cache: 'no-store',
     signal: AbortSignal.timeout(REDIS_TIMEOUT_MS),
   });
 

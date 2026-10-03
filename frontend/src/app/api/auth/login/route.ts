@@ -46,7 +46,6 @@ export async function POST(request: Request) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ password: parsed.data.password }),
-      cache: 'no-store',
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)]),
     });
     return await relayAuthResponse(upstream);

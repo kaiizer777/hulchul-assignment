@@ -31,6 +31,7 @@ afterEach(() => {
   setBackendUrlEnv(originalEnv);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('getBackendUrl', () => {
@@ -68,13 +69,22 @@ describe('getBackendUrl', () => {
     expect(getBackendUrl()).toBe('http://localhost:8051');
   });
 
-  it('never degrades to localhost on a deployed host without configuration', () => {
+  it('never degrades to localhost on a deployed host without configuration in production', () => {
     // This is the regression that produced an opaque "Failed to fetch": a bundle
     // built without the variable pointed the browser at the visitor's machine.
+    // NODE_ENV is inlined at build time, so stub it to simulate a prod bundle.
     setBackendUrlEnv(undefined);
     setHostname('hulchul-frontend.sufiyanx.workers.dev');
+    vi.stubEnv('NODE_ENV', 'production');
     expect(getBackendUrl()).toBe(PRODUCTION_BACKEND_URL);
     expect(getBackendUrl()).not.toContain('localhost');
+  });
+
+  it('resolves localhost on a deployed hostname outside production so dev never touches prod', () => {
+    setBackendUrlEnv(undefined);
+    setHostname('hulchul-frontend.sufiyanx.workers.dev');
+    vi.stubEnv('NODE_ENV', 'development');
+    expect(getBackendUrl()).toBe('http://localhost:8051');
   });
 });
 

@@ -6,7 +6,7 @@ import {
   unauthorizedIfNoSession,
   verifySession,
 } from '@/lib/auth';
-import { resolveReturnTo } from '@/app/login/page';
+import { resolveReturnTo } from '@/lib/return-to';
 
 /**
  * A syntactically valid raw session token: unpadded base64url, no reserved

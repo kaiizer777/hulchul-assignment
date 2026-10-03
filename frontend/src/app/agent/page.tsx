@@ -319,21 +319,21 @@ export default function AgentControlPage() {
         try {
           const data = JSON.parse(event.data);
           if (data.status) setStatus(data.status);
-        } catch (e) {}
+        } catch {}
       });
 
       eventSource.addEventListener('step_complete', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, data]);
-        } catch (e) {}
+        } catch {}
       });
 
       eventSource.addEventListener('step_failed', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, data]);
-        } catch (e) {}
+        } catch {}
       });
 
       eventSource.addEventListener('done', (event: MessageEvent) => {
@@ -348,7 +348,7 @@ export default function AgentControlPage() {
           }
           setStatus('awaiting_approval');
           setApprovalData(data);
-        } catch (e) {}
+        } catch {}
       });
 
       eventSource.onerror = (err) => {
@@ -379,8 +379,8 @@ export default function AgentControlPage() {
             setApprovalData(data.approval_data);
           }
         }
-      } catch (e: any) {
-        if (e.name !== 'AbortError') {
+      } catch (e) {
+        if (e instanceof Error && e.name !== 'AbortError') {
           // ignore
         }
       }
@@ -475,7 +475,7 @@ export default function AgentControlPage() {
       } else {
         alert('No screenshot captured for this step.');
       }
-    } catch (err) {
+    } catch {
       alert('Failed to retrieve step screenshot.');
     } finally {
       setIsFetchingScreenshot(false);
