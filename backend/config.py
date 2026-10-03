@@ -60,5 +60,53 @@ class Settings:
     APPROVAL_TIMEOUT_SECONDS: float = float(os.getenv("APPROVAL_TIMEOUT_SECONDS", "120.0"))
     PAUSE_TIMEOUT_SECONDS: float = float(os.getenv("PAUSE_TIMEOUT_SECONDS", "300.0"))
 
+    # Run lease settings (issue #56). A run holds a postgres lease for as long as it
+    # is executing; the heartbeat renews it out-of-band so a single slow agent
+    # iteration (Groq call + a full CDP session acquire + a browser action) cannot
+    # outlast the window and get its run reclaimed underneath it.
+    RUN_LEASE_SECONDS: float = float(os.getenv("RUN_LEASE_SECONDS", "900.0"))
+    RUN_HEARTBEAT_SECONDS: float = float(os.getenv("RUN_HEARTBEAT_SECONDS", "60.0"))
+
+
+def validate_run_lease_settings(
+    lease_seconds: float,
+    heartbeat_seconds: float,
+    pause_timeout_seconds: float,
+) -> None:
+    """Reject run-lease timings that would let the reconciler kill a live run.
+
+    Two invariants, both load-time:
+
+    1. ``lease_seconds > pause_timeout_seconds``. The pause loop in
+       ``ReActAgent.run`` blocks for up to PAUSE_TIMEOUT_SECONDS *while holding no
+       CPU but still holding its lease*, and reconciliation treats a lease older
+       than the window as abandoned. A lease at or below the pause timeout means a
+       run paused on a human is indistinguishable from a run frozen mid-flight, so
+       the startup sweep would fail a run that is legitimately waiting.
+    2. ``heartbeat_seconds < lease_seconds``. Otherwise the lease lapses in the gap
+       between two renewals and the owner loses a run it is still executing.
+
+    Raised rather than ``assert`` so the check survives ``python -O``.
+    """
+    if lease_seconds <= pause_timeout_seconds:
+        raise ValueError(
+            f"RUN_LEASE_SECONDS ({lease_seconds}) must be strictly greater than "
+            f"PAUSE_TIMEOUT_SECONDS ({pause_timeout_seconds}); a shorter lease window "
+            "lets startup reconciliation fail a run that is legitimately paused."
+        )
+    if heartbeat_seconds <= 0:
+        raise ValueError(f"RUN_HEARTBEAT_SECONDS must be positive, got {heartbeat_seconds}.")
+    if heartbeat_seconds >= lease_seconds:
+        raise ValueError(
+            f"RUN_HEARTBEAT_SECONDS ({heartbeat_seconds}) must be less than "
+            f"RUN_LEASE_SECONDS ({lease_seconds}); otherwise the lease lapses between "
+            "renewals and the executing run loses its claim."
+        )
+
 
 settings = Settings()
+validate_run_lease_settings(
+    settings.RUN_LEASE_SECONDS,
+    settings.RUN_HEARTBEAT_SECONDS,
+    settings.PAUSE_TIMEOUT_SECONDS,
+)

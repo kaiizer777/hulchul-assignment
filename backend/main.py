@@ -14,6 +14,7 @@ from sse_starlette.sse import EventSourceResponse
 from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
+from backend.run_lease import reconcile_orphaned_agent_runs
 from backend.verification import VerificationReport, generate_verification_report
 from backend.auth import (
     AUTH_UNAVAILABLE_DETAIL,
@@ -87,6 +88,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database pool on startup: {e}")
         # Allow app to start even if DB is momentarily unreachable, health checks will report degraded
+
+    # Reclaim runs abandoned by a previous execution environment (issue #56). Separate
+    # try/except from pool init: a failed sweep must never be able to stop the app from
+    # starting, and adding DB round trips to every cold start is the one thing a
+    # serverless invocation cannot afford.
+    try:
+        pool = await get_db_pool()
+        reclaimed = await reconcile_orphaned_agent_runs(pool)
+        if reclaimed:
+            logger.error(
+                f"Reconciled {len(reclaimed)} orphaned agent run(s) on startup: {reclaimed}"
+            )
+    except Exception as e:
+        logger.error(f"Failed to reconcile orphaned agent runs on startup: {e}")
     yield
     logger.info("FastAPI shutting down: closing asyncpg database pool...")
     await close_db_pool()

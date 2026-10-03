@@ -190,7 +190,11 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
             reconnect=reconnect,
             max_reattaches=max_reattaches,
         )
-        agent.ensure_run_record = AsyncMock(return_value=None)
+        # ensure_run_record now returns whether this execution was ACCEPTED the run
+        # lease (issue #56); False means a live owner already holds it and run()
+        # must bail instead of double-running the same run_id. These reattach tests
+        # are single-owner, so the stub has to report acceptance.
+        agent.ensure_run_record = AsyncMock(return_value=True)
         agent.get_last_successful_step_index = AsyncMock(return_value=0)
         agent.persist_step = AsyncMock(return_value=str(uuid.uuid4()))
         agent.update_run_status = AsyncMock(return_value=None)

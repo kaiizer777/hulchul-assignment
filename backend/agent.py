@@ -15,6 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.config import settings
 from backend.db import get_db_pool
 from backend.redis_client import UpstashRedisClient, get_redis_client
+from backend.run_lease import (
+    TERMINAL_RUN_STATUSES,
+    release_run_lease,
+    run_lease_heartbeat,
+)
 from backend.tools import (
     PlaywrightTools,
     TOOL_DEFINITIONS,
@@ -271,6 +276,12 @@ class ReActAgent:
         # Track idempotency checks performed during this run (cache key: entity_type:identifier -> check_result)
         self._checked_entities: Dict[str, Dict[str, Any]] = {}
 
+        # Identity this execution holds its run lease under (issue #56). Per-instance,
+        # so two concurrent executions of the same run_id are always distinct owners
+        # and the second one is refused rather than silently joining the first.
+        self._run_owner_id: str = uuid.uuid4().hex
+        self._run_heartbeat_task: Optional[asyncio.Task] = None
+
         # Approval threshold extracted from goal or default
         self.approval_threshold: float = settings.DEFAULT_APPROVAL_THRESHOLD
 
@@ -314,19 +325,102 @@ class ReActAgent:
         except Exception:
             pass
 
-    async def ensure_run_record(self, goal: str = "Agent Execution Run") -> None:
-        """Ensure an agent_runs row exists in Neon database."""
+    async def ensure_run_record(
+        self,
+        goal: str = "Agent Execution Run",
+        start_heartbeat: bool = False,
+    ) -> bool:
+        """Ensure an agent_runs row exists and is owned by this execution.
+
+        Single atomic upsert: the row is created as ``running`` under this
+        execution's lease, or an existing row is taken over only when no live owner
+        holds it. Returns ``False`` when the claim is refused because another owner
+        holds an unexpired lease, which is the caller's signal not to execute --
+        that is what stops a duplicate request or a retry from driving the same
+        run_id twice.
+
+        The lease is established by this statement rather than by a follow-up
+        ``claim_run_lease`` call because a fresh run has no row to claim yet, and
+        splitting the accept into "upsert" then "claim" would leave a window where a
+        second request could upsert the row between the two.
+
+        Resurrection of a terminal run (no live lease) is preserved deliberately: that
+        is the resume/recovery path for a run that previously stalled or failed, and
+        existing recovery flows depend on it.
+
+        ``start_heartbeat`` is only set by ``run``. ``persist_step`` also calls this
+        as foreign-key recovery when a row is missing, and a bookkeeping write must
+        not spawn a lease heartbeat.
+        """
         pool = await self.get_db()
         async with pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
-                INSERT INTO agent_runs (run_id, goal, status, created_at)
-                VALUES ($1, $2, 'running', now())
-                ON CONFLICT (run_id) DO UPDATE SET status = 'running';
+                INSERT INTO agent_runs
+                    (run_id, goal, status, owner_id, lease_expires_at, attempt, created_at)
+                VALUES
+                    ($1, $2, 'running', $3, now() + make_interval(secs => $4::double precision), 1, now())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    goal = EXCLUDED.goal,
+                    status = 'running',
+                    owner_id = EXCLUDED.owner_id,
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    attempt = agent_runs.attempt + 1
+                WHERE agent_runs.lease_expires_at IS NULL
+                   OR agent_runs.lease_expires_at <= now()
+                   OR agent_runs.owner_id = EXCLUDED.owner_id
+                RETURNING run_id, status, owner_id, attempt, lease_expires_at
                 """,
                 uuid.UUID(self.run_id),
                 goal,
+                self._run_owner_id,
+                float(settings.RUN_LEASE_SECONDS),
             )
+
+        if row is None:
+            logger.error(
+                f"Run {self.run_id} is leased by another live owner; refusing to execute."
+            )
+            return False
+
+        if start_heartbeat:
+            self._start_run_lease_heartbeat(pool)
+        return True
+
+    def _start_run_lease_heartbeat(self, pool: asyncpg.Pool) -> None:
+        """Start the out-of-band lease renewal task for this run, if not already running."""
+        if self._run_heartbeat_task is not None and not self._run_heartbeat_task.done():
+            return
+        try:
+            self._run_heartbeat_task = asyncio.create_task(
+                run_lease_heartbeat(
+                    pool=pool,
+                    run_id=self.run_id,
+                    owner_id=self._run_owner_id,
+                    interval_seconds=settings.RUN_HEARTBEAT_SECONDS,
+                    lease_seconds=settings.RUN_LEASE_SECONDS,
+                    owner_task=asyncio.current_task(),
+                )
+            )
+        except RuntimeError as e:
+            # No running loop: the lease still exists, it just will not be renewed,
+            # so it lapses and reconciliation can reclaim the run.
+            logger.warning(f"Could not start run lease heartbeat for {self.run_id}: {e}")
+
+    async def stop_run_lease(self) -> None:
+        """Cancel the heartbeat and hand the lease back. Safe to call more than once."""
+        task = self._run_heartbeat_task
+        self._run_heartbeat_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        try:
+            pool = await self.get_db()
+            await release_run_lease(pool, self.run_id, self._run_owner_id)
+        except Exception as e:
+            # Never raise from here: this runs in the cleanup path of a run that is
+            # already finishing or unwinding. A lease we cannot release simply lapses,
+            # and a lapsed lease on a terminal run is inert.
+            logger.warning(f"Failed to release run lease for {self.run_id}: {e}")
 
     async def update_run_status(self, status: str) -> None:
         """Update agent_runs record status in Neon database and emit status_change event."""
@@ -345,6 +439,13 @@ class ReActAgent:
             await self.emit_event("status_change", {"status": status})
         except Exception as e:
             logger.error(f"Failed to update agent_runs status for {self.run_id}: {e}")
+        finally:
+            # Every terminal transition is the last thing this execution does, so this
+            # is the one place guaranteed to run on each exit path. Non-terminal
+            # transitions (running, paused, awaiting_approval) keep the lease: the run
+            # is still the caller's to renew.
+            if status in TERMINAL_RUN_STATUSES:
+                await self.stop_run_lease()
 
     async def persist_step(
         self,
@@ -823,8 +924,22 @@ class ReActAgent:
         logger.info(f"Starting ReAct agent run {self.run_id} with goal: '{clean_goal}'")
         self._reattach_attempts = 0
 
-        # 1. Ensure run record in database
-        await self.ensure_run_record(clean_goal)
+        # 1. Ensure run record in database, taking the run lease. A refusal means
+        # another live owner is already executing this run_id; bail out instead of
+        # racing it, so a duplicate request cannot double-run an ERP workflow.
+        accepted = await self.ensure_run_record(clean_goal, start_heartbeat=True)
+        if not accepted:
+            return {
+                "run_id": self.run_id,
+                "status": "failed",
+                "iterations": 0,
+                "goal": clean_goal,
+                "threshold": settings.DEFAULT_APPROVAL_THRESHOLD,
+                "summary": (
+                    "Run is already leased by another active execution; "
+                    "this request did not start it."
+                ),
+            }
 
         # 2. Extract constraints from goal
         threshold = extract_approval_threshold(clean_goal, default=settings.DEFAULT_APPROVAL_THRESHOLD)
