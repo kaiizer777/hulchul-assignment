@@ -61,6 +61,13 @@ DROP INDEX IF EXISTS idx_agent_steps_run_id;
 -- poll needs: its row comparison (timestamp, step_id) > ($2, $3) spans two
 -- columns, so it can only become an index qual if both are in the index.
 -- Without it the comparison degrades to a filter over the run's steps.
+-- Dropped by name first because CREATE INDEX IF NOT EXISTS matches on the index
+-- NAME, not its definition: against a database initialized from the two-column
+-- version it would otherwise skip creation and leave the old index in place.
+-- Not CONCURRENTLY because this runs inside conn.execute's implicit transaction,
+-- where CONCURRENTLY is rejected; agent_steps holds a few rows per run, so the
+-- rebuild is momentary.
+DROP INDEX IF EXISTS idx_agent_steps_run_timestamp;
 CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp ON agent_steps(run_id, timestamp ASC, step_id ASC);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_po_number ON invoices(po_number);
