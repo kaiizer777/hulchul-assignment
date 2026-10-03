@@ -306,33 +306,38 @@ async def verify_password(candidate: str) -> bool:
 
 async def enforce_login_rate_limit(ip: str) -> None:
     """
-    Reject an IP whose failure budget is spent, before any hashing runs, so
+    Atomically consume one failure-budget slot before any hashing runs, so
     argon2 cost cannot be amplified into a free CPU-exhaustion vector.
+
+    The gate issues a single server-atomic INCR and rejects when the post-INCR
+    count exceeds the budget. The INCR *is* the failure record, so callers must
+    not record a second time on a 401 -- that would double-count and halve the
+    sequential budget. Blocked (over-budget) increments carry no EXPIRE, so the
+    window stays anchored at the last counted failure instead of sliding
+    indefinitely under sustained blocked probes. Any unconfirmed counter state
+    (transport failure or corrupt count) fails closed with 503 before hashing.
     """
     redis = get_redis_client()
     if not redis.is_configured:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AUTH_UNAVAILABLE_DETAIL)
     try:
-        failures = await redis.get_login_failure_count(ip)
+        failures = await redis.record_login_failure(ip, LOGIN_WINDOW_SECONDS, LOGIN_MAX_FAILURES)
     except UpstashRedisError as exc:
         logger.error(f"Login rate limit lookup failed: {exc}")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AUTH_UNAVAILABLE_DETAIL)
 
-    if failures >= LOGIN_MAX_FAILURES:
+    try:
+        count = int(failures)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        logger.error(f"Login rate limit counter corrupt, failing closed: {failures!r}")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=AUTH_UNAVAILABLE_DETAIL)
+
+    if count > LOGIN_MAX_FAILURES:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=RATE_LIMITED_DETAIL,
             headers={"Retry-After": str(LOGIN_RETRY_AFTER_SECONDS)},
         )
-
-
-async def record_login_failure(ip: str) -> None:
-    """Count a failed attempt. A bookkeeping failure must not turn a 401 into a 500."""
-    redis = get_redis_client()
-    try:
-        await redis.record_login_failure(ip, LOGIN_WINDOW_SECONDS)
-    except UpstashRedisError as exc:
-        logger.error(f"Failed to record login failure: {exc}")
 
 
 async def clear_login_failures(ip: str) -> None:

@@ -27,7 +27,6 @@ from backend.auth import (
     enforce_login_rate_limit,
     is_https_request,
     read_session_token,
-    record_login_failure,
     require_session,
     set_session_cookie,
     verify_password,
@@ -210,12 +209,12 @@ class LoginRequest(BaseModel):
 async def login(payload: LoginRequest, request: Request, response: Response) -> Session:
     """Exchange the operator password for a session cookie."""
     ip = client_ip(request)
-    # Throttle first: argon2 is intentionally expensive and must not be reachable
-    # for free by anyone who can guess passwords.
+    # Atomic pre-hash gate: enforce_login_rate_limit issues a single
+    # server-atomic INCR and 429s past budget before argon2 runs. That INCR
+    # is the failure record, so no second increment happens on a 401.
     await enforce_login_rate_limit(ip)
 
     if not await verify_password(payload.password):
-        await record_login_failure(ip)
         raise HTTPException(status_code=401, detail=INVALID_CREDENTIALS_DETAIL)
 
     await clear_login_failures(ip)
