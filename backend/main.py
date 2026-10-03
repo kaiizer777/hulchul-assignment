@@ -98,6 +98,19 @@ _active_agent_tasks: Dict[str, asyncio.Task] = {}
 _reserved_agent_runs: Set[str] = set()
 
 
+# Ceiling for each database write that reports a terminal run status. The
+# cancellation handler shields this coroutine so a second cancellation cannot
+# abort it, and the asyncpg pool is configured without a command or acquire
+# timeout (backend/db.py), so a database that accepts the connection and then
+# never answers would hold that shielded await -- and anything draining it --
+# with no ceiling. Bounding the individual writes rather than the coroutine
+# keeps the shield honest: no orphaned follow-up task is created, the terminal
+# status is still recorded whenever the database responds, and the wait always
+# terminates. Redis needs no equivalent bound; its client is already built with
+# httpx.AsyncClient(timeout=10.0).
+TERMINAL_WRITE_IO_TIMEOUT_SECONDS: float = 5.0
+
+
 async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
     """Record a terminal run status in the database, Redis, and the event hub.
 
@@ -105,12 +118,15 @@ async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
     prevent the others from recording the terminal status.
     """
     try:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE agent_runs SET status = $1 WHERE run_id = $2;",
-                status,
-                uuid.UUID(run_id_str),
+        pool = await asyncio.wait_for(get_db_pool(), TERMINAL_WRITE_IO_TIMEOUT_SECONDS)
+        async with pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS) as conn:
+            await asyncio.wait_for(
+                conn.execute(
+                    "UPDATE agent_runs SET status = $1 WHERE run_id = $2;",
+                    status,
+                    uuid.UUID(run_id_str),
+                ),
+                TERMINAL_WRITE_IO_TIMEOUT_SECONDS,
             )
     except Exception as db_err:
         logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
@@ -139,8 +155,14 @@ async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
         logger.warning(f"Could not publish terminal status for run {run_id_str}: {hub_err}")
 
 
-async def _log_terminal_write_outcome(terminal_write: "asyncio.Task[None]") -> None:
-    """Surface failures from a terminal-status write that outlived its handler."""
+def _log_terminal_write_outcome(terminal_write: "asyncio.Future[None]") -> None:
+    """Surface failures from a terminal-status write that outlived its handler.
+
+    Synchronous by necessity: asyncio invokes a done callback from the event
+    loop and never awaits its return value, so an `async def` here would build a
+    coroutine that nobody awaits -- the log would never fire and every cancelled
+    run would emit a "coroutine was never awaited" RuntimeWarning.
+    """
     if terminal_write.cancelled():
         return
     write_err = terminal_write.exception()
@@ -216,15 +238,18 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         # second cancellation (a repeated cancel, or an enclosing wait_for
         # timeout) would abort them mid-flight and strand the run as 'running'.
         # shield() lets the writes run to completion across further
-        # cancellations of this handler. Deliberately no timeout -- bounding it
-        # would leave the write orphaned and could drop the terminal status,
-        # and lifespan never awaits these tasks, so there is no drain to stall.
+        # cancellations of this handler, and every write inside is individually
+        # bounded (TERMINAL_WRITE_IO_TIMEOUT_SECONDS), so the shield is never
+        # waiting on an unbounded database await. Lifespan never awaits these
+        # tasks, so there is no drain to stall either way.
         terminal_write = asyncio.ensure_future(_mark_agent_run_terminal(run_id_str, "failed"))
-        try:
-            await asyncio.shield(terminal_write)
-        except asyncio.CancelledError:
-            terminal_write.add_done_callback(_log_terminal_write_outcome)
-            raise
+        # Registered before the shield, not only on the cancellation path below,
+        # so the fallback log also covers a cancellation landing between creating
+        # the task and awaiting it.
+        terminal_write.add_done_callback(_log_terminal_write_outcome)
+        # A cancellation raised out of this await propagates: the handler is
+        # already unwinding from a CancelledError, which is never swallowed.
+        await asyncio.shield(terminal_write)
         raise
     except Exception as e:
         logger.exception(f"Background agent run {run_id_str} failed: {e}")
@@ -1003,8 +1028,9 @@ async def stream_agent_run_endpoint(
         queue = run_event_hub.subscribe(run_id_str)
         # step_ids already delivered on this stream. The agent persists a step
         # before publishing its live event, so the live path and the durable poll
-        # can both offer the same step; this keeps the second delivery out instead
-        # of depending on the frontend's dedupe. Bounded by the run's own step
+        # can both offer the same step, in either order; both paths check this
+        # set before yielding, which keeps the second delivery out instead of
+        # depending on the frontend's dedupe. Bounded by the run's own step
         # count, which the agent's iteration cap bounds.
         emitted_step_ids: Set[str] = set()
         # (timestamp, step_id) of the newest step delivered so far. Seeded by the
@@ -1103,6 +1129,15 @@ async def stream_agent_run_endpoint(
                     )
                     event_type = event.get("type", "message")
                     live_step_id = event.get("step_id")
+                    if live_step_id and str(live_step_id) in emitted_step_ids:
+                        # The agent persists a step before it publishes the live
+                        # event, so the cursor poll can read and emit that row
+                        # first and the hub copy lands afterwards. The step is
+                        # already on this stream, so the second copy is dropped
+                        # here instead of being left to the frontend's dedupe.
+                        # status_change carries no step_id and never takes this
+                        # branch.
+                        continue
                     if live_step_id:
                         emitted_step_ids.add(str(live_step_id))
                     if event_type == "status_change" and event.get("status"):

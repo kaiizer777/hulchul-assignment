@@ -521,6 +521,11 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_run_still_releases_reservation(self) -> None:
         """A cancelled background task must not leave the run_id reserved."""
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
         run_id = "55555555-5555-4555-8555-555555555555"
 
         @asynccontextmanager
@@ -531,7 +536,20 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
 
         started = asyncio.Event()
 
-        with patch("backend.browser.get_browser_session", new=hanging_browser):
+        # The cancellation branch calls _mark_agent_run_terminal, so the database
+        # and Redis clients are stubbed here exactly as the other cancellation
+        # tests do. Without them this test opens a real connection and issues a
+        # real Redis request on any machine that has credentials configured.
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = None
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=hanging_browser),
+            patch.object(run_event_hub, "publish", new=AsyncMock()),
+        ):
             task = asyncio.create_task(_execute_agent_run_background(run_id, "Process invoices"))
             await asyncio.wait_for(started.wait(), timeout=5.0)
             _reserved_agent_runs.add(run_id)
@@ -1078,3 +1096,140 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
 
         statuses = [p["status"] for p in payloads if p.get("type") == "status_change"]
         self.assertEqual(statuses, ["running", "completed"])
+
+    async def test_sse_live_event_for_polled_step_is_not_delivered_twice(self) -> None:
+        """A live event for a step the poll already emitted must not be re-emitted.
+
+        The agent persists a step before it publishes the live event, so the
+        cursor poll can read and emit that row first. Without a check on the
+        live path the hub copy is emitted afterwards and the stream delivers the
+        same step twice.
+        """
+        run_id = uuid.uuid4()
+        run_id_str = str(run_id)
+        created_at = datetime.now(timezone.utc)
+        history_step_id = uuid.uuid4()
+        polled_step_id = uuid.uuid4()
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(history_step_id, "navigate", "loaded", created_at)
+        ]
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
+        mock_pool._mock_conn.fetchval.return_value = "running"
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store(rows)
+
+        frames = await self._open_stream(mock_pool, run_id)
+        payloads: List[Dict[str, Any]] = []
+        try:
+            for _ in range(2):
+                frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                payloads.append(json.loads(frame["data"]))
+            # The row is committed with no hub event, so only the poll can emit it.
+            rows.append(
+                _fake_step_row(polled_step_id, "click", "clicked approve", created_at + timedelta(seconds=1))
+            )
+            while True:
+                frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                payload = json.loads(frame["data"])
+                payloads.append(payload)
+                if payload.get("step_id") == str(polled_step_id):
+                    break
+            # The agent's own publish for that same step arrives afterwards.
+            await run_event_hub.publish(
+                run_id_str,
+                {
+                    "type": "step_complete",
+                    "run_id": run_id_str,
+                    "step_id": str(polled_step_id),
+                    "step_index": 2,
+                    "action": "click",
+                    "result": "clicked approve",
+                    "timestamp": (created_at + timedelta(seconds=1)).isoformat(),
+                },
+            )
+            # Neither a further poll cycle nor the keep-alive may resurface it.
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(frames.__anext__(), timeout=0.4)
+        finally:
+            await frames.aclose()
+
+        step_ids = [p.get("step_id") for p in payloads if p.get("step_id")]
+        self.assertEqual(step_ids, [str(history_step_id), str(polled_step_id)])
+        self.assertGreaterEqual(
+            _cursor_poll_count(mock_pool),
+            1,
+            "the step must have been delivered by the poll, not by the live queue",
+        )
+
+    async def test_terminal_write_bounds_a_stalled_database(self) -> None:
+        """A database that never answers must not hold the terminal write open."""
+        run_id = "66666666-6666-4666-8666-666666666666"
+        mock_pool = _make_mock_pool()
+
+        async def never_returns(*args: Any, **kwargs: Any) -> Any:
+            await asyncio.Event().wait()
+
+        mock_pool._mock_conn.execute.side_effect = never_returns
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = {"run_id": run_id, "status": "running"}
+        mock_redis.set_session_state.return_value = True
+
+        with (
+            patch.object(main_module, "TERMINAL_WRITE_IO_TIMEOUT_SECONDS", 0.05),
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            # Unbounded against the old code: the stalled write is awaited forever.
+            await asyncio.wait_for(
+                main_module._mark_agent_run_terminal(run_id, "failed"), timeout=5.0
+            )
+
+        failed_writes = [
+            c.args[1]
+            for c in mock_redis.set_session_state.call_args_list
+            if c.args[1].get("status") == "failed"
+        ]
+        self.assertTrue(
+            failed_writes,
+            "a bounded database write must not abort the Redis write behind it",
+        )
+        statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
+        self.assertIn("failed", statuses)
+
+    def test_terminal_write_fallback_log_runs_synchronously(self) -> None:
+        """The fallback log must actually run: an async done-callback is never awaited.
+
+        asyncio schedules a done callback with call_soon, which rejects a
+        coroutine function outright ("coroutines cannot be used with
+        call_soon()"). An async callback here is therefore worse than a silent
+        no-op: it also breaks the registration itself, so the failure logging
+        this callback exists to provide can never happen.
+        """
+        from backend.main import _log_terminal_write_outcome
+
+        self.assertFalse(
+            asyncio.iscoroutinefunction(_log_terminal_write_outcome),
+            "a coroutine function is not a usable done callback; its body would never run",
+        )
+
+        loop = asyncio.new_event_loop()
+        try:
+            failed_write = loop.create_future()
+            failed_write.set_exception(RuntimeError("terminal write exploded"))
+            with self.assertLogs("hulchul.backend", level="WARNING") as logs:
+                returned = _log_terminal_write_outcome(failed_write)
+        finally:
+            loop.close()
+
+        self.assertIsNone(returned, "the callback must return None, not an un-awaited coroutine")
+        self.assertTrue(
+            any("Terminal status write did not complete cleanly" in m for m in logs.output),
+            f"the fallback log must fire; captured {logs.output}",
+        )
