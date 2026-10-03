@@ -4,12 +4,13 @@ import time
 import unittest
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx import AsyncClient, ASGITransport
 
+import backend.main as main_module
 from backend.auth import Session
 from backend.auth import require_session as require_session_dep
 from backend.main import (
@@ -18,6 +19,8 @@ from backend.main import (
     _active_agent_tasks,
     _reserved_agent_runs,
     _execute_agent_run_background,
+    _SSE_STEPS_ALL_SQL,
+    _SSE_STEPS_AFTER_CURSOR_SQL,
 )
 
 
@@ -26,6 +29,10 @@ def _make_mock_pool() -> MagicMock:
     mock_conn.execute.return_value = "INSERT 1"
     mock_conn.fetchrow.return_value = None
     mock_conn.fetch.return_value = []
+    # No agent_runs status for tests that do not drive one: the SSE poll reads
+    # the status through fetchval, and an unstubbed AsyncMock would yield a
+    # bogus transition frame.
+    mock_conn.fetchval.return_value = None
     mock_cm = AsyncMock()
     mock_cm.__aenter__.return_value = mock_conn
     mock_cm.__aexit__.return_value = False
@@ -33,6 +40,58 @@ def _make_mock_pool() -> MagicMock:
     mock_pool.acquire.return_value = mock_cm
     mock_pool._mock_conn = mock_conn
     return mock_pool
+
+
+def _fake_step_row(step_id: uuid.UUID, action: str, result: str, timestamp: datetime) -> Dict[str, Any]:
+    """Build one agent_steps row shaped like the columns the SSE stream selects."""
+    return {
+        "step_id": step_id,
+        "action": action,
+        "result": result,
+        "screenshot_b64": None,
+        "timestamp": timestamp,
+    }
+
+
+def _fake_run_row(run_id: uuid.UUID, status: str, created_at: datetime) -> Dict[str, Any]:
+    """Build one agent_runs row shaped like the columns the SSE stream selects."""
+    return {
+        "run_id": run_id,
+        "goal": "Process all pending invoices",
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+def _fake_step_store(rows: List[Dict[str, Any]]):
+    """Build a conn.fetch side_effect over `rows` that honours the SSE cursor query.
+
+    `rows` stands in for the whole agent_steps table of one run; a test appends
+    to it to model a step committed after the stream connected. Both orderings
+    are (timestamp, step_id) so the fake cannot pass by accident where the real
+    row comparison would skip or repeat a row.
+    """
+    async def fetch_steps(query: str, run_uuid: Any, *args: Any) -> List[Any]:
+        ordered = sorted(rows, key=lambda r: (r["timestamp"], r["step_id"]))
+        if query == _SSE_STEPS_AFTER_CURSOR_SQL:
+            cursor_timestamp, cursor_step_id = args
+            return [
+                r for r in ordered
+                if (r["timestamp"], r["step_id"]) > (cursor_timestamp, cursor_step_id)
+            ]
+        if query != _SSE_STEPS_ALL_SQL:
+            raise AssertionError(f"unexpected agent_steps query: {query}")
+        return list(ordered)
+
+    return fetch_steps
+
+
+def _cursor_poll_count(mock_pool: MagicMock) -> int:
+    """Count how many times the stream re-read agent_steps through its cursor."""
+    return sum(
+        1 for c in mock_pool._mock_conn.fetch.call_args_list
+        if c.args and c.args[0] == _SSE_STEPS_AFTER_CURSOR_SQL
+    )
 
 
 @asynccontextmanager
@@ -672,3 +731,219 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         )
         statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
         self.assertIn("failed", statuses)
+
+    async def _open_stream(self, mock_pool: MagicMock, run_id: uuid.UUID):
+        """Open the SSE endpoint against a mock pool with the poll interval collapsed.
+
+        The patches stay active until the test finishes because the generator
+        body does not run until the first frame is pulled from it, and every
+        later poll reads through them.
+        """
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        from backend.main import stream_agent_run_endpoint
+
+        for active in (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch.object(main_module, "SSE_DURABLE_POLL_INTERVAL_SECONDS", 0.05),
+        ):
+            active.start()
+            self.addCleanup(active.stop)
+
+        response = await stream_agent_run_endpoint(
+            run_id,
+            _session=Session(sub="operator", exp=9999999999),
+        )
+        return response.body_iterator
+
+    async def test_sse_poll_delivers_step_persisted_after_connect(self) -> None:
+        """A step committed after connect must reach an open stream with no hub event at all."""
+        run_id = uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        history_step_id = uuid.uuid4()
+        late_step_id = uuid.uuid4()
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(history_step_id, "navigate", "loaded", created_at)
+        ]
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
+        mock_pool._mock_conn.fetchval.return_value = "running"
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store(rows)
+
+        frames = await self._open_stream(mock_pool, run_id)
+        payloads: List[Dict[str, Any]] = []
+        try:
+            with patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish:
+                # Drain the replay first, so the row below is committed strictly
+                # after the stream read it and only a poll can deliver it.
+                for _ in range(2):
+                    frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                    payloads.append(json.loads(frame["data"]))
+                rows.append(
+                    _fake_step_row(late_step_id, "click", "clicked approve", created_at + timedelta(seconds=1))
+                )
+                while True:
+                    frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                    payload = json.loads(frame["data"])
+                    payloads.append(payload)
+                    if payload.get("step_id") == str(late_step_id):
+                        break
+            self.assertEqual(
+                mock_publish.await_count,
+                0,
+                "the step must arrive through durable reconciliation, not the hub",
+            )
+        finally:
+            await frames.aclose()
+
+        self.assertEqual(payloads[0]["type"], "status_change")
+        self.assertEqual(payloads[0]["status"], "running")
+        self.assertEqual(payloads[-1]["type"], "step_complete")
+        self.assertEqual(payloads[-1]["step_id"], str(late_step_id))
+        self.assertEqual(payloads[-1]["step_index"], 2)
+        self.assertEqual(payloads[-1]["result"], "clicked approve")
+        self.assertGreaterEqual(
+            _cursor_poll_count(mock_pool),
+            1,
+            "the step must have been read back through the cursor query, not the replay",
+        )
+
+    async def test_sse_live_and_poll_paths_deliver_each_step_once(self) -> None:
+        """A step offered by both the live queue and the poll is delivered once."""
+        run_id = uuid.uuid4()
+        run_id_str = str(run_id)
+        created_at = datetime.now(timezone.utc)
+        history_step_id = uuid.uuid4()
+        live_step_id = uuid.uuid4()
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(history_step_id, "navigate", "loaded", created_at)
+        ]
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
+        mock_pool._mock_conn.fetchval.return_value = "running"
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store(rows)
+
+        frames = await self._open_stream(mock_pool, run_id)
+        payloads: List[Dict[str, Any]] = []
+        try:
+            for _ in range(2):
+                frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                payloads.append(json.loads(frame["data"]))
+            # The agent commits a step and then publishes its live event, so the
+            # row is visible to the poll and the frame to the queue at the same
+            # time. Whichever path the stream sees first, the other must be a
+            # no-op rather than a second render of the same step.
+            await run_event_hub.publish(
+                run_id_str,
+                {
+                    "type": "step_complete",
+                    "run_id": run_id_str,
+                    "step_id": str(live_step_id),
+                    "step_index": 2,
+                    "action": "click",
+                    "result": "clicked approve",
+                    "timestamp": (created_at + timedelta(seconds=1)).isoformat(),
+                },
+            )
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            payloads.append(json.loads(frame["data"]))
+            rows.append(
+                _fake_step_row(live_step_id, "click", "clicked approve", created_at + timedelta(seconds=1))
+            )
+            # Several poll cycles over the already-delivered rows.
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(frames.__anext__(), timeout=0.4)
+        finally:
+            await frames.aclose()
+
+        self.assertGreaterEqual(
+            _cursor_poll_count(mock_pool),
+            2,
+            "the poll must have run over the row the live path already delivered",
+        )
+        step_ids = [p.get("step_id") for p in payloads if p.get("step_id")]
+        self.assertEqual(step_ids.count(str(history_step_id)), 1)
+        self.assertEqual(step_ids.count(str(live_step_id)), 1)
+        self.assertEqual(len(step_ids), 2, f"unexpected duplicate deliveries: {step_ids}")
+
+    async def test_sse_poll_does_not_replay_step_already_delivered_from_history(self) -> None:
+        """A replayed row offered again by the poll must not be emitted twice."""
+        run_id = uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        history_step_id = uuid.uuid4()
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(history_step_id, "navigate", "loaded", created_at)
+        ]
+
+        async def fetch_steps_ignoring_cursor(query: str, run_uuid: Any, *args: Any) -> List[Any]:
+            return list(rows)
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
+        mock_pool._mock_conn.fetchval.return_value = "running"
+        mock_pool._mock_conn.fetch.side_effect = fetch_steps_ignoring_cursor
+
+        frames = await self._open_stream(mock_pool, run_id)
+        payloads: List[Dict[str, Any]] = []
+        try:
+            for _ in range(2):
+                frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                payloads.append(json.loads(frame["data"]))
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(frames.__anext__(), timeout=0.4)
+        finally:
+            await frames.aclose()
+
+        step_ids = [p.get("step_id") for p in payloads if p.get("step_id")]
+        self.assertEqual(step_ids, [str(history_step_id)])
+
+        cursor_calls = [
+            c.args for c in mock_pool._mock_conn.fetch.call_args_list
+            if c.args and c.args[0] == _SSE_STEPS_AFTER_CURSOR_SQL
+        ]
+        self.assertTrue(cursor_calls, "the poll must resume from the replay cursor")
+        self.assertEqual(
+            cursor_calls[0],
+            (_SSE_STEPS_AFTER_CURSOR_SQL, run_id, created_at, history_step_id),
+            "the cursor must be the (timestamp, step_id) of the newest replayed row",
+        )
+
+    async def test_sse_poll_emits_status_change_only_on_transition(self) -> None:
+        """One transition is emitted once; unchanged polls emit nothing."""
+        run_id = uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        rows: List[Dict[str, Any]] = []
+        status = {"value": "running"}
+
+        async def fetchval_status(query: str, run_uuid: Any) -> Any:
+            return status["value"]
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
+        mock_pool._mock_conn.fetchval.side_effect = fetchval_status
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store(rows)
+
+        frames = await self._open_stream(mock_pool, run_id)
+        payloads: List[Dict[str, Any]] = []
+        try:
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            payloads.append(json.loads(frame["data"]))
+            status["value"] = "completed"
+            while True:
+                frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                payload = json.loads(frame["data"])
+                payloads.append(payload)
+                if payload.get("type") == "status_change" and payload.get("status") == "completed":
+                    break
+            # ~8 further poll cycles on an unchanged status.
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(frames.__anext__(), timeout=0.4)
+        finally:
+            await frames.aclose()
+
+        statuses = [p["status"] for p in payloads if p.get("type") == "status_change"]
+        self.assertEqual(statuses, ["running", "completed"])
