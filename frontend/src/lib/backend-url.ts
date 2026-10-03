@@ -43,8 +43,8 @@ export const getBackendUrl = (): string => {
  *
  * The message deliberately does not claim the server never saw the request. A
  * rejected fetch() cannot distinguish "never arrived" from "arrived, but the
- * browser refused the response" (CORS), and POST /agent/run only returns a run
- * id after the agent loop has already executed on the server. Asserting "no run
+ * browser refused the response" (CORS), and POST /agent/run returns 202 + run
+ * id immediately while the agent loop continues in the background. Asserting "no run
  * started" would invite a duplicate submission of side-effecting work, so the
  * operator is told to check the run status instead.
  *

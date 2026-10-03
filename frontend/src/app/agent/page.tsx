@@ -20,8 +20,8 @@ const AGENT_API_BASE = '/api/agent';
  *
  * It deliberately does not claim the server never saw the request: a rejected
  * fetch cannot distinguish "never arrived" from "arrived and was refused", and
- * `POST /agent/run` only returns a run id after the agent loop has already
- * executed on the backend. Asserting no run started would invite a duplicate
+ * `POST /agent/run` returns 202 + run id immediately while the agent loop
+ * continues in the background. Asserting no run started would invite a duplicate
  * submission of side-effecting work, so the operator is told to check the run
  * status instead.
  */
