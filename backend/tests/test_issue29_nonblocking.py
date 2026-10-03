@@ -1200,8 +1200,11 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
             failed_writes,
             "a bounded database write must not abort the Redis write behind it",
         )
-        statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
-        self.assertIn("failed", statuses)
+        self.assertEqual(
+            mock_publish.await_count,
+            0,
+            "a write that never completed must not announce a status the durable store lacks",
+        )
 
     def test_terminal_write_fallback_log_runs_synchronously(self) -> None:
         """The fallback log must actually run: an async done-callback is never awaited.
@@ -1232,4 +1235,170 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("Terminal status write did not complete cleanly" in m for m in logs.output),
             f"the fallback log must fire; captured {logs.output}",
+        )
+
+    async def test_cancelled_during_teardown_does_not_overwrite_a_finished_run(self) -> None:
+        """A cancellation after the agent returned must not rewrite its terminal status.
+
+        ReActAgent.run records the run's own terminal status before returning, so
+        a cancellation landing during teardown would otherwise report a
+        completed run as failed.
+        """
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = "77777777-7777-4777-8777-777777777777"
+        agent_returned = asyncio.Event()
+        teardown_entered = asyncio.Event()
+
+        @asynccontextmanager
+        async def slow_teardown_browser(*args: Any, **kwargs: Any):
+            yield MagicMock(page=MagicMock())
+            # Reached only after agent.run has returned.
+            teardown_entered.set()
+            await asyncio.sleep(0.3)
+
+        async def finished_run(self_agent: Any, goal: str) -> Dict[str, Any]:
+            agent_returned.set()
+            return {"summary": "done"}
+
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = {"run_id": run_id, "status": "completed"}
+        mock_redis.set_session_state.return_value = True
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=slow_teardown_browser),
+            patch("backend.agent.ReActAgent.run", new=finished_run),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            task = asyncio.create_task(_execute_agent_run_background(run_id, "Process invoices"))
+            await asyncio.wait_for(teardown_entered.wait(), timeout=5.0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(agent_returned.is_set(), "the cancellation must land after the agent returned")
+        db_statuses = [
+            c.args[1]
+            for c in mock_pool._mock_conn.execute.call_args_list
+            if c.args and c.args[0].startswith("UPDATE agent_runs")
+        ]
+        self.assertEqual(db_statuses, [], "a finished run must not be rewritten as failed")
+        failed_writes = [
+            c.args[1]
+            for c in mock_redis.set_session_state.call_args_list
+            if c.args[1].get("status") == "failed"
+        ]
+        self.assertEqual(failed_writes, [], "Redis must keep the status the agent recorded")
+        statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
+        self.assertNotIn("failed", statuses)
+        self.assertNotIn(run_id, _reserved_agent_runs)
+        self.assertNotIn(run_id, _active_agent_tasks)
+
+    async def test_terminal_status_is_published_only_after_the_database_accepts_it(self) -> None:
+        """A rejected database write must not publish a status the poll would then revert."""
+        run_id = "88888888-8888-4888-8888-888888888888"
+        mock_pool = _make_mock_pool()
+
+        async def failing_execute(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("database unavailable")
+
+        mock_pool._mock_conn.execute.side_effect = failing_execute
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = {"run_id": run_id, "status": "running"}
+        mock_redis.set_session_state.return_value = True
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            await asyncio.wait_for(
+                main_module._mark_agent_run_terminal(run_id, "failed"), timeout=5.0
+            )
+
+        self.assertEqual(
+            mock_publish.await_count,
+            0,
+            "publishing failed without the database update makes the next poll revert the client to running",
+        )
+        failed_writes = [
+            c.args[1]
+            for c in mock_redis.set_session_state.call_args_list
+            if c.args[1].get("status") == "failed"
+        ]
+        self.assertTrue(failed_writes, "Redis is a separate read model and is still updated")
+
+    async def test_sse_live_step_start_does_not_suppress_its_own_completion(self) -> None:
+        """step_start shares a step_id with its terminal event, so only the terminal event dedupes."""
+        run_id = uuid.uuid4()
+        run_id_str = str(run_id)
+        created_at = datetime.now(timezone.utc)
+        rows: List[Dict[str, Any]] = []
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "running", created_at)
+        mock_pool._mock_conn.fetchval.return_value = "running"
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store(rows)
+
+        frames = await self._open_stream(mock_pool, run_id)
+        payloads: List[Dict[str, Any]] = []
+        try:
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            payloads.append(json.loads(frame["data"]))
+            live_step_id = str(uuid.uuid4())
+            # The agent emits step_start, then the terminal event for that same
+            # step under one step_id.
+            await run_event_hub.publish(
+                run_id_str,
+                {
+                    "type": "step_start",
+                    "run_id": run_id_str,
+                    "step_id": live_step_id,
+                    "step_index": 7,
+                    "action": "click",
+                    "arguments": {},
+                },
+            )
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            payloads.append(json.loads(frame["data"]))
+            await run_event_hub.publish(
+                run_id_str,
+                {
+                    "type": "step_complete",
+                    "run_id": run_id_str,
+                    "step_id": live_step_id,
+                    "step_index": 7,
+                    "action": "click",
+                    "result": "clicked approve",
+                },
+            )
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            payloads.append(json.loads(frame["data"]))
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(frames.__anext__(), timeout=0.4)
+        finally:
+            await frames.aclose()
+
+        self.assertEqual(payloads[1]["type"], "step_start")
+        self.assertEqual(
+            payloads[2]["type"],
+            "step_complete",
+            "registering step_start as emitted would suppress its own step's completion",
+        )
+        self.assertEqual(payloads[2]["step_id"], live_step_id)
+        self.assertEqual(
+            payloads[2]["step_index"],
+            1,
+            "live steps are numbered by the stream, not by the agent's loop counter",
         )

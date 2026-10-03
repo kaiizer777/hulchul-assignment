@@ -116,7 +116,15 @@ async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
 
     Each target is written in its own try/except so a failure in one cannot
     prevent the others from recording the terminal status.
+
+    The hub publication is gated on the database write succeeding. The stream
+    reconciles `agent_runs.status` on every poll, so announcing a status the
+    durable store never accepted would make the next poll re-emit the older one
+    as a fresh transition and walk the client backwards from `failed` to
+    `running`. Redis is a separate read model and is still written
+    best-effort.
     """
+    db_updated = False
     try:
         pool = await asyncio.wait_for(get_db_pool(), TERMINAL_WRITE_IO_TIMEOUT_SECONDS)
         async with pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS) as conn:
@@ -128,6 +136,7 @@ async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
                 ),
                 TERMINAL_WRITE_IO_TIMEOUT_SECONDS,
             )
+        db_updated = True
     except Exception as db_err:
         logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
 
@@ -140,6 +149,9 @@ async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
             await redis.set_session_state(run_id_str, state)
     except Exception as redis_err:
         logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
+
+    if not db_updated:
+        return
 
     try:
         await run_event_hub.publish(
@@ -177,6 +189,12 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     from backend.agent import ReActAgent
 
     session_stack: list = []
+    # ReActAgent.run records the run's own terminal status (and the matching
+    # Redis state) before it returns. A cancellation that lands during the
+    # teardown below therefore arrives *after* the run already committed
+    # 'completed', and writing 'failed' over it would contradict the durable
+    # record the SSE poll reads on every pass.
+    agent_finished = False
 
     async def _enter_cdp_session():
         """Enter a browser session context manager and track it for later release."""
@@ -211,6 +229,7 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
                 max_reattaches=MAX_CDP_REATTACH_ATTEMPTS,
             )
             await agent.run(goal=goal)
+            agent_finished = True
         finally:
             # Teardown is reached either by a finished run or by a cancellation
             # landing in the run above, and the second cancellation that follows
@@ -233,6 +252,15 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         # arm below never sees a cancelled run. Without this branch the task
         # unwinds without recording a terminal status and the run stays
         # 'running' in the database and Redis forever.
+        if agent_finished:
+            # The run already recorded its own terminal status. Overwriting it
+            # here would report a completed run as failed purely because its
+            # browser sessions were slow to close.
+            logger.warning(
+                f"Background agent run {run_id_str} was cancelled during teardown "
+                "after the agent finished; keeping the terminal status it recorded"
+            )
+            raise
         logger.warning(f"Background agent run {run_id_str} was cancelled")
         # Awaiting the terminal writes directly leaves them interruptible: a
         # second cancellation (a repeated cancel, or an enclosing wait_for
@@ -954,6 +982,16 @@ _SSE_STEPS_AFTER_CURSOR_SQL = """
 """
 
 
+# The event types this stream treats as a persisted agent_steps row: the same
+# classifications _step_row_to_frame derives, so a live event and a replayed row
+# for one step are the same kind of frame. step_start is deliberately excluded --
+# it carries the same step_id as the terminal event that follows it, so
+# registering it here would suppress that step's own completion.
+_SSE_PERSISTED_STEP_EVENT_TYPES = frozenset(
+    {"step_complete", "step_failed", "step_unknown", "session_lost"}
+)
+
+
 def _status_change_frame(run_id_str: str, status: str, timestamp: str) -> Dict[str, Any]:
     """Build the SSE frame carrying a run status transition."""
     return {
@@ -1129,17 +1167,24 @@ async def stream_agent_run_endpoint(
                     )
                     event_type = event.get("type", "message")
                     live_step_id = event.get("step_id")
-                    if live_step_id and str(live_step_id) in emitted_step_ids:
-                        # The agent persists a step before it publishes the live
-                        # event, so the cursor poll can read and emit that row
-                        # first and the hub copy lands afterwards. The step is
-                        # already on this stream, so the second copy is dropped
-                        # here instead of being left to the frontend's dedupe.
-                        # status_change carries no step_id and never takes this
-                        # branch.
-                        continue
-                    if live_step_id:
-                        emitted_step_ids.add(str(live_step_id))
+                    if live_step_id and event_type in _SSE_PERSISTED_STEP_EVENT_TYPES:
+                        live_step_id = str(live_step_id)
+                        if live_step_id in emitted_step_ids:
+                            # The agent persists a step before it publishes the
+                            # live event, so the cursor poll can read and emit
+                            # that row first and the hub copy lands afterwards.
+                            # The step is already on this stream, so this copy is
+                            # dropped here instead of being left to the
+                            # frontend's dedupe.
+                            continue
+                        emitted_step_ids.add(live_step_id)
+                        # Live events carry the agent's own loop counter while
+                        # the replay and the poll number the rows they deliver
+                        # from this stream's counter. Reassign so a single
+                        # stream never mixes the two schemes and the displayed
+                        # ordinals stay monotonic.
+                        event = {**event, "step_index": next_step_index}
+                        next_step_index += 1
                     if event_type == "status_change" and event.get("status"):
                         last_status = event["status"]
                     yield {
