@@ -272,8 +272,10 @@ class UpstashRedisClient:
 
         Blocked (over-budget) increments are plain INCR with no EXPIRE, so
         sustained blocked probes cannot extend the lockout indefinitely (fixed
-        expiry anchored at the last counted failure). A non-integer INCR
-        result is unconfirmed and raises instead of coercing to 0.
+        expiry anchored at the last counted failure). A fresh key (count 1)
+        always gets EXPIRE so a non-positive budget can never create an
+        immortal key. A non-integer INCR result is unconfirmed and raises
+        instead of coercing to 0.
         """
         key = f"{AUTH_LOGIN_FAIL_KEY_PREFIX}{ip}"
         count = await self.execute_command("INCR", key)
@@ -282,7 +284,7 @@ class UpstashRedisClient:
         except (TypeError, ValueError):
             logger.error(f"Corrupt INCR result for login failure counter {ip!r}: {count!r}")
             raise UpstashRedisError(f"Corrupt INCR result for login failure counter {ip!r}")
-        if failures <= max_failures:
+        if failures <= max_failures or failures == 1:
             await self.execute_command("EXPIRE", key, window_seconds)
         return failures
 

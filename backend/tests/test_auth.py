@@ -888,6 +888,21 @@ def test_login_failure_counter_rearms_window_only_while_under_budget() -> None:
         ["EXPIRE", "hulchul:auth:login_fail:203.0.113.9", "900"],
     ]
 
+    at_budget: list[list] = []
+
+    def at_handler(request: httpx.Request) -> httpx.Response:
+        at_budget.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": 10})
+
+    at_http = httpx.AsyncClient(transport=httpx.MockTransport(at_handler))
+    at_redis = UpstashRedisClient(url="https://example.upstash.io", token="t", http_client=at_http)
+
+    assert _run(at_redis.record_login_failure("203.0.113.9", 900, 10)) == 10
+    assert at_budget == [
+        ["INCR", "hulchul:auth:login_fail:203.0.113.9"],
+        ["EXPIRE", "hulchul:auth:login_fail:203.0.113.9", "900"],
+    ], "the boundary increment (count == MAX) is still counted, so it must arm EXPIRE"
+
     over_budget: list[list] = []
 
     def over_handler(request: httpx.Request) -> httpx.Response:
