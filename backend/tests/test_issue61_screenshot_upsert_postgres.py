@@ -86,12 +86,20 @@ class TestScreenshotUpsertAgainstPostgres(unittest.IsolatedAsyncioTestCase):
         """Open the isolated pool and plant the run row the steps will hang off."""
         self.pool = await self._init_isolated_pool()
         self.run_id = uuid.uuid4()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO agent_runs (run_id, goal, status) VALUES ($1, $2, 'running') ON CONFLICT (run_id) DO NOTHING;",
-                self.run_id,
-                "issue 61 screenshot upsert",
-            )
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO agent_runs (run_id, goal, status) VALUES ($1, $2, 'running') ON CONFLICT (run_id) DO NOTHING;",
+                    self.run_id,
+                    "issue 61 screenshot upsert",
+                )
+        except BaseException:
+            # asyncTearDown never runs when asyncSetUp raises, so the pool this
+            # test opened would leak. Same reasoning as phase26's probe path.
+            with contextlib.suppress(Exception):
+                await self.pool.close()
+            self.pool = None
+            raise
 
     async def asyncTearDown(self):
         """Delete this run's rows and release the pool, even if the body failed."""
