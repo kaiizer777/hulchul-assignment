@@ -17,6 +17,7 @@ from backend.db import get_db_pool
 from backend.redis_client import UpstashRedisClient, get_redis_client
 from backend.run_lease import (
     TERMINAL_RUN_STATUSES,
+    affected_rows,
     release_run_lease,
     run_lease_heartbeat,
 )
@@ -423,19 +424,40 @@ class ReActAgent:
             logger.warning(f"Failed to release run lease for {self.run_id}: {e}")
 
     async def update_run_status(self, status: str) -> None:
-        """Update agent_runs record status in Neon database and emit status_change event."""
+        """Update agent_runs record status in Neon database and emit status_change event.
+
+        The write is fenced on the lease owner (issue #56). A lease expiring does not
+        stop the old holder: a frozen-then-thawed execution can wake up mid-run and
+        write `completed` straight over a newer owner's state, including a run that
+        reconciliation already failed. A NULL owner is *not* writable either -- NULL
+        means the lease was released or the run was reclaimed, and in both cases this
+        execution is not the owner. ``run()`` always claims the lease via
+        ``ensure_run_record`` before any status write, so the legitimate writer is
+        always fenced in.
+
+        A fenced-out write emits no ``status_change``: announcing a status that never
+        reached the database would be a lie the SSE stream would then broadcast.
+        """
         try:
             pool = await self.get_db()
             async with pool.acquire() as conn:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE agent_runs
                     SET status = $1
-                    WHERE run_id = $2;
+                    WHERE run_id = $2
+                      AND owner_id = $3;
                     """,
                     status,
                     uuid.UUID(self.run_id),
+                    self._run_owner_id,
                 )
+            if affected_rows(result) == 0:
+                logger.warning(
+                    f"Dropped '{status}' for run {self.run_id}: ownership was lost to "
+                    "another execution."
+                )
+                return
             await self.emit_event("status_change", {"status": status})
         except Exception as e:
             logger.error(f"Failed to update agent_runs status for {self.run_id}: {e}")

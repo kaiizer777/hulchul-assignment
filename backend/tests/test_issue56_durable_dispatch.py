@@ -13,6 +13,7 @@ rather than asserting on mock call counts alone.
 """
 
 import asyncio
+import contextlib
 import os
 import unittest
 import uuid
@@ -23,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from backend.agent import ReActAgent
 from backend.config import settings, validate_run_lease_settings
 from backend.run_lease import (
+    ACTIVE_RUN_STATUSES,
     ORPHANED_RUN_STATUS,
     ORPHANED_STEP_ACTION,
     TERMINAL_RUN_STATUSES,
@@ -30,6 +32,7 @@ from backend.run_lease import (
     reconcile_orphaned_agent_runs,
     release_run_lease,
     renew_run_lease,
+    run_lease_heartbeat,
 )
 from backend.tools import PlaywrightTools
 
@@ -42,6 +45,8 @@ LEASE_FREE_GUARD = "lease_expires_at IS NULL OR lease_expires_at < now()"
 # also appears in claim_run_lease's SET list, which would make the fake demand that
 # an unowned row already be owned before it can be claimed.
 OWNER_SCOPED_GUARD = "AND owner_id = $2"
+STATUS_FENCE_GUARD = "AND owner_id = $3"
+ACTIVE_STATUS_GUARD = "status = ANY($4::text[])"
 UPSERT_LEASE_GUARD = "agent_runs.lease_expires_at IS NULL"
 UPSERT_EXPIRED_GUARD = "agent_runs.lease_expires_at <= now()"
 UPSERT_SAME_OWNER_GUARD = "agent_runs.owner_id = EXCLUDED.owner_id"
@@ -216,6 +221,13 @@ class _FakePool:
         if LEASE_FREE_GUARD in query:
             lease = row.get("lease_expires_at")
             if lease is not None and lease >= _now():
+                return False
+        if ACTIVE_STATUS_GUARD in query:
+            allowed = [str(s) for s in args[3]] if len(args) > 3 else []
+            if row["status"] not in allowed:
+                return False
+        if STATUS_FENCE_GUARD in query and len(args) > 2:
+            if row.get("owner_id") != args[2]:
                 return False
         if OWNER_SCOPED_GUARD in query and len(args) > 1:
             if row.get("owner_id") != args[1]:
@@ -399,6 +411,50 @@ class TestRunLeaseRenewRelease(unittest.IsolatedAsyncioTestCase):
         pool = _FakePool([_row(status="done", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)])
 
         self.assertFalse(await renew_run_lease(pool, run_id, "owner-a", 900.0))
+
+    async def test_05_renew_keeps_the_lease_alive_while_paused_or_awaiting_approval(self) -> None:
+        """Regression: the heartbeat must survive a human wait.
+
+        Scoping renewal to status = 'running' made the first heartbeat tick during a
+        pause or approval gate renew zero rows, which the heartbeat read as "lease
+        lost" and stopped for good. The resumed run then executed with a dead lease,
+        so a duplicate request could claim it and double-run it.
+        """
+        for status in ("running", "paused", "awaiting_approval"):
+            with self.subTest(status=status):
+                run_id = str(uuid.uuid4())
+                pool = _FakePool(
+                    [_row(status=status, owner_id="owner-a", lease_expires_at=_expired(), run_id=run_id)]
+                )
+
+                self.assertTrue(
+                    await renew_run_lease(pool, run_id, "owner-a", 900.0),
+                    f"a run in {status!r} is still executing and must keep its lease",
+                )
+                self.assertEqual(pool.row(run_id)["owner_id"], "owner-a")
+
+    async def test_06_active_statuses_exclude_terminal_ones(self) -> None:
+        """A terminal run must never hold a live lease, or it stops being resumable."""
+        self.assertFalse(ACTIVE_RUN_STATUSES & TERMINAL_RUN_STATUSES)
+        self.assertIn("running", ACTIVE_RUN_STATUSES)
+        self.assertIn("paused", ACTIVE_RUN_STATUSES)
+        self.assertIn("awaiting_approval", ACTIVE_RUN_STATUSES)
+
+    async def test_07_heartbeat_survives_a_pause(self) -> None:
+        """End-to-end version of test_05: the heartbeat task itself keeps renewing."""
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="paused", owner_id="owner-a", lease_expires_at=_expired(), run_id=run_id)]
+        )
+
+        task = asyncio.create_task(run_lease_heartbeat(pool, run_id, "owner-a", 0.01, 900.0))
+        await asyncio.sleep(0.08)
+        self.assertFalse(task.done(), "the heartbeat must not treat a pause as a lost lease")
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        self.assertGreater(pool.row(run_id)["lease_expires_at"], _now())
 
     async def test_03_release_is_owner_scoped(self) -> None:
         """A stale releaser must not clear the lease a newer owner is holding."""
@@ -689,9 +745,6 @@ class TestEnsureRunRecordLease(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(agent._run_heartbeat_task, "a refused run must not start a heartbeat")
 
     async def test_11_heartbeat_stops_when_it_loses_ownership(self) -> None:
-
-        from backend.run_lease import run_lease_heartbeat
-
         run_id = str(uuid.uuid4())
         pool = _FakePool([_row(status="done", owner_id="someone-else", lease_expires_at=_live(), run_id=run_id)])
 
@@ -701,6 +754,94 @@ class TestEnsureRunRecordLease(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, timeout=2.0)
 
         self.assertEqual(pool.row(run_id)["owner_id"], "someone-else")
+
+
+class TestRunStatusFencing(unittest.IsolatedAsyncioTestCase):
+    """A status write must be fenced on the lease owner.
+
+    An expired lease does not stop the old holder: a frozen-then-thawed execution
+    wakes up mid-run and would otherwise write `completed` straight over a newer
+    owner's state, including a run reconciliation already failed.
+    """
+
+    def _leased_agent(
+        self, row_owner: Optional[str], agent_owner: str
+    ) -> Tuple[_FakePool, ReActAgent]:
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id=row_owner, lease_expires_at=_live(), run_id=run_id)]
+        )
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = agent_owner
+        agent.emit_event = AsyncMock()
+        return pool, agent
+
+    async def test_01_owner_write_is_applied_and_broadcast(self) -> None:
+        pool, agent = self._leased_agent("owner-me", "owner-me")
+
+        await agent.update_run_status("completed")
+
+        self.assertEqual(pool.row(agent.run_id)["status"], "completed")
+        agent.emit_event.assert_awaited_once_with(
+            "status_change", {"status": "completed"}
+        )
+
+    async def test_02_superseded_owner_write_is_dropped(self) -> None:
+        # The row is now owned by a newer execution; this agent is the stale one.
+        pool, agent = self._leased_agent("owner-new", "owner-old")
+
+        await agent.update_run_status("completed")
+
+        self.assertEqual(
+            pool.row(agent.run_id)["status"],
+            "running",
+            "a superseded execution overwrote newer state",
+        )
+        agent.emit_event.assert_not_awaited()
+
+    async def test_03_superseded_owner_cannot_overwrite_a_reconciled_run(self) -> None:
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="failed", owner_id=None, lease_expires_at=None, run_id=run_id)]
+        )
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = "ghost-owner"
+        agent.emit_event = AsyncMock()
+
+        await agent.update_run_status("completed")
+
+        self.assertEqual(pool.row(run_id)["status"], "failed")
+
+    async def test_04_unowned_row_rejects_a_status_write(self) -> None:
+        """NULL owner means the lease was released or the run was reclaimed.
+
+        Either way this execution is not the owner, so it must not write. An earlier
+        draft allowed `owner_id IS NULL` here to avoid stranding a run whose row was
+        created by tools.py's ON CONFLICT DO NOTHING insert (which sets no owner) --
+        but that allowance let a ghost owner resurrect a run reconciliation had
+        already failed, which is the exact bug the fence exists to stop. run() always
+        claims the lease via ensure_run_record before any status write, so the
+        legitimate writer is always fenced in.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id=None, lease_expires_at=None, run_id=run_id)]
+        )
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = "whoever"
+        agent.emit_event = AsyncMock()
+
+        await agent.update_run_status("stalled")
+
+        self.assertEqual(pool.row(run_id)["status"], "running")
+        agent.emit_event.assert_not_awaited()
+
+    async def test_05_status_sql_carries_the_fence(self) -> None:
+        pool, agent = self._leased_agent("owner-me", "owner-me")
+
+        await agent.update_run_status("running")
+
+        self.assertIn(STATUS_FENCE_GUARD, pool.find("SET status = $1")[0][0])
 
 
 class TestStartupReconciliationHook(unittest.IsolatedAsyncioTestCase):

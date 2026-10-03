@@ -43,6 +43,24 @@ TERMINAL_RUN_STATUSES = frozenset(
     {"done", "failed", "completed", "session_lost", "stalled"}
 )
 
+# Statuses from which execution may still continue, i.e. the owner still holds the
+# lease and the heartbeat must keep renewing it.
+#
+# This is NOT simply the complement of TERMINAL_RUN_STATUSES: a run parks itself in
+# 'paused' (up to PAUSE_TIMEOUT_SECONDS) and 'awaiting_approval' (up to
+# APPROVAL_TIMEOUT_SECONDS) while it is very much alive and waiting on a human.
+# Renewal has to match those states too. Scoping renewal to 'running' alone made the
+# heartbeat treat a legitimate pause as a lost lease, stop for good, and leave the
+# resumed run executing with a dead lease -- at which point a duplicate request could
+# claim the run and double-run it, which is the precise failure this module exists to
+# prevent.
+ACTIVE_RUN_STATUSES = frozenset({"running", "paused", "awaiting_approval"})
+
+assert not (ACTIVE_RUN_STATUSES & TERMINAL_RUN_STATUSES), (
+    "a status cannot be both terminal and still-reachable; "
+    "a run marked terminal must have its lease released, not renewed"
+)
+
 # Upper bound on how many orphans a single startup sweep will reclaim, so a database
 # that has been unreachable for a while cannot turn cold start into a long write
 # burst on the first warm invocation.
@@ -161,6 +179,14 @@ async def renew_run_lease(
 ) -> bool:
     """Extend a lease the caller already owns. Owner-scoped.
 
+    Matches every status from which execution can still continue
+    (``ACTIVE_RUN_STATUSES``), not just ``running``: a run that is parked in
+    ``paused`` or ``awaiting_approval`` is still the owner's, and letting its lease
+    lapse there would hand the run to a duplicate execution the moment it resumed.
+
+    Terminal statuses are deliberately excluded, so a finished run never holds a live
+    lease and stays claimable by the resume/recovery path.
+
     Returns ``False`` when the caller no longer owns the run (it was reclaimed, or the
     run finished), so the heartbeat can stop instead of resurrecting a lease it lost.
     """
@@ -176,15 +202,16 @@ async def renew_run_lease(
             SET lease_expires_at = now() + {_lease_interval_expr()}
             WHERE run_id = $1
               AND owner_id = $2
-              AND status = 'running'
+              AND status = ANY($4::text[])
             """,
             run_uuid,
             owner_id,
             float(lease_seconds),
+            sorted(ACTIVE_RUN_STATUSES),
         )
 
     # asyncpg returns the affected row count as a command tag string.
-    return _affected_rows(result) > 0
+    return affected_rows(result) > 0
 
 
 async def release_run_lease(
@@ -216,8 +243,13 @@ async def release_run_lease(
         )
 
 
-def _affected_rows(command_tag: Any) -> int:
-    """Extract the affected row count from an asyncpg command tag."""
+def affected_rows(command_tag: Any) -> int:
+    """Extract the affected row count from an asyncpg command tag.
+
+    ``execute`` reports "UPDATE 3"; anything unparseable counts as zero, which is the
+    fail-safe direction for every caller: a lease we cannot prove we still hold is
+    treated as lost.
+    """
     try:
         return int(str(command_tag).rsplit(" ", 1)[-1])
     except (ValueError, IndexError):
@@ -349,7 +381,7 @@ async def reconcile_orphaned_agent_runs(
                     run_uuid,
                     ORPHANED_RUN_STATUS,
                 )
-            reclaimed_here = _affected_rows(claimed) > 0
+            reclaimed_here = affected_rows(claimed) > 0
         except Exception as e:
             logger.error(f"Failed to mark orphaned agent run {candidate_id} as failed: {e}")
             continue
