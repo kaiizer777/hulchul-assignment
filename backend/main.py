@@ -136,6 +136,15 @@ async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
         logger.warning(f"Could not publish terminal status for run {run_id_str}: {hub_err}")
 
 
+async def _log_terminal_write_outcome(terminal_write: "asyncio.Task[None]") -> None:
+    """Surface failures from a terminal-status write that outlived its handler."""
+    if terminal_write.cancelled():
+        return
+    write_err = terminal_write.exception()
+    if write_err is not None:
+        logger.warning(f"Terminal status write did not complete cleanly: {write_err}")
+
+
 async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     """Run the full ReAct loop off-request; publish live events via run_event_hub."""
     from backend.browser import get_browser_session
@@ -156,7 +165,19 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         # unwinds without recording a terminal status and the run stays
         # 'running' in the database and Redis forever.
         logger.warning(f"Background agent run {run_id_str} was cancelled")
-        await _mark_agent_run_terminal(run_id_str, "failed")
+        # Awaiting the terminal writes directly leaves them interruptible: a
+        # second cancellation (a repeated cancel, or an enclosing wait_for
+        # timeout) would abort them mid-flight and strand the run as 'running'.
+        # shield() lets the writes run to completion across further
+        # cancellations of this handler. Deliberately no timeout -- bounding it
+        # would leave the write orphaned and could drop the terminal status,
+        # and lifespan never awaits these tasks, so there is no drain to stall.
+        terminal_write = asyncio.ensure_future(_mark_agent_run_terminal(run_id_str, "failed"))
+        try:
+            await asyncio.shield(terminal_write)
+        except asyncio.CancelledError:
+            terminal_write.add_done_callback(_log_terminal_write_outcome)
+            raise
         raise
     except Exception as e:
         logger.exception(f"Background agent run {run_id_str} failed: {e}")

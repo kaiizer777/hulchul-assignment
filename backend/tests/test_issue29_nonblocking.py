@@ -603,3 +603,72 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
             run_event_hub._subscribers,
             "subscription must be released exactly once on exit",
         )
+
+    async def test_cancelled_run_terminal_write_survives_second_cancel(self) -> None:
+        """A second cancellation must not abort the in-flight terminal writes."""
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = "66666666-6666-4666-8666-666666666666"
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = None
+
+        db_write_started = asyncio.Event()
+        release_db_write = asyncio.Event()
+
+        async def slow_execute(*args: Any, **kwargs: Any) -> Any:
+            db_write_started.set()
+            await release_db_write.wait()
+            return "UPDATE 1"
+
+        mock_pool._mock_conn.execute.side_effect = slow_execute
+
+        started = asyncio.Event()
+
+        async def blocking_run(self_agent, goal: str) -> Dict[str, Any]:
+            started.set()
+            await asyncio.sleep(30.0)
+            raise AssertionError("run should have been cancelled")
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=_fake_browser_session),
+            patch("backend.agent.ReActAgent.run", new=blocking_run),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            task = asyncio.create_task(_execute_agent_run_background(run_id, "Process invoices"))
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+
+            # First cancellation lands while the run is in flight.
+            task.cancel()
+            # The terminal DB write is now blocked mid-flight.
+            await asyncio.wait_for(db_write_started.wait(), timeout=5.0)
+            # Second cancellation arrives while the terminal write is suspended.
+            task.cancel()
+
+            # Release the blocked DB write; the shielded task must still finish it.
+            release_db_write.set()
+            for _ in range(50):
+                if task.done():
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.2)
+
+        self.assertTrue(task.cancelled(), "cancellation must still propagate")
+
+        db_statuses = [
+            c.args[1]
+            for c in mock_pool._mock_conn.execute.call_args_list
+            if c.args and c.args[0].startswith("UPDATE agent_runs")
+        ]
+        self.assertEqual(
+            db_statuses[-1:],
+            ["failed"],
+            "terminal DB write must complete despite the second cancellation",
+        )
+        statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
+        self.assertIn("failed", statuses)
