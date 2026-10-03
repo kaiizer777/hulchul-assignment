@@ -434,6 +434,12 @@ async def run_agent_endpoint(
         tools = PlaywrightTools(page=session.page, run_id=run_id_str)
 
         async def _reattach_page():
+            if session_stack:
+                old_cm = session_stack.pop()
+                try:
+                    await old_cm.__aexit__(None, None, None)
+                except Exception as release_err:
+                    logger.warning(f"Failed to release previous browser session during reattach: {release_err}")
             new_session = await _enter_cdp_session()
             return new_session.page
 
@@ -759,9 +765,10 @@ async def stream_agent_run_endpoint(
                 for idx, r in enumerate(step_rows, start=1):
                     res_str = r["result"] or ""
                     lowered = res_str.lower()
-                    is_session_lost = "session_lost" in lowered
+                    persisted_action = r["action"] or ""
+                    is_terminal_session_lost = persisted_action == "session_lost"
                     is_fail = "failed" in lowered or "aborted" in lowered
-                    if is_session_lost:
+                    if is_terminal_session_lost:
                         event_type = "session_lost"
                     else:
                         event_type = "step_failed" if is_fail else "step_complete"
@@ -775,6 +782,9 @@ async def stream_agent_run_endpoint(
                         "timestamp": r["timestamp"].isoformat(),
                         "has_screenshot": bool(r["screenshot_b64"]),
                     }
+                    if is_terminal_session_lost:
+                        event_data["terminal"] = True
+                        event_data["reattached"] = False
                     if is_fail:
                         event_data["error"] = res_str
                     yield {

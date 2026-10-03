@@ -350,14 +350,18 @@ export default function AgentControlPage() {
           if (data.terminal === true || data.status === 'session_lost') {
             setStatus('session_lost');
           }
-        } catch {}
+        } catch (e) {
+          console.warn('Failed to parse session_lost SSE frame, ignoring', e);
+        }
       });
 
       eventSource.addEventListener('session_reattached', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, { ...data, action: data.action || 'session_reattached' }]);
-        } catch {}
+        } catch (e) {
+          console.warn('Failed to parse session_reattached SSE frame, ignoring', e);
+        }
       });
 
       eventSource.addEventListener('done', (event: MessageEvent) => {

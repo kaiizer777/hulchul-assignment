@@ -925,7 +925,9 @@ class ReActAgent:
                 while self._reattach_attempts < self.max_reattaches:
                     ok = await self._try_reattach_session(f"read_page: {last_err}")
                     if not ok:
-                        break
+                        if self._reconnect is None or self._reattach_attempts >= self.max_reattaches:
+                            break
+                        continue
                     try:
                         snapshot_res = await self.tools.read_page()
                     except Exception as obs_err2:
@@ -1475,9 +1477,15 @@ class ReActAgent:
             if not tool_success and self._result_is_session_lost(tool_result):
                 last_err = str(tool_result.get("error", "session lost"))
                 recovered_act = False
+                is_mutating_tool = tool_name in ("click", "fill", "select")
                 while self._reattach_attempts < self.max_reattaches:
                     ok = await self._try_reattach_session(f"{tool_name}: {last_err}")
                     if not ok:
+                        if self._reconnect is None or self._reattach_attempts >= self.max_reattaches:
+                            break
+                        continue
+                    if is_mutating_tool:
+                        recovered_act = True
                         break
                     try:
                         retry_res = await self.tools.execute(tool_name, tool_args)
@@ -1501,7 +1509,7 @@ class ReActAgent:
                         break
                     tool_result = retry_res
                     last_err = str(retry_res.get("error", "session lost"))
-                if not tool_success and self._result_is_session_lost(tool_result):
+                if not tool_success and self._result_is_session_lost(tool_result) and not recovered_act:
                     return await self._abort_session_lost(
                         iteration, str(tool_result.get("error", last_err)), threshold, clean_goal
                     )

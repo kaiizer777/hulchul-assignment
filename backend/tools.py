@@ -25,15 +25,14 @@ logger = logging.getLogger(__name__)
 CLOSED_TARGET_SUBSTRINGS = (
     "target page, context or browser has been closed",
     "context or browser has been closed",
-    "has been closed",
     "target closed",
     "session closed",
     "browser has been closed",
     "browser has disconnected",
     "browser disconnected",
     "connection closed",
-    "websocket",
-    "protocol error",
+    "websocket is not open",
+    "websocket closed",
 )
 
 

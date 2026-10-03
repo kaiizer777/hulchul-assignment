@@ -31,6 +31,17 @@ class TestClosedTargetClassifier(unittest.TestCase):
         self.assertTrue(is_session_lost_error("Connection closed while reading"))
         self.assertTrue(is_session_lost_error("Protocol error: Session closed"))
 
+    def test_narrowed_excludes_broad_patterns(self):
+        self.assertFalse(is_session_lost_error("websocket connection failed"))
+        self.assertFalse(is_session_lost_error("websocket"))
+        self.assertFalse(is_session_lost_error("Protocol error: timeout exceeded"))
+        self.assertFalse(is_session_lost_error("Something has been closed"))
+        self.assertFalse(is_session_lost_error("Element not found: Submit"))
+
+    def test_exact_transport_strings(self):
+        self.assertTrue(is_session_lost_error("websocket is not open: readyState 3 (CLOSED)"))
+        self.assertTrue(is_session_lost_error("websocket closed: connection dropped"))
+
     def test_non_session_errors(self):
         self.assertFalse(is_session_lost_error("Element not found: Submit"))
         self.assertFalse(is_session_lost_error("Timeout 5000ms exceeded"))
@@ -176,7 +187,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 {"success": True, "url": "http://x/invoices"},
                 {"success": False, "error": "Target page, context or browser has been closed", "session_lost": True},
-                {"success": True, "clicked": True},
+                {"success": True, "url": "http://x/invoices/new", "status": 200},
             ]
         )
         mock_tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})
@@ -184,7 +195,7 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         new_page.is_closed = MagicMock(return_value=False)
         reconnect = AsyncMock(return_value=new_page)
         mock_groq = _groq_for_tool_calls(
-            [("c1", "navigate", {"url": "/invoices"}), ("c2", "click", {"selector": "Submit"})]
+            [("c1", "navigate", {"url": "/invoices"}), ("c2", "navigate", {"url": "/invoices/new"})]
         )
         agent = await self._make_agent(mock_tools, mock_groq, reconnect, events)
         result = await agent.run(goal="Process invoices")
@@ -194,9 +205,75 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         types = [e["type"] for e in events]
         self.assertIn("session_lost", types)
         self.assertIn("session_reattached", types)
-        # The recovered click must not surface as a generic step_failed.
-        failed_clicks = [e for e in events if e["type"] == "step_failed" and e.get("action") == "click"]
-        self.assertEqual(failed_clicks, [])
+        # The recovered safe-tool replay must not surface as a generic step_failed.
+        failed_navigates = [e for e in events if e["type"] == "step_failed" and e.get("action") == "navigate"]
+        self.assertEqual(failed_navigates, [])
+
+    async def test_transient_reattach_failure_then_success_resumes(self):
+        events = []
+        mock_tools = MagicMock(spec=PlaywrightTools)
+        mock_tools.page = MagicMock()
+        mock_tools.page.is_closed = MagicMock(return_value=False)
+        mock_tools.set_run_id = MagicMock()
+        mock_tools.set_page = MagicMock()
+        mock_tools.read_page = AsyncMock(
+            return_value={"success": True, "snapshot": "- button 'Submit'", "url": "http://x", "title": "T"}
+        )
+        mock_tools.execute = AsyncMock(
+            side_effect=[
+                {"success": False, "error": "Target page, context or browser has been closed", "session_lost": True},
+                {"success": True, "url": "http://x/invoices/new", "status": 200},
+            ]
+        )
+        mock_tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})
+        new_page = MagicMock()
+        new_page.is_closed = MagicMock(return_value=False)
+        reconnect = AsyncMock(side_effect=[Exception("transient CDP failure"), new_page])
+        mock_groq = _groq_for_tool_calls(
+            [("c1", "navigate", {"url": "/invoices/new"})]
+        )
+        agent = await self._make_agent(mock_tools, mock_groq, reconnect, events)
+        result = await agent.run(goal="Process invoices")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(reconnect.await_count, 2)
+        types = [e["type"] for e in events]
+        self.assertIn("session_reattached", types)
+        terminal = [e for e in events if e["type"] == "session_lost" and e.get("terminal") is True]
+        self.assertEqual(terminal, [])
+
+    async def test_click_session_loss_does_not_replay(self):
+        events = []
+        mock_tools = MagicMock(spec=PlaywrightTools)
+        mock_tools.page = MagicMock()
+        mock_tools.page.is_closed = MagicMock(return_value=False)
+        mock_tools.set_run_id = MagicMock()
+        mock_tools.set_page = MagicMock()
+        mock_tools.read_page = AsyncMock(
+            return_value={"success": True, "snapshot": "- button 'Submit'", "url": "http://x", "title": "T"}
+        )
+        click_args = {"selector": "Submit"}
+        mock_tools.execute = AsyncMock(
+            return_value={"success": False, "error": "Target page, context or browser has been closed", "session_lost": True}
+        )
+        mock_tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})
+        new_page = MagicMock()
+        new_page.is_closed = MagicMock(return_value=False)
+        reconnect = AsyncMock(return_value=new_page)
+        mock_groq = _groq_for_tool_calls(
+            [("c1", "click", click_args)]
+        )
+        agent = await self._make_agent(mock_tools, mock_groq, reconnect, events, max_iterations=3)
+        result = await agent.run(goal="Process invoices")
+        self.assertEqual(reconnect.await_count, 1)
+        mock_tools.set_page.assert_called_once_with(new_page)
+        # Non-idempotent click must not be redispatched after reattach.
+        self.assertEqual(mock_tools.execute.await_count, 1)
+        dispatched_args = mock_tools.execute.await_args_list[0].args[1]
+        self.assertEqual(dispatched_args, click_args)
+        # Original session-loss result preserved; terminal abort bypassed after reattach.
+        terminal = [e for e in events if e["type"] == "session_lost" and e.get("terminal") is True]
+        self.assertEqual(terminal, [])
+        self.assertNotEqual(result["status"], "session_lost")
 
     async def test_observe_session_loss_reattaches_and_resumes(self):
         events = []
