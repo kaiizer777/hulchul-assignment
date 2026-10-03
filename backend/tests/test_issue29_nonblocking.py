@@ -281,3 +281,53 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(run_count, 1)
                 self.assertEqual(mock_pool._mock_conn.execute.await_count, 1)
                 self.assertNotIn(run_id, _reserved_agent_runs)
+
+    async def test_background_failure_marks_redis_state_failed(self) -> None:
+        from backend.main import _execute_agent_run_background
+
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = "22222222-2222-4222-8222-222222222222"
+        stored = {
+            "run_id": run_id,
+            "goal": "Process invoices",
+            "current_step": 2,
+            "last_action": "navigate",
+            "status": "running",
+        }
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = dict(stored)
+        mock_redis.set_session_state.return_value = True
+
+        @asynccontextmanager
+        async def failing_browser(*args: Any, **kwargs: Any):
+            raise RuntimeError("CDP endpoint gone")
+            yield
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=failing_browser),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            await _execute_agent_run_background(run_id, "Process invoices")
+
+        # Redis snapshot preserved with status flipped to failed.
+        mock_redis.get_session_state.assert_awaited_once_with(run_id)
+        failed_writes = [
+            c.args[1]
+            for c in mock_redis.set_session_state.call_args_list
+            if c.args[1].get("status") == "failed"
+        ]
+        self.assertTrue(failed_writes)
+        self.assertEqual(failed_writes[-1]["goal"], "Process invoices")
+        self.assertEqual(failed_writes[-1]["current_step"], 2)
+        self.assertEqual(failed_writes[-1]["last_action"], "navigate")
+        # DB marked failed + SSE status_change failed still published.
+        self.assertTrue(mock_pool._mock_conn.execute.await_count >= 1)
+        statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
+        self.assertIn("failed", statuses)

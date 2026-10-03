@@ -115,6 +115,15 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         except Exception as db_err:
             logger.warning(f"Could not mark run {run_id_str} as failed: {db_err}")
         try:
+            from backend.redis_client import get_redis_client
+            redis = get_redis_client()
+            state = await redis.get_session_state(run_id_str)
+            if state is not None:
+                state["status"] = "failed"
+                await redis.set_session_state(run_id_str, state)
+        except Exception as redis_err:
+            logger.warning(f"Could not mark run {run_id_str} as failed in Redis: {redis_err}")
+        try:
             await run_event_hub.publish(
                 run_id_str,
                 {
