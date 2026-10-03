@@ -96,12 +96,10 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     try:
         async with get_browser_session() as session:
             tools = PlaywrightTools(page=session.page, run_id=run_id_str)
-
-            async def handle_agent_event(event: Dict[str, Any]) -> None:
-                """Forward agent events to the global run event hub for SSE broadcasting."""
-                await run_event_hub.publish(run_id_str, event)
-
-            agent = ReActAgent(run_id=run_id_str, tools=tools, on_event=handle_agent_event)
+            # No on_event forwarding here: ReActAgent.emit_event already publishes
+            # every event to run_event_hub itself, so a hub-publishing callback
+            # delivered each event to SSE subscribers twice.
+            agent = ReActAgent(run_id=run_id_str, tools=tools)
             await agent.run(goal=goal)
     except Exception as e:
         logger.exception(f"Background agent run {run_id_str} failed: {e}")

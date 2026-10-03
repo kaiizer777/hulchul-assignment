@@ -4,14 +4,20 @@ import unittest
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from httpx import AsyncClient, ASGITransport
 
 from backend.auth import Session
 from backend.auth import require_session as require_session_dep
-from backend.main import app, run_event_hub, _active_agent_tasks, _reserved_agent_runs
+from backend.main import (
+    app,
+    run_event_hub,
+    _active_agent_tasks,
+    _reserved_agent_runs,
+    _execute_agent_run_background,
+)
 
 
 def _make_mock_pool() -> MagicMock:
@@ -331,3 +337,58 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(mock_pool._mock_conn.execute.await_count >= 1)
         statuses = [c.args[1].get("status") for c in mock_publish.call_args_list]
         self.assertIn("failed", statuses)
+
+    async def test_agent_event_published_to_hub_exactly_once(self) -> None:
+        """ReActAgent.emit_event owns hub delivery; main must not forward a second time."""
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        mock_redis = AsyncMock()
+        mock_redis.set_session_state.return_value = True
+
+        run_id = "33333333-3333-4333-8333-333333333333"
+        observed_on_event: List[Any] = []
+
+        async def emitting_run(self_agent, goal: str) -> Dict[str, Any]:
+            observed_on_event.append(self_agent.on_event)
+            for idx in (1, 2, 3):
+                await self_agent.emit_event(
+                    "step_complete",
+                    {
+                        "step_id": str(uuid.uuid4()),
+                        "step_index": idx,
+                        "action": "navigate",
+                        "result": "ok",
+                    },
+                )
+            return {
+                "run_id": self_agent.run_id,
+                "status": "completed",
+                "iterations": 1,
+                "goal": goal,
+                "threshold": 50000.0,
+                "summary": "done",
+            }
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=_fake_browser_session),
+            patch("backend.agent.ReActAgent.run", new=emitting_run),
+            patch.object(run_event_hub, "publish", new=AsyncMock()) as mock_publish,
+        ):
+            await _execute_agent_run_background(run_id, "Process invoices")
+
+        # A hub-publishing on_event callback would double every delivery.
+        self.assertEqual(
+            observed_on_event,
+            [None],
+            "run setup must not install a hub-forwarding on_event callback",
+        )
+        # Three emitted events => exactly three hub publishes.
+        self.assertEqual(mock_publish.await_count, 3)
+        published_run_ids = [c.args[0] for c in mock_publish.call_args_list]
+        self.assertEqual(published_run_ids, [run_id, run_id, run_id])
