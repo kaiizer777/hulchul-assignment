@@ -229,8 +229,10 @@ async def login(payload: LoginRequest, request: Request, response: Response) -> 
 
 @app.post("/auth/logout", status_code=204)
 async def logout(request: Request, response: Response) -> None:
-    """Revoke the current session and clear the cookie. Idempotent by design."""
-    await destroy_session(read_session_token(request))
+    """Revoke the current session and clear the cookie. 204 is idempotent; 503 (cookie kept) when revocation cannot be confirmed."""
+    revoked = await destroy_session(read_session_token(request))
+    if not revoked:
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE_DETAIL)
     clear_session_cookie(response, is_https_request(request))
 
 
