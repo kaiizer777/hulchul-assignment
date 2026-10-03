@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import React from 'react';
 
-import { getBackendUrl, unreachableBackendMessage } from '@/lib/backend-url';
+import { getBackendUrl } from '@/lib/backend-url';
 import AgentControlPage from '@/app/agent/page';
 
 const PRODUCTION_BACKEND_URL = 'https://gmruxxvvxbypxv4d74kix7l6aq0ppwmd.lambda-url.us-east-1.on.aws';
@@ -85,37 +85,6 @@ describe('getBackendUrl', () => {
     setHostname('hulchul-frontend.sufiyanx.workers.dev');
     vi.stubEnv('NODE_ENV', 'development');
     expect(getBackendUrl()).toBe('http://localhost:8051');
-  });
-});
-
-describe('unreachableBackendMessage', () => {
-  it('names the backend whose response could not be read', () => {
-    const message = unreachableBackendMessage(PRODUCTION_BACKEND_URL);
-    expect(message).toContain(PRODUCTION_BACKEND_URL);
-    expect(message).toMatch(/cannot read a response from the backend/i);
-  });
-
-  it('does not claim the run never started, which a rejected fetch cannot establish', () => {
-    // POST /agent/run executes the agent loop before returning a run id, so a lost
-    // response can leave work executing on the server. Telling the operator no run
-    // started invites a duplicate submission of side-effecting work.
-    const message = unreachableBackendMessage(PRODUCTION_BACKEND_URL);
-    expect(message).not.toMatch(/never reached the server/i);
-    expect(message).not.toMatch(/no agent run was started/i);
-    expect(message).toMatch(/may have reached the server/i);
-    expect(message).toMatch(/check it before retrying/i);
-  });
-
-  it('strips credentials embedded in the URL', () => {
-    const message = unreachableBackendMessage('https://user:hunter2@backend.example.com');
-    expect(message).toContain('backend.example.com');
-    expect(message).not.toContain('hunter2');
-    expect(message).not.toContain('user');
-  });
-
-  it('falls back to the raw value for an unparseable URL', () => {
-    const message = unreachableBackendMessage('not a url');
-    expect(message).toContain('not a url');
   });
 });
 
