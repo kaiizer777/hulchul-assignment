@@ -43,7 +43,9 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
     duration of each test so the FastAPI endpoints under test read the same
     rows. Only transient Neon connection failures retry-then-skip legibly
     instead of erroring; authentication, catalog and syntax errors propagate
-    and fail the test.
+    and fail the test. A pool that was already created is closed on every
+    failed validation path, transient or fatal, because a fatal error exits
+    asyncSetUp and never reaches asyncTearDown.
     """
 
     async def _init_isolated_pool(self):
@@ -52,21 +54,22 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
             raise unittest.SkipTest("DATABASE_URL is not set; skipping live-Neon phase26 tests")
         last_exc = None
         for attempt in (1, 2):
-            pool = None
             try:
                 pool = await asyncpg.create_pool(
                     dsn=settings.DATABASE_URL,
                     min_size=1,
                     max_size=2,
                 )
-                async with pool.acquire() as conn:
-                    await conn.fetchval("SELECT 1")
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.fetchval("SELECT 1")
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await pool.close()
+                    raise
                 return pool
             except _TRANSIENT_DB_ERRORS as exc:
                 last_exc = exc
-                if pool is not None:
-                    with contextlib.suppress(*_TRANSIENT_DB_ERRORS):
-                        await pool.close()
                 if attempt == 2:
                     raise unittest.SkipTest(
                         f"Neon unavailable for phase26 (attempt {attempt}): "
@@ -582,6 +585,31 @@ class TestPhase26PoolInitErrorClassification(unittest.IsolatedAsyncioTestCase):
                 self.assertRaises(unittest.SkipTest):
             await self._case()._init_isolated_pool()
 
+    async def test_fatal_validation_error_propagates_after_closing_created_pool(self):
+        """A fatal error once the pool exists propagates unchanged, and the pool is closed."""
+        for stage in ("acquire", "fetchval"):
+            with self.subTest(stage=stage):
+                cause = ValueError("root cause")
+                fatal = asyncpg.UndefinedTableError("relation missing")
+                fatal.__cause__ = cause
+                pool, conn = _mock_pool()
+                if stage == "fetchval":
+                    conn.fetchval = AsyncMock(side_effect=fatal)
+                else:
+                    pool.acquire.side_effect = fatal
+                create_pool = AsyncMock(return_value=pool)
+
+                with self._settings_patch(), \
+                        patch("asyncpg.create_pool", new=create_pool), \
+                        self.assertRaises(asyncpg.UndefinedTableError) as raised:
+                    await self._case()._init_isolated_pool()
+
+                self.assertIs(raised.exception, fatal)
+                self.assertIs(raised.exception.__cause__, cause)
+                self.assertNotIsInstance(raised.exception, unittest.SkipTest)
+                self.assertEqual(create_pool.await_count, 1)
+                pool.close.assert_awaited_once()
+
     async def test_auth_and_catalog_errors_propagate_without_retry_or_skip(self):
         """Bad credentials or a bad database name fail the test on the first attempt."""
         for exc_cls in (asyncpg.InvalidPasswordError, asyncpg.InvalidCatalogNameError):
@@ -620,21 +648,21 @@ class TestPhase26PoolInitErrorClassification(unittest.IsolatedAsyncioTestCase):
         """asyncSetUp/asyncTearDown never read, replace or close backend.db._db_pool."""
         import backend.db
 
+        initial_pool = backend.db._db_pool
         pool, conn = _mock_pool()
         redis = MagicMock()
         redis.close = AsyncMock()
         case = self._case()
 
-        self.assertIsNone(backend.db._db_pool)
         with self._settings_patch(), \
                 patch("asyncpg.create_pool", new=AsyncMock(return_value=pool)), \
                 patch.object(sys.modules[__name__], "get_redis_client", return_value=redis):
             await case.asyncSetUp()
             self.assertEqual(len(case._db_patchers), 3)
-            self.assertIsNone(backend.db._db_pool)
+            self.assertIs(backend.db._db_pool, initial_pool)
             case.test_run_ids.append(str(uuid.uuid4()))
             await case.asyncTearDown()
-            self.assertIsNone(backend.db._db_pool)
+            self.assertIs(backend.db._db_pool, initial_pool)
 
         self.assertEqual(conn.execute.await_count, 2)
         pool.close.assert_awaited_once()
