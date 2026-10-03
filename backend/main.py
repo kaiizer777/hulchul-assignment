@@ -1130,22 +1130,37 @@ async def stream_agent_run_endpoint(
                 frames: List[Dict[str, Any]] = []
                 pool = await get_db_pool()
                 async with pool.acquire() as conn:
-                    status = await conn.fetchval(
-                        "SELECT status FROM agent_runs WHERE run_id = $1;",
-                        run_id,
-                    )
-                    status_changed = status is not None and status != last_status
-                    if step_cursor is None:
-                        # Nothing has been replayed (no steps yet, or the replay
-                        # above failed), so the whole list is still unread.
-                        rows = await conn.fetch(_SSE_STEPS_ALL_SQL, run_id)
-                    else:
-                        rows = await conn.fetch(
-                            _SSE_STEPS_AFTER_CURSOR_SQL,
+                    try:
+                        status = await conn.fetchval(
+                            "SELECT status FROM agent_runs WHERE run_id = $1;",
                             run_id,
-                            step_cursor[0],
-                            step_cursor[1],
                         )
+                        status_changed = status is not None and status != last_status
+                        if step_cursor is None:
+                            # Nothing has been replayed (no steps yet, or the replay
+                            # above failed), so the whole list is still unread.
+                            rows = await conn.fetch(_SSE_STEPS_ALL_SQL, run_id)
+                        else:
+                            rows = await conn.fetch(
+                                _SSE_STEPS_AFTER_CURSOR_SQL,
+                                run_id,
+                                step_cursor[0],
+                                step_cursor[1],
+                            )
+                    except asyncio.CancelledError:
+                        # Terminate rather than return a connection that was
+                        # cancelled mid-query. Pool release shields itself from
+                        # cancellation and then blocks on asyncpg's
+                        # cancellation wait and connection reset, which have no
+                        # bound here because the pool sets no command_timeout --
+                        # so asyncio.wait_for would wait on that cleanup instead
+                        # of returning, and the bound above would not bound
+                        # anything. A terminated connection is released
+                        # immediately and the pool opens a replacement. Nothing is
+                        # lost: these are autocommit SELECTs with no open
+                        # transaction.
+                        conn.terminate()
+                        raise
                 # Every await this reconcile depends on has returned. Only now
                 # advance the status and the cursor: doing either inside the
                 # block above would consume state whose frame is thrown away

@@ -614,6 +614,47 @@ class TestSseReconcileBound(unittest.IsolatedAsyncioTestCase):
             "transition on the floor with the discarded frames",
         )
 
+    async def test_cancelled_reconcile_terminates_the_pooled_connection(self) -> None:
+        """A read cancelled mid-query must terminate, not hand back, its connection.
+
+        Returning a connection that was cancelled mid-query makes pool release
+        block on asyncpg's cancellation wait and reset, which is unbounded here
+        because the pool sets no command_timeout -- so wait_for would wait on that
+        cleanup instead of returning.
+        """
+        run_id = uuid.uuid4()
+        created_at = datetime.now(timezone.utc)
+        rows: List[Dict[str, Any]] = [
+            _fake_step_row(uuid.uuid4(), "navigate", "loaded", created_at)
+        ]
+        mock_pool = self._hanging_pool(run_id, rows, hangs=1)
+        conn = mock_pool._mock_conn
+        # asyncpg's Connection.terminate is synchronous, but an AsyncMock would
+        # auto-create it as a coroutine function and never run the call.
+        conn.terminate = MagicMock()
+
+        frames = await _open_stream(self, mock_pool, run_id)
+        try:
+            for _ in range(2):
+                await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            # Let the bound cancel the hanging read.
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while not conn.terminate.call_count:
+                self.assertLess(
+                    asyncio.get_running_loop().time(),
+                    deadline,
+                    "the cancelled reconcile never terminated its connection",
+                )
+                await asyncio.wait_for(frames.__anext__(), timeout=1.0)
+        finally:
+            await frames.aclose()
+
+        self.assertGreaterEqual(
+            conn.terminate.call_count,
+            1,
+            "a connection cancelled mid-query must not be returned to the pool",
+        )
+
     async def test_reconcile_timeout_is_logged_apart_from_a_read_failure(self) -> None:
         """A timeout must be distinguishable in logs from a query that errored."""
         run_id = uuid.uuid4()
