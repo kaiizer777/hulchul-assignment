@@ -33,6 +33,48 @@ class BrowserSession:
     session_id: Optional[str] = None
 
 
+MAX_CDP_REATTACH_ATTEMPTS: int = 2
+
+
+def is_browser_session_alive(session: Optional[BrowserSession]) -> bool:
+    """Synchronous liveness probe for a CDP session (no I/O)."""
+    if session is None:
+        return False
+    try:
+        page = getattr(session, "page", None)
+        if page is not None and callable(getattr(page, "is_closed", None)):
+            try:
+                if page.is_closed():
+                    return False
+            except Exception:
+                return False
+        browser = getattr(session, "browser", None)
+        if browser is not None and callable(getattr(browser, "is_connected", None)):
+            try:
+                if not browser.is_connected():
+                    return False
+            except Exception:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+async def check_browser_session_health(session: Optional[BrowserSession], timeout_s: float = 5.0) -> bool:
+    """Mid-run health check used by the ReAct loop; True means reusable."""
+    if not is_browser_session_alive(session):
+        return False
+    try:
+        await asyncio.wait_for(session.page.evaluate("() => document.readyState"), timeout=timeout_s)
+        return True
+    except Exception as e:
+        from backend.tools import is_session_lost_error
+
+        if is_session_lost_error(e):
+            return False
+        return True
+
+
 async def _release_steel_session(api_key: str, session_id: str) -> None:
     """Explicitly release a Steel.dev session via REST API."""
     try:

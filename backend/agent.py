@@ -20,9 +20,12 @@ from backend.tools import (
     TOOL_DEFINITIONS,
     take_screenshot,
     check_exists,
+    is_session_lost_error,
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_SESSION_REATTACHES: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +243,8 @@ class ReActAgent:
         model: str = settings.GROQ_MODEL,
         max_iterations: int = settings.MAX_AGENT_ITERATIONS,
         on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        reconnect: Optional[Callable[[], Awaitable[Any]]] = None,
+        max_reattaches: int = MAX_SESSION_REATTACHES,
     ):
         """Initialize ReAct loop agent with tools, database pool, Groq LLM, and Redis clients."""
         self.run_id = str(run_id or uuid.uuid4())
@@ -250,6 +255,9 @@ class ReActAgent:
         self.model = model
         self.max_iterations = max_iterations
         self.on_event = on_event
+        self._reconnect = reconnect
+        self.max_reattaches = max_reattaches
+        self._reattach_attempts = 0
 
         # Ensure tools has this run_id
         self.tools.set_run_id(self.run_id)
@@ -721,6 +729,87 @@ class ReActAgent:
                 logger.warning(f"Could not mark invoice as skipped in Neon: {dbe}")
             return "rejected"
 
+    def _result_is_session_lost(self, result: Optional[Dict[str, Any]]) -> bool:
+        """Classify a tool result dict as a closed-target CDP eviction."""
+        if not isinstance(result, dict):
+            return False
+        if result.get("session_lost") is True:
+            return True
+        return is_session_lost_error(result.get("error"))
+
+    def _tool_page_is_closed(self) -> bool:
+        """Synchronous is_closed probe on the bound Playwright page."""
+        page = getattr(self.tools, "page", None)
+        if page is None:
+            return False
+        try:
+            is_closed = getattr(page, "is_closed", None)
+            if callable(is_closed):
+                return bool(is_closed())
+        except Exception:
+            return True
+        return False
+
+    async def _try_reattach_session(self, reason: str) -> bool:
+        """Bounded reattach: invoke reconnect hook and swap tools page."""
+        if self._reattach_attempts >= self.max_reattaches:
+            return False
+        if self._reconnect is None:
+            return False
+        attempt = self._reattach_attempts + 1
+        await self.emit_event(
+            "session_lost",
+            {"reason": reason, "attempt": attempt, "max_attempts": self.max_reattaches, "reattaching": True},
+        )
+        try:
+            new_page = await self._reconnect()
+        except Exception as e:
+            self._reattach_attempts += 1
+            logger.error(f"Agent {self.run_id}: CDP reattach attempt {attempt} failed: {e}")
+            return False
+        try:
+            self.tools.set_page(new_page)
+        except Exception:
+            try:
+                self.tools.page = new_page  # type: ignore[attr-defined]
+            except Exception:
+                self._reattach_attempts += 1
+                return False
+        self._reattach_attempts += 1
+        logger.info(f"Agent {self.run_id}: CDP reattach attempt {attempt} succeeded, resuming.")
+        await self.emit_event(
+            "session_reattached",
+            {"attempt": attempt, "max_attempts": self.max_reattaches},
+        )
+        return True
+
+    async def _abort_session_lost(self, iteration: int, error: str, threshold: float, clean_goal: str) -> Dict[str, Any]:
+        """Persist and broadcast terminal session_lost distinct from step_failed."""
+        await self.persist_step(
+            action="session_lost",
+            result=f"session_lost: {error} after {self._reattach_attempts} reattach attempt(s)",
+        )
+        await self.update_run_status("session_lost")
+        await self.emit_event(
+            "session_lost",
+            {
+                "step": iteration,
+                "error": error,
+                "terminal": True,
+                "reattached": False,
+                "attempts": self._reattach_attempts,
+                "max_attempts": self.max_reattaches,
+            },
+        )
+        return {
+            "run_id": self.run_id,
+            "status": "session_lost",
+            "iterations": iteration,
+            "goal": clean_goal,
+            "threshold": threshold,
+            "summary": f"Browser session lost and reattach exhausted: {error}",
+        }
+
     async def run(
         self,
         goal: str,
@@ -732,6 +821,7 @@ class ReActAgent:
         """
         clean_goal = goal.strip()
         logger.info(f"Starting ReAct agent run {self.run_id} with goal: '{clean_goal}'")
+        self._reattach_attempts = 0
 
         # 1. Ensure run record in database
         await self.ensure_run_record(clean_goal)
@@ -815,8 +905,47 @@ class ReActAgent:
                     await self.update_run_status("running")
                     await self.emit_event("resumed", {"step": iteration})
 
-            # Step 1: OBSERVE - call read_page() to capture accessibility tree snapshot
-            snapshot_res = await self.tools.read_page()
+            # Step 1: OBSERVE - call read_page() with bounded CDP reattach (Issue #31)
+            if self._tool_page_is_closed():
+                snapshot_res: Dict[str, Any] = {
+                    "success": False,
+                    "error": "Target page, context or browser has been closed",
+                    "session_lost": True,
+                }
+            else:
+                try:
+                    snapshot_res = await self.tools.read_page()
+                except Exception as obs_err:
+                    snapshot_res = {"success": False, "error": str(obs_err)}
+                    if is_session_lost_error(obs_err):
+                        snapshot_res["session_lost"] = True
+            if not snapshot_res.get("success") and self._result_is_session_lost(snapshot_res):
+                recovered = False
+                last_err = str(snapshot_res.get("error", "session lost"))
+                while self._reattach_attempts < self.max_reattaches:
+                    ok = await self._try_reattach_session(f"read_page: {last_err}")
+                    if not ok:
+                        if self._reconnect is None or self._reattach_attempts >= self.max_reattaches:
+                            break
+                        continue
+                    try:
+                        snapshot_res = await self.tools.read_page()
+                    except Exception as obs_err2:
+                        snapshot_res = {"success": False, "error": str(obs_err2)}
+                        if is_session_lost_error(obs_err2):
+                            snapshot_res["session_lost"] = True
+                    if snapshot_res.get("success"):
+                        recovered = True
+                        break
+                    if not self._result_is_session_lost(snapshot_res):
+                        break
+                    last_err = str(snapshot_res.get("error", "session lost"))
+                if not snapshot_res.get("success") and self._result_is_session_lost(snapshot_res):
+                    return await self._abort_session_lost(
+                        iteration, str(snapshot_res.get("error", last_err)), threshold, clean_goal
+                    )
+                if recovered:
+                    logger.info(f"Agent {self.run_id}: resumed after CDP reattach on observe.")
             snapshot_text = snapshot_res.get("snapshot", "") if snapshot_res.get("success") else ""
             current_url = snapshot_res.get("url", "")
             current_title = snapshot_res.get("title", "")
@@ -1341,7 +1470,56 @@ class ReActAgent:
             except Exception as exec_err:
                 logger.error(f"Error executing tool '{tool_name}': {exec_err}")
                 tool_result = {"success": False, "error": str(exec_err)}
+                if is_session_lost_error(exec_err):
+                    tool_result["session_lost"] = True
                 tool_success = False
+
+            outcome_unknown = False
+            if not tool_success and self._result_is_session_lost(tool_result):
+                last_err = str(tool_result.get("error", "session lost"))
+                recovered_act = False
+                is_mutating_tool = tool_name in ("click", "fill", "select")
+                while self._reattach_attempts < self.max_reattaches:
+                    ok = await self._try_reattach_session(f"{tool_name}: {last_err}")
+                    if not ok:
+                        if self._reconnect is None or self._reattach_attempts >= self.max_reattaches:
+                            break
+                        continue
+                    if is_mutating_tool:
+                        # Non-idempotent: do not replay on the fresh page; the
+                        # first attempt may already have taken effect. Record
+                        # outcome-unknown instead of success/failure.
+                        recovered_act = True
+                        outcome_unknown = True
+                        break
+                    try:
+                        retry_res = await self.tools.execute(tool_name, tool_args)
+                        retry_ok = retry_res.get("success", False)
+                        if "exists" in retry_res and not retry_res.get("error"):
+                            retry_ok = True
+                    except Exception as exec_err2:
+                        retry_res = {"success": False, "error": str(exec_err2)}
+                        if is_session_lost_error(exec_err2):
+                            retry_res["session_lost"] = True
+                        retry_ok = False
+                    if retry_ok:
+                        tool_result = retry_res
+                        tool_success = True
+                        recovered_act = True
+                        break
+                    if not self._result_is_session_lost(retry_res):
+                        tool_result = retry_res
+                        tool_success = False
+                        recovered_act = True
+                        break
+                    tool_result = retry_res
+                    last_err = str(retry_res.get("error", "session lost"))
+                if not tool_success and self._result_is_session_lost(tool_result) and not recovered_act:
+                    return await self._abort_session_lost(
+                        iteration, str(tool_result.get("error", last_err)), threshold, clean_goal
+                    )
+                if recovered_act:
+                    logger.info(f"Agent {self.run_id}: resumed after CDP reattach on act '{tool_name}'.")
 
             # Phase 2.5: Cache explicit check_exists results (positive matches only)
             if tool_name == "check_exists" and tool_success and isinstance(tool_result, dict):
@@ -1350,7 +1528,27 @@ class ReActAgent:
                 if e_ident and tool_result.get("exists") and not tool_result.get("error"):
                     self._checked_entities[f"{e_type}:{e_ident.lower()}"] = tool_result
 
-            if not tool_success:
+            if not tool_success and outcome_unknown:
+                # Mutating action reattached without replay: outcome is unknown,
+                # not failed. Persist distinctly; skip the failure screenshot
+                # (the fresh page would mislead) and step_failed emission.
+                unknown_step_id = await self.persist_step(
+                    action=tool_name,
+                    result=f"outcome unknown after CDP reattach (not replayed): {tool_result.get('error')}",
+                    step_id=step_id,
+                )
+                await self.emit_event(
+                    "step_unknown",
+                    {
+                        "step_id": unknown_step_id,
+                        "step_index": iteration,
+                        "action": tool_name,
+                        "arguments": tool_args,
+                        "error": tool_result.get("error"),
+                        "outcome_unknown": True,
+                    },
+                )
+            elif not tool_success:
                 # Capture diagnostic screenshot on failure without creating duplicate rows (Phase 2.8)
                 failed_step_id = await self.persist_step(
                     action=tool_name,

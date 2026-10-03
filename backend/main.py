@@ -418,16 +418,51 @@ async def run_agent_endpoint(
     from backend.tools import PlaywrightTools
     from backend.agent import ReActAgent
 
+    from backend.browser import MAX_CDP_REATTACH_ATTEMPTS
+
     run_id_str = str(payload.run_id) if payload.run_id else None
-    async with get_browser_session() as session:
+    session_stack: list = []
+
+    async def _enter_cdp_session():
+        """Enter a browser session context manager and track it for later release."""
+        cm = get_browser_session()
+        sess = await cm.__aenter__()
+        session_stack.append(cm)
+        return sess
+
+    session = await _enter_cdp_session()
+    try:
         tools = PlaywrightTools(page=session.page, run_id=run_id_str)
+
+        async def _reattach_page():
+            """Release the current browser session and return a freshly acquired page."""
+            if session_stack:
+                old_cm = session_stack.pop()
+                try:
+                    await old_cm.__aexit__(None, None, None)
+                except Exception as release_err:
+                    logger.warning(f"Failed to release previous browser session during reattach: {release_err}")
+            new_session = await _enter_cdp_session()
+            return new_session.page
 
         async def handle_agent_event(event: Dict[str, Any]) -> None:
             """Forward agent events to the global run event hub for SSE broadcasting."""
             await run_event_hub.publish(agent.run_id, event)
 
-        agent = ReActAgent(run_id=run_id_str, tools=tools, on_event=handle_agent_event)
+        agent = ReActAgent(
+            run_id=run_id_str,
+            tools=tools,
+            on_event=handle_agent_event,
+            reconnect=_reattach_page,
+            max_reattaches=MAX_CDP_REATTACH_ATTEMPTS,
+        )
         result = await agent.run(goal=payload.goal)
+    finally:
+        for cm in reversed(session_stack):
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
     return AgentRunResponse(
         run_id=result["run_id"],
@@ -731,8 +766,17 @@ async def stream_agent_run_endpoint(
                 )
                 for idx, r in enumerate(step_rows, start=1):
                     res_str = r["result"] or ""
-                    is_fail = "failed" in res_str.lower() or "aborted" in res_str.lower()
-                    event_type = "step_failed" if is_fail else "step_complete"
+                    lowered = res_str.lower()
+                    persisted_action = r["action"] or ""
+                    is_terminal_session_lost = persisted_action == "session_lost"
+                    is_unknown = lowered.startswith("outcome unknown")
+                    is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
+                    if is_terminal_session_lost:
+                        event_type = "session_lost"
+                    elif is_unknown:
+                        event_type = "step_unknown"
+                    else:
+                        event_type = "step_failed" if is_fail else "step_complete"
                     event_data = {
                         "type": event_type,
                         "run_id": run_id_str,
@@ -743,7 +787,10 @@ async def stream_agent_run_endpoint(
                         "timestamp": r["timestamp"].isoformat(),
                         "has_screenshot": bool(r["screenshot_b64"]),
                     }
-                    if is_fail:
+                    if is_terminal_session_lost:
+                        event_data["terminal"] = True
+                        event_data["reattached"] = False
+                    if is_fail or is_unknown:
                         event_data["error"] = res_str
                     yield {
                         "event": event_type,
