@@ -785,9 +785,6 @@ class ReActAgent:
 
     async def _abort_session_lost(self, iteration: int, error: str, threshold: float, clean_goal: str) -> Dict[str, Any]:
         """Persist and broadcast terminal session_lost distinct from step_failed."""
-        # Carry the row's step_id so the SSE stream can correlate this frame with
-        # the durable poll's read of the same row: a duplicate session_lost would
-        # re-fire the frontend's terminal-status branch.
         session_lost_step_id = await self.persist_step(
             action="session_lost",
             result=f"session_lost: {error} after {self._reattach_attempts} reattach attempt(s)",
@@ -977,19 +974,15 @@ class ReActAgent:
                 response_msg = choice.message
             except Exception as llm_err:
                 logger.error(f"Groq LLM completion failed on iteration {iteration}: {llm_err}")
-                llm_fail_step_id = await self.persist_step(
+                llm_step_id = await self.persist_step(
                     action="llm_think",
                     result=f"failed: {llm_err}",
                 )
-                # Carry the row's step_id so the SSE stream can correlate this frame
-                # with the durable poll's read of the same row and deliver it once.
+                # The live event must carry the id of the row just persisted, or
+                # the stream cannot correlate the two deliveries of this step.
                 await self.emit_event(
                     "step_failed",
-                    {
-                        "step_id": llm_fail_step_id,
-                        "action": "llm_think",
-                        "error": str(llm_err),
-                    },
+                    {"step_id": llm_step_id, "action": "llm_think", "error": str(llm_err)},
                 )
                 # Wait briefly and retry next iteration
                 await asyncio.sleep(2.0)
@@ -1476,7 +1469,7 @@ class ReActAgent:
 
             screenshot_on_fail: Optional[str] = None
             try:
-                tool_result = await self.tools.execute(tool_name, tool_args)
+                tool_result = await self.tools.execute(tool_name, tool_args, step_id=step_id)
                 tool_success = tool_result.get("success", False)
                 if "exists" in tool_result and not tool_result.get("error"):
                     tool_success = True
@@ -1506,7 +1499,7 @@ class ReActAgent:
                         outcome_unknown = True
                         break
                     try:
-                        retry_res = await self.tools.execute(tool_name, tool_args)
+                        retry_res = await self.tools.execute(tool_name, tool_args, step_id=step_id)
                         retry_ok = retry_res.get("success", False)
                         if "exists" in retry_res and not retry_res.get("error"):
                             retry_ok = True
@@ -1619,6 +1612,8 @@ class ReActAgent:
                     sc_b64 = tool_result.get("screenshot_b64")
 
                 # If take_screenshot was already persisted by tools.take_screenshot, avoid duplicate row
+                # (that row was written under this same step_id, so the live event below still
+                # identifies the one durable row)
                 if not (tool_name == "take_screenshot" and tool_result.get("persisted")):
                     await self.persist_step(
                         action=tool_name,
