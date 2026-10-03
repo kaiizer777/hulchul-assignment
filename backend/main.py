@@ -147,18 +147,51 @@ async def _log_terminal_write_outcome(terminal_write: "asyncio.Task[None]") -> N
 
 async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     """Run the full ReAct loop off-request; publish live events via run_event_hub."""
-    from backend.browser import get_browser_session
+    from backend.browser import get_browser_session, MAX_CDP_REATTACH_ATTEMPTS
     from backend.tools import PlaywrightTools
     from backend.agent import ReActAgent
 
+    session_stack: list = []
+
+    async def _enter_cdp_session():
+        """Enter a browser session context manager and track it for later release."""
+        cm = get_browser_session()
+        sess = await cm.__aenter__()
+        session_stack.append(cm)
+        return sess
+
     try:
-        async with get_browser_session() as session:
+        try:
+            session = await _enter_cdp_session()
             tools = PlaywrightTools(page=session.page, run_id=run_id_str)
+
+            async def _reattach_page():
+                """Release the current browser session and return a freshly acquired page."""
+                if session_stack:
+                    old_cm = session_stack.pop()
+                    try:
+                        await old_cm.__aexit__(None, None, None)
+                    except Exception as release_err:
+                        logger.warning(f"Failed to release previous browser session during reattach: {release_err}")
+                new_session = await _enter_cdp_session()
+                return new_session.page
+
             # No on_event forwarding here: ReActAgent.emit_event already publishes
             # every event to run_event_hub itself, so a hub-publishing callback
             # delivered each event to SSE subscribers twice.
-            agent = ReActAgent(run_id=run_id_str, tools=tools)
+            agent = ReActAgent(
+                run_id=run_id_str,
+                tools=tools,
+                reconnect=_reattach_page,
+                max_reattaches=MAX_CDP_REATTACH_ATTEMPTS,
+            )
             await agent.run(goal=goal)
+        finally:
+            for cm in reversed(session_stack):
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
     except asyncio.CancelledError:
         # CancelledError is a BaseException since 3.8, so the `except Exception`
         # arm below never sees a cancelled run. Without this branch the task
@@ -592,7 +625,6 @@ async def run_agent_endpoint(
     except BaseException:
         _reserved_agent_runs.discard(run_id_str)
         raise
-
     return AgentRunResponse(
         run_id=run_id_str,
         status="running",
@@ -902,8 +934,17 @@ async def stream_agent_run_endpoint(
                     )
                     for idx, r in enumerate(step_rows, start=1):
                         res_str = r["result"] or ""
-                        is_fail = "failed" in res_str.lower() or "aborted" in res_str.lower()
-                        event_type = "step_failed" if is_fail else "step_complete"
+                        lowered = res_str.lower()
+                        persisted_action = r["action"] or ""
+                        is_terminal_session_lost = persisted_action == "session_lost"
+                        is_unknown = lowered.startswith("outcome unknown")
+                        is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
+                        if is_terminal_session_lost:
+                            event_type = "session_lost"
+                        elif is_unknown:
+                            event_type = "step_unknown"
+                        else:
+                            event_type = "step_failed" if is_fail else "step_complete"
                         event_data = {
                             "type": event_type,
                             "run_id": run_id_str,
@@ -914,7 +955,10 @@ async def stream_agent_run_endpoint(
                             "timestamp": r["timestamp"].isoformat(),
                             "has_screenshot": bool(r["screenshot_b64"]),
                         }
-                        if is_fail:
+                        if is_terminal_session_lost:
+                            event_data["terminal"] = True
+                            event_data["reattached"] = False
+                        if is_fail or is_unknown:
                             event_data["error"] = res_str
                         yield {
                             "event": event_type,
