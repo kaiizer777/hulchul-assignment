@@ -3,7 +3,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncGenerator, Optional, Dict, Any
+from typing import AsyncGenerator, Coroutine, Optional, Dict, Any, TypeVar
 from urllib.parse import urlparse, parse_qs
 import httpx
 from playwright.async_api import (
@@ -17,6 +17,8 @@ from playwright.async_api import (
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 class BrowserConnectionError(Exception):
@@ -75,18 +77,67 @@ async def check_browser_session_health(session: Optional[BrowserSession], timeou
         return True
 
 
+async def run_cancellation_safe(coro: Coroutine[Any, Any, _T]) -> _T:
+    """
+    Run a teardown coroutine to completion even while the caller is being cancelled.
+
+    Teardown runs in `finally` blocks that a cancelled task unwinds through, and
+    an agent run is cancelled rather than awaited, so awaiting the teardown
+    directly leaves it interruptible: a second cancellation (a repeated cancel,
+    or an enclosing wait_for timeout) aborts it mid-flight and the resource it
+    was releasing is leaked. CancelledError is a BaseException, so an
+    `except Exception` arm around it never sees the interruption at all.
+
+    The work therefore runs as its own task and is awaited through shield()
+    until it settles. A cancellation observed on the way is re-raised
+    afterwards, so it is delayed and never swallowed: the caller still ends up
+    cancelled, but only after the release has happened.
+    """
+    work = asyncio.ensure_future(coro)
+    pending_cancel: Optional[asyncio.CancelledError] = None
+    while True:
+        try:
+            await asyncio.shield(work)
+            break
+        except asyncio.CancelledError as cancel_err:
+            pending_cancel = cancel_err
+            if work.done():
+                break
+        except Exception:
+            # The teardown itself failed. Surfaced below so the caller decides
+            # whether that is fatal; the exception is retrieved either way, so
+            # asyncio does not also report it as never-retrieved.
+            break
+    work_err = work.exception()
+    if pending_cancel is not None:
+        raise pending_cancel
+    if work_err is not None:
+        raise work_err
+    return work.result()
+
+
+async def _post_steel_session_release(api_key: str, session_id: str) -> None:
+    """Issue the Steel.dev session release request. Raises on transport failure."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"https://api.steel.dev/v1/sessions/{session_id}/release",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    if resp.status_code == 200:
+        logger.info(f"Released Steel.dev session {session_id}")
+    else:
+        logger.warning(f"Steel.dev session release returned status {resp.status_code}: {resp.text}")
+
+
 async def _release_steel_session(api_key: str, session_id: str) -> None:
-    """Explicitly release a Steel.dev session via REST API."""
+    """Explicitly release a Steel.dev session via REST API.
+
+    Guarded by run_cancellation_safe: this runs from the teardown of a task that
+    is usually being cancelled, and an interrupted release leaks a remote
+    browser session that then holds Steel concurrency until its own timeout.
+    """
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"https://api.steel.dev/v1/sessions/{session_id}/release",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            if resp.status_code == 200:
-                logger.info(f"Released Steel.dev session {session_id}")
-            else:
-                logger.warning(f"Steel.dev session release returned status {resp.status_code}: {resp.text}")
+        await run_cancellation_safe(_post_steel_session_release(api_key, session_id))
     except Exception as e:
         logger.warning(f"Failed to release Steel.dev session {session_id}: {e}")
 

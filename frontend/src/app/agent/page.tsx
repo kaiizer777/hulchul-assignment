@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useTransition } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useTransition } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
 
 /**
@@ -20,8 +20,8 @@ const AGENT_API_BASE = '/api/agent';
  *
  * It deliberately does not claim the server never saw the request: a rejected
  * fetch cannot distinguish "never arrived" from "arrived and was refused", and
- * `POST /agent/run` only returns a run id after the agent loop has already
- * executed on the backend. Asserting no run started would invite a duplicate
+ * `POST /agent/run` returns 202 + run id immediately while the agent loop
+ * continues in the background. Asserting no run started would invite a duplicate
  * submission of side-effecting work, so the operator is told to check the run
  * status instead.
  */
@@ -287,6 +287,26 @@ export default function AgentControlPage() {
     }
   };
 
+  /**
+   * Appends a step event unless that step_id is already rendered.
+   *
+   * `GET /agent/runs/{run_id}/stream` replays the whole `agent_steps` history on
+   * every connection, and the agent persists a step before it emits the matching
+   * live event, so a step can arrive both from history playback and from the live
+   * queue. EventSource also reconnects on its own whenever the stream drops, and
+   * the run now outlives the POST request, so mid-run reconnects are routine. Both
+   * paths would otherwise re-append every earlier step. Events without a step_id
+   * cannot be correlated and are always appended.
+   */
+  const appendStep = useCallback((step: StepEvent) => {
+    setSteps((prev) => {
+      if (step.step_id && prev.some((existing) => existing.step_id === step.step_id)) {
+        return prev;
+      }
+      return [...prev, step];
+    });
+  }, []);
+
   // If we have a runId, connect to SSE stream and poll approval status
   useEffect(() => {
     if (!runId) return;
@@ -306,14 +326,14 @@ export default function AgentControlPage() {
           if (data.type === 'status_change') {
             setStatus(data.status);
           } else if (data.type === 'step_complete' || data.type === 'step_failed' || data.type === 'step_unknown') {
-            setSteps((prev) => [...prev, data]);
+            appendStep(data);
           } else if (data.type === 'session_lost') {
-            setSteps((prev) => [...prev, { ...data, action: data.action || 'session_lost' }]);
+            appendStep({ ...data, action: data.action || 'session_lost' });
             if (data.terminal === true) {
               setStatus('session_lost');
             }
           } else if (data.type === 'session_reattached') {
-            setSteps((prev) => [...prev, { ...data, action: data.action || 'session_reattached' }]);
+            appendStep({ ...data, action: data.action || 'session_reattached' });
           } else if (data.type === 'done') {
             setStatus('done');
           }
@@ -334,7 +354,7 @@ export default function AgentControlPage() {
       eventSource.addEventListener('step_complete', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, data]);
+          appendStep(data);
         } catch (e) {
           console.warn('Failed to parse step_complete SSE frame, ignoring', e);
         }
@@ -343,7 +363,7 @@ export default function AgentControlPage() {
       eventSource.addEventListener('step_failed', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, data]);
+          appendStep(data);
         } catch (e) {
           console.warn('Failed to parse step_failed SSE frame, ignoring', e);
         }
@@ -352,7 +372,7 @@ export default function AgentControlPage() {
       eventSource.addEventListener('step_unknown', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, data]);
+          appendStep(data);
         } catch (e) {
           console.warn('Failed to parse step_unknown SSE frame, ignoring', e);
         }
@@ -361,7 +381,7 @@ export default function AgentControlPage() {
       eventSource.addEventListener('session_lost', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, { ...data, action: data.action || 'session_lost' }]);
+          appendStep({ ...data, action: data.action || 'session_lost' });
           if (data.terminal === true || data.status === 'session_lost') {
             setStatus('session_lost');
           }
@@ -373,7 +393,7 @@ export default function AgentControlPage() {
       eventSource.addEventListener('session_reattached', (event: MessageEvent) => {
         try {
           const data = JSON.parse(event.data);
-          setSteps((prev) => [...prev, { ...data, action: data.action || 'session_reattached' }]);
+          appendStep({ ...data, action: data.action || 'session_reattached' });
         } catch (e) {
           console.warn('Failed to parse session_reattached SSE frame, ignoring', e);
         }
@@ -437,7 +457,7 @@ export default function AgentControlPage() {
       if (eventSource) eventSource.close();
       if (pollInterval) clearInterval(pollInterval);
     };
-  }, [runId]);
+  }, [runId, appendStep]);
 
   /**
    * Toggles the pause or resume state of the active agent run.

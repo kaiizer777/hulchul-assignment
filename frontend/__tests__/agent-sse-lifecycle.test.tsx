@@ -164,4 +164,69 @@ describe('/agent SSE frame handling', () => {
 
     expect(consoleWarnSpy).not.toHaveBeenCalledWith('Approval status poll failed', expect.anything());
   });
+
+  it('renders one step when the same step_id arrives from history replay and the live stream', async () => {
+    await startRun();
+
+    // The stream replays every persisted step on connect and the agent publishes
+    // the same step again as it runs, so one step_id legitimately arrives twice.
+    const replayed = JSON.stringify({
+      type: 'step_complete',
+      run_id: 'run-12345678',
+      step_id: 'step-aaaa',
+      step_index: 1,
+      action: 'navigate',
+      result: 'loaded /invoices',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      has_screenshot: false,
+    });
+
+    await emitFrame('step_complete', replayed);
+    await emitFrame('step_complete', replayed);
+
+    expect(screen.getByText(/1 step logged/i)).toBeDefined();
+    expect(screen.getAllByText('navigate')).toHaveLength(1);
+  });
+
+  it('renders distinct step_ids as separate steps', async () => {
+    await startRun();
+
+    await emitFrame('step_complete', JSON.stringify({
+      type: 'step_complete',
+      run_id: 'run-12345678',
+      step_id: 'step-aaaa',
+      step_index: 1,
+      action: 'navigate',
+      result: 'loaded /invoices',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    }));
+    await emitFrame('step_complete', JSON.stringify({
+      type: 'step_complete',
+      run_id: 'run-12345678',
+      step_id: 'step-bbbb',
+      step_index: 2,
+      action: 'click',
+      result: 'clicked Submit',
+      timestamp: '2026-01-01T00:00:01.000Z',
+    }));
+
+    expect(screen.getByText(/2 steps logged/i)).toBeDefined();
+    expect(screen.getAllByText('navigate')).toHaveLength(1);
+    expect(screen.getAllByText('click')).toHaveLength(1);
+  });
+
+  it('appends events that carry no step_id because they cannot be correlated', async () => {
+    await startRun();
+
+    await emitFrame('session_reattached', JSON.stringify({
+      type: 'session_reattached',
+      run_id: 'run-12345678',
+      result: 'reattached after 1 attempt',
+      timestamp: '2026-01-01T00:00:02.000Z',
+    }));
+
+    expect(screen.getByText(/1 step logged/i)).toBeDefined();
+    expect(screen.getAllByText('session_reattached')).toHaveLength(1);
+    expect(screen.getByText('reattached after 1 attempt')).toBeDefined();
+  });
 });
