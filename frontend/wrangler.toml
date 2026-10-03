@@ -1,7 +1,8 @@
 name = "hulchul-frontend"
 main = ".open-next/worker.js"
 compatibility_date = "2024-09-25"
-compatibility_flags = ["nodejs_compat"]
+# nodejs_compat_populate_process_env is required below compat date 2025-04-01 so process.env (read in src/lib/auth.ts) is populated at runtime.
+compatibility_flags = ["nodejs_compat", "nodejs_compat_populate_process_env"]
 
 [assets]
 directory = ".open-next/assets"
