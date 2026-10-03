@@ -6,14 +6,13 @@ import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
 from httpx import ASGITransport, AsyncClient
 from groq import AsyncGroq
 
 from backend.config import settings
-from backend.db import get_db_pool, close_db_pool
 from backend.main import app
 from backend.agent import ReActAgent
 from backend.tools import PlaywrightTools
@@ -24,31 +23,100 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
     """
     Comprehensive tests for Phase 2.6:
     Persist every step to agent_steps table in Neon (action, result, screenshot_b64, timestamp).
+
+    Test isolation (issue #41): each test owns a dedicated asyncpg pool that is
+    closed in tearDown. This class never reads or closes the process-global
+    backend.db._db_pool, so a sibling module's teardown cannot close the pool
+    mid-setup (previously surfaced as ConnectionDoesNotExistError in
+    asyncSetUp). Global pool lookups are patched to the isolated pool for the
+    duration of each test so the FastAPI endpoints under test read the same
+    rows. Transient Neon connection failures skip legibly instead of erroring.
     """
 
+    async def _init_isolated_pool(self):
+        """Create a per-test pool; retry once on transient failure, else SkipTest."""
+        if not settings.DATABASE_URL:
+            raise unittest.SkipTest("DATABASE_URL is not set; skipping live-Neon phase26 tests")
+        last_exc = None
+        for attempt in (1, 2):
+            pool = None
+            try:
+                pool = await asyncpg.create_pool(
+                    dsn=settings.DATABASE_URL,
+                    min_size=1,
+                    max_size=2,
+                )
+                async with pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                return pool
+            except Exception as exc:
+                last_exc = exc
+                if pool is not None:
+                    try:
+                        await pool.close()
+                    except Exception:
+                        pass
+                if attempt == 2:
+                    raise unittest.SkipTest(
+                        f"Neon unavailable for phase26 (attempt {attempt}): "
+                        f"{type(last_exc).__name__}: {last_exc}"
+                    )
+        raise unittest.SkipTest(f"Neon unavailable for phase26: {last_exc}")
+
     async def asyncSetUp(self):
-        self.pool = await get_db_pool()
+        self._db_patchers = []
+        self.pool = await self._init_isolated_pool()
+        for target in (
+            "backend.db.get_db_pool",
+            "backend.main.get_db_pool",
+            "backend.agent.get_db_pool",
+        ):
+            try:
+                patcher = patch(target, new=AsyncMock(return_value=self.pool))
+                patcher.start()
+                self._db_patchers.append(patcher)
+            except Exception:
+                pass
         self.redis = get_redis_client()
         self.test_run_ids: List[str] = []
 
     async def asyncTearDown(self):
         # Cleanup test records
-        if self.test_run_ids:
-            try:
-                valid_uuids = []
-                for r in self.test_run_ids:
-                    try:
-                        valid_uuids.append(uuid.UUID(str(r)))
-                    except (ValueError, TypeError):
-                        pass
-                if valid_uuids:
-                    async with self.pool.acquire() as conn:
-                        await conn.execute("DELETE FROM agent_steps WHERE run_id = ANY($1::uuid[]);", valid_uuids)
-                        await conn.execute("DELETE FROM agent_runs WHERE run_id = ANY($1::uuid[]);", valid_uuids)
-            except Exception:
-                pass
-        await self.redis.close()
-        await close_db_pool()
+        try:
+            if getattr(self, "test_run_ids", None) and getattr(self, "pool", None) is not None:
+                try:
+                    valid_uuids = []
+                    for r in self.test_run_ids:
+                        try:
+                            valid_uuids.append(uuid.UUID(str(r)))
+                        except (ValueError, TypeError):
+                            pass
+                    if valid_uuids:
+                        async with self.pool.acquire() as conn:
+                            await conn.execute("DELETE FROM agent_steps WHERE run_id = ANY($1::uuid[]);", valid_uuids)
+                            await conn.execute("DELETE FROM agent_runs WHERE run_id = ANY($1::uuid[]);", valid_uuids)
+                except Exception:
+                    pass
+        finally:
+            for patcher in getattr(self, "_db_patchers", []):
+                try:
+                    patcher.stop()
+                except Exception:
+                    pass
+            self._db_patchers = []
+            pool = getattr(self, "pool", None)
+            self.pool = None
+            if pool is not None:
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
+            redis = getattr(self, "redis", None)
+            if redis is not None:
+                try:
+                    await redis.close()
+                except Exception:
+                    pass
 
     # -----------------------------------------------------------------------
     # 1. Step Creation, Verification & Timestamps in Neon
