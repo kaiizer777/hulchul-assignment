@@ -228,9 +228,9 @@ export default function AgentControlPage() {
     }
   };
 
-  // Automatically fetch verification report when run completes or fails
+  // Automatically fetch verification report when run completes, fails, or loses session
   useEffect(() => {
-    if (runId && (status === 'done' || status === 'failed')) {
+    if (runId && (status === 'done' || status === 'failed' || status === 'session_lost')) {
       handleFetchVerification();
     }
   }, [runId, status]);
@@ -307,6 +307,13 @@ export default function AgentControlPage() {
             setStatus(data.status);
           } else if (data.type === 'step_complete' || data.type === 'step_failed') {
             setSteps((prev) => [...prev, data]);
+          } else if (data.type === 'session_lost') {
+            setSteps((prev) => [...prev, { ...data, action: data.action || 'session_lost' }]);
+            if (data.terminal === true) {
+              setStatus('session_lost');
+            }
+          } else if (data.type === 'session_reattached') {
+            setSteps((prev) => [...prev, { ...data, action: data.action || 'session_reattached' }]);
           } else if (data.type === 'done') {
             setStatus('done');
           }
@@ -333,6 +340,23 @@ export default function AgentControlPage() {
         try {
           const data = JSON.parse(event.data);
           setSteps((prev) => [...prev, data]);
+        } catch {}
+      });
+
+      eventSource.addEventListener('session_lost', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          setSteps((prev) => [...prev, { ...data, action: data.action || 'session_lost' }]);
+          if (data.terminal === true || data.status === 'session_lost') {
+            setStatus('session_lost');
+          }
+        } catch {}
+      });
+
+      eventSource.addEventListener('session_reattached', (event: MessageEvent) => {
+        try {
+          const data = JSON.parse(event.data);
+          setSteps((prev) => [...prev, { ...data, action: data.action || 'session_reattached' }]);
         } catch {}
       });
 
@@ -502,7 +526,7 @@ export default function AgentControlPage() {
           <div className="flex items-center gap-2">
             <button
               onClick={handleTogglePause}
-              disabled={isPausingOrResuming || status === 'done' || status === 'failed'}
+              disabled={isPausingOrResuming || status === 'done' || status === 'failed' || status === 'session_lost'}
               className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-2 text-xs font-semibold shadow-xs transition-all active:translate-y-[0.5px] disabled:opacity-50 ${
                 status === 'paused'
                   ? 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300'
@@ -607,6 +631,13 @@ export default function AgentControlPage() {
             {error}
           </div>
         )}
+
+        {status === 'session_lost' && (
+          <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+            Browser session lost: the remote Steel/Browserless CDP target was evicted mid-run. Bounded reattach
+            was attempted and exhausted. This is distinct from a step failure. Start a new run to retry.
+          </div>
+        )}
       </div>
 
       {/* Real-Time Step Log via SSE */}
@@ -652,13 +683,16 @@ export default function AgentControlPage() {
           ) : (
             steps.map((st, idx) => {
               const isFail = st.type === 'step_failed' || (st.result && st.result.toLowerCase().includes('failed'));
+              const isSessionLost = st.type === 'session_lost' || st.type === 'session_reattached';
               return (
                 <div
                   key={idx}
                   className={`rounded-xl border p-4 transition-all ${
-                    isFail
-                      ? 'border-red-200 bg-red-50/70 text-red-900 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200'
-                      : 'border-zinc-200/80 bg-zinc-50/70 text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950/50 dark:text-zinc-200'
+                    isSessionLost
+                      ? 'border-amber-300 bg-amber-50/70 text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200'
+                      : isFail
+                        ? 'border-red-200 bg-red-50/70 text-red-900 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200'
+                        : 'border-zinc-200/80 bg-zinc-50/70 text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950/50 dark:text-zinc-200'
                   }`}
                 >
                   <div className="flex items-center justify-between pb-2 border-b border-zinc-200/60 dark:border-zinc-800/80 text-[11px]">
@@ -701,7 +735,7 @@ export default function AgentControlPage() {
       </div>
 
       {/* Verification Report Section (Phase 4) */}
-      {(verificationReport || isFetchingVerification || verificationError || (runId && (status === 'done' || status === 'failed'))) && (
+      {(verificationReport || isFetchingVerification || verificationError || (runId && (status === 'done' || status === 'failed' || status === 'session_lost'))) && (
         <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60 space-y-6">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-4 border-b border-zinc-200/80 dark:border-zinc-800">
             <div>

@@ -19,6 +19,38 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Closed-target / session-lost classifier (Issue #31)
+# ---------------------------------------------------------------------------
+
+CLOSED_TARGET_SUBSTRINGS = (
+    "target page, context or browser has been closed",
+    "context or browser has been closed",
+    "has been closed",
+    "target closed",
+    "session closed",
+    "browser has been closed",
+    "browser has disconnected",
+    "browser disconnected",
+    "connection closed",
+    "websocket",
+    "protocol error",
+)
+
+
+def is_session_lost_error(err: Any) -> bool:
+    """Return True when an error string/exception indicates mid-run CDP eviction."""
+    if err is None:
+        return False
+    try:
+        msg = str(err).lower()
+    except Exception:
+        return False
+    if not msg:
+        return False
+    return any(pat in msg for pat in CLOSED_TARGET_SUBSTRINGS)
+
+
+# ---------------------------------------------------------------------------
 # Strict Pydantic Schemas for Tool Inputs & DTOs
 # ---------------------------------------------------------------------------
 
@@ -343,6 +375,7 @@ async def navigate(page: Page, url: str) -> Dict[str, Any]:
             "success": False,
             "url": page.url if page else url,
             "error": str(e),
+            "session_lost": is_session_lost_error(e),
         }
 
 
@@ -369,6 +402,7 @@ async def read_page(page: Page) -> Dict[str, Any]:
         return {
             "success": False,
             "error": str(e),
+            "session_lost": is_session_lost_error(e),
         }
 
 
@@ -440,6 +474,7 @@ async def click(page: Page, selector: str) -> Dict[str, Any]:
             "selector": selector,
             "clicked": False,
             "error": str(e),
+            "session_lost": is_session_lost_error(e),
         }
 
 
@@ -465,6 +500,7 @@ async def fill(page: Page, selector: str, value: Union[str, int, float]) -> Dict
             "selector": selector,
             "value": str(value),
             "error": str(e),
+            "session_lost": is_session_lost_error(e),
         }
 
 
@@ -498,6 +534,7 @@ async def select(page: Page, selector: str, value: str) -> Dict[str, Any]:
             "selector": selector,
             "selected": None,
             "error": str(e),
+            "session_lost": is_session_lost_error(e),
         }
 
 
@@ -576,6 +613,7 @@ async def take_screenshot(
         return {
             "success": False,
             "error": str(e),
+            "session_lost": is_session_lost_error(e),
         }
 
 
