@@ -409,6 +409,58 @@ def test_session_is_invalid_after_logout(client: TestClient, configured_password
     assert replay.status_code == 401
 
 
+def test_logout_returns_503_when_redis_delete_raises(client: TestClient) -> None:
+    """A revocation that cannot be confirmed must fail closed, never clear the cookie."""
+    from backend.redis_client import UpstashRedisError
+
+    token, digest = _store_session(ttl_seconds=3600)
+
+    broken = MagicMock(spec=UpstashRedisClient)
+    broken.is_configured = True
+    broken.delete_auth_session = AsyncMock(side_effect=UpstashRedisError("connection refused"))
+
+    with patch.object(auth_module, "get_redis_client", return_value=broken):
+        response = client.post("/auth/logout", headers={"Cookie": f"hulchul_session={token}"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": auth.AUTH_UNAVAILABLE_DETAIL}
+    assert "set-cookie" not in response.headers, "an unconfirmed revocation must not clear the cookie"
+    assert f"{SESSION_KEY_PREFIX}{digest}" in storage, "the session record must survive a failed revocation"
+
+    # The copied token stays usable, which is exactly why the 503 must be visible.
+    replay = client.get("/auth/session", headers={"Cookie": f"hulchul_session={token}"})
+    assert replay.status_code == 200
+
+
+def test_logout_with_token_but_redis_unconfigured_returns_503(client: TestClient) -> None:
+    """A token presented while Redis is unconfigured cannot be revoked: 503, cookie kept."""
+    unconfigured = _unconfigured_redis()
+
+    with patch.object(auth_module, "get_redis_client", return_value=unconfigured):
+        response = client.post(
+            "/auth/logout",
+            headers={"Cookie": f"hulchul_session={auth.generate_session_token()}"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": auth.AUTH_UNAVAILABLE_DETAIL}
+    assert "set-cookie" not in response.headers
+
+
+def test_logout_without_token_still_returns_204_when_redis_is_down(client: TestClient) -> None:
+    """No token means nothing to revoke: 204 even when Redis is unreachable."""
+    from backend.redis_client import UpstashRedisError
+
+    broken = MagicMock(spec=UpstashRedisClient)
+    broken.is_configured = True
+    broken.delete_auth_session = AsyncMock(side_effect=UpstashRedisError("connection refused"))
+
+    with patch.object(auth_module, "get_redis_client", return_value=broken):
+        response = client.post("/auth/logout")
+
+    assert response.status_code == 204
+
+
 # ---------------------------------------------------------------------------
 # Login rate limiting
 # ---------------------------------------------------------------------------

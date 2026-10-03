@@ -250,20 +250,28 @@ async def create_session() -> Optional[IssuedSession]:
     return IssuedSession(token=token, session=Session(sub=SESSION_SUBJECT, exp=payload["exp"]))
 
 
-async def destroy_session(raw_token: Optional[str]) -> None:
+async def destroy_session(raw_token: Optional[str]) -> bool:
     """
-    Revoke a session record. Best-effort by design: logout stays idempotent even
-    when Redis cannot confirm the deletion.
+    Revoke a session record. Returns True when logout may proceed to 204.
+
+    Logout stays idempotent: a missing or already-deleted key (DEL -> 0) counts
+    as revoked. Returns False only when revocation cannot be confirmed -- Redis
+    unconfigured while a token was presented, or the delete raised -- so the
+    caller can fail closed with a 503 instead of clearing the cookie on top of
+    a still-valid session.
     """
     if not raw_token:
-        return
+        return True
     redis = get_redis_client()
     if not redis.is_configured:
-        return
+        logger.error("Session revocation failed: Redis is not configured")
+        return False
     try:
         await redis.delete_auth_session(hash_session_token(raw_token))
     except UpstashRedisError as exc:
-        logger.warning(f"Session revocation failed: {exc}")
+        logger.error(f"Session revocation failed: {exc}")
+        return False
+    return True
 
 
 async def verify_password(candidate: str) -> bool:
