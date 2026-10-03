@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { InvoiceDTO, PurchaseOrderDTO, VendorDTO } from '@/lib/types';
 
 // Mock DB client
@@ -135,6 +135,124 @@ describe('API Route Unit Tests', () => {
       const data = await response.json();
       expect(data.error).toBe('Validation failed');
       expect(data.details).toBeDefined();
+    });
+  });
+
+  describe('POST /api/invoices failure injection gate', () => {
+    const payload = {
+      vendor: 'Acme Corp',
+      amount: 1,
+      date: '2026-01-01',
+    };
+
+    const createdRow = {
+      id: '99',
+      vendor: 'Acme Corp',
+      amount: 1,
+      date: '2026-01-01',
+      po_number: null,
+      status: 'pending',
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+
+    const postInvoice = async (query: string, headers?: Record<string, string>) => {
+      const { POST } = await import('@/app/api/invoices/route');
+      return POST(
+        new Request(`http://localhost:3051/api/invoices${query}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(payload),
+        })
+      );
+    };
+
+    const resetCounter = async () => {
+      vi.stubEnv('NODE_ENV', 'test');
+      mockSql.mockResolvedValueOnce([createdRow]);
+      await postInvoice('?reset_failure=true');
+    };
+
+    beforeEach(async () => {
+      vi.stubEnv('SIMULATE_FAILURE_AFTER', '');
+      await resetCounter();
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('ignores x-test-failure-injection in production', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      vi.stubEnv('ENABLE_TEST_FAILURE_INJECTION', '');
+      mockSql.mockResolvedValueOnce([createdRow]);
+
+      const response = await postInvoice('?fail_after=1', {
+        'x-test-failure-injection': 'true',
+      });
+
+      expect(response.status).toBe(201);
+      expect(mockSql).toHaveBeenCalledTimes(2);
+      expect(await response.json()).toEqual({
+        id: '99',
+        vendor: 'Acme Corp',
+        amount: 1,
+        date: '2026-01-01',
+        po_number: null,
+        status: 'pending',
+        created_at: '2026-01-01T00:00:00.000Z',
+      });
+    });
+
+    it('ignores x-test-mode in production', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      vi.stubEnv('ENABLE_TEST_FAILURE_INJECTION', '');
+      mockSql.mockResolvedValueOnce([createdRow]);
+
+      const response = await postInvoice('?fail_after=1', {
+        'x-test-mode': 'true',
+      });
+
+      expect(response.status).toBe(201);
+      expect(mockSql).toHaveBeenCalledTimes(2);
+      expect(await response.json()).toEqual({
+        id: '99',
+        vendor: 'Acme Corp',
+        amount: 1,
+        date: '2026-01-01',
+        po_number: null,
+        status: 'pending',
+        created_at: '2026-01-01T00:00:00.000Z',
+      });
+    });
+
+    it('allows injection in production when ENABLE_TEST_FAILURE_INJECTION is set', async () => {
+      vi.stubEnv('NODE_ENV', 'production');
+      vi.stubEnv('ENABLE_TEST_FAILURE_INJECTION', 'true');
+
+      const response = await postInvoice('?fail_after=1', {
+        'x-test-failure-injection': 'true',
+      });
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: 'Simulated ERP internal server error',
+      });
+      expect(mockSql).toHaveBeenCalledTimes(1);
+    });
+
+    it('honours fail_after with the header outside production', async () => {
+      vi.stubEnv('NODE_ENV', 'test');
+      vi.stubEnv('ENABLE_TEST_FAILURE_INJECTION', '');
+
+      const response = await postInvoice('?fail_after=1', {
+        'x-test-failure-injection': 'true',
+      });
+
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: 'Simulated ERP internal server error',
+      });
+      expect(mockSql).toHaveBeenCalledTimes(1);
     });
   });
 
