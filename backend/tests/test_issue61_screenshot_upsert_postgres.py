@@ -15,6 +15,7 @@ Gated on DATABASE_URL like test_phase26_steps_persistence.py, so it runs in CI
 """
 
 import asyncio
+import base64
 import contextlib
 import unittest
 import uuid
@@ -35,13 +36,16 @@ _TRANSIENT_DB_ERRORS = (
     asyncio.TimeoutError,
 )
 
-_FAKE_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+# What the stub page hands back, and therefore exactly what take_screenshot must
+# base64-encode into screenshot_b64.
+_FAKE_PNG_BYTES = b"\x89PNG\r\n\x1a\nfake"
+_FAKE_PNG_B64 = base64.b64encode(_FAKE_PNG_BYTES).decode("utf-8")
 
 
 def _fake_page() -> MagicMock:
     """A Playwright-shaped page whose screenshot returns real PNG bytes."""
     page = MagicMock()
-    page.screenshot = AsyncMock(return_value=b"\x89PNG\r\n\x1a\nfake")
+    page.screenshot = AsyncMock(return_value=_FAKE_PNG_BYTES)
     return page
 
 
