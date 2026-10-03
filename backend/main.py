@@ -150,7 +150,7 @@ async def _log_terminal_write_outcome(terminal_write: "asyncio.Task[None]") -> N
 
 async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     """Run the full ReAct loop off-request; publish live events via run_event_hub."""
-    from backend.browser import get_browser_session, MAX_CDP_REATTACH_ATTEMPTS
+    from backend.browser import get_browser_session, run_cancellation_safe, MAX_CDP_REATTACH_ATTEMPTS
     from backend.tools import PlaywrightTools
     from backend.agent import ReActAgent
 
@@ -190,11 +190,22 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
             )
             await agent.run(goal=goal)
         finally:
+            # Teardown is reached either by a finished run or by a cancellation
+            # landing in the run above, and the second cancellation that follows
+            # it must not abort a close midway: a session left open holds a
+            # remote browser for its whole timeout. Each close is therefore run
+            # cancellation-safe, and a cancellation seen here is re-raised only
+            # after every remaining session has been released.
+            pending_cancel: Optional[asyncio.CancelledError] = None
             for cm in reversed(session_stack):
                 try:
-                    await cm.__aexit__(None, None, None)
+                    await run_cancellation_safe(cm.__aexit__(None, None, None))
+                except asyncio.CancelledError as cancel_err:
+                    pending_cancel = cancel_err
                 except Exception:
                     pass
+            if pending_cancel is not None:
+                raise pending_cancel
     except asyncio.CancelledError:
         # CancelledError is a BaseException since 3.8, so the `except Exception`
         # arm below never sees a cancelled run. Without this branch the task

@@ -4,7 +4,8 @@ import asyncio
 import json
 import unittest
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, Dict, List
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.tools import (
     is_session_lost_error,
@@ -15,6 +16,8 @@ from backend.tools import (
 from backend.browser import (
     is_browser_session_alive,
     check_browser_session_health,
+    run_cancellation_safe,
+    _release_steel_session,
 )
 from backend.agent import ReActAgent
 
@@ -375,6 +378,85 @@ class TestAgentReattach(unittest.IsolatedAsyncioTestCase):
         self.assertIn("session_lost", types)
         terminal = [e for e in events if e["type"] == "session_lost" and e.get("terminal") is True]
         self.assertTrue(terminal)
+
+
+class TestCancellationSafeTeardown(unittest.IsolatedAsyncioTestCase):
+    """Test suite for teardown that must finish while its caller is being cancelled."""
+
+    async def test_teardown_completes_and_cancellation_still_propagates(self):
+        """Verify a cancelled caller cannot abort the teardown, and is still cancelled afterwards."""
+        release_started = asyncio.Event()
+        release_gate = asyncio.Event()
+        completed: List[str] = []
+
+        async def teardown() -> str:
+            release_started.set()
+            await release_gate.wait()
+            completed.append("released")
+            return "done"
+
+        task = asyncio.ensure_future(run_cancellation_safe(teardown()))
+        await asyncio.wait_for(release_started.wait(), timeout=5.0)
+
+        task.cancel()
+        # Nothing releases until this is set, so a teardown that honoured the
+        # cancellation would never record the release.
+        release_gate.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(completed, ["released"])
+
+    async def test_teardown_error_still_surfaces_to_the_caller(self):
+        """Verify the teardown's own failure is raised rather than silently dropped."""
+        async def failing_teardown() -> None:
+            raise RuntimeError("close failed")
+
+        with self.assertRaises(RuntimeError):
+            await run_cancellation_safe(failing_teardown())
+
+    async def test_steel_session_release_completes_under_cancellation(self):
+        """Verify a cancelled release still issues the Steel.dev release request."""
+        post_started = asyncio.Event()
+        post_gate = asyncio.Event()
+        released: List[str] = []
+
+        class _FakeResponse:
+            status_code = 200
+            text = "ok"
+
+        class _FakeAsyncClient:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> "_FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *exc_info: Any) -> bool:
+                return False
+
+            async def post(self, url: str, headers: Dict[str, str] = {}, **kwargs: Any) -> _FakeResponse:
+                post_started.set()
+                await post_gate.wait()
+                released.append(url)
+                return _FakeResponse()
+
+        with patch("backend.browser.httpx.AsyncClient", new=_FakeAsyncClient):
+            task = asyncio.ensure_future(_release_steel_session("test-key", "session-abc"))
+            await asyncio.wait_for(post_started.wait(), timeout=5.0)
+
+            # The cancellation lands while the release request is in flight.
+            task.cancel()
+            post_gate.set()
+
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(
+            released,
+            ["https://api.steel.dev/v1/sessions/session-abc/release"],
+            "the remote session must be released even though the task was cancelled",
+        )
 
 
 if __name__ == "__main__":

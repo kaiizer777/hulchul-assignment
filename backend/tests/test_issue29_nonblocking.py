@@ -758,6 +758,68 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         )
         return response.body_iterator
 
+    async def test_cancelled_run_still_drains_browser_sessions_during_teardown(self) -> None:
+        """A cancellation during teardown must not skip the browser session close."""
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = "88888888-8888-4888-8888-888888888888"
+        mock_redis = AsyncMock()
+        mock_redis.get_session_state.return_value = None
+
+        release_started = asyncio.Event()
+        release_gate = asyncio.Event()
+        released: List[str] = []
+
+        class _BlockingSession:
+            """A browser session whose close suspends until the test releases it."""
+
+            async def __aenter__(self) -> Any:
+                session = MagicMock()
+                session.page = MagicMock()
+                return session
+
+            async def __aexit__(self, *exc_info: Any) -> bool:
+                release_started.set()
+                await release_gate.wait()
+                released.append("closed")
+                return False
+
+        async def quick_run(self_agent, goal: str) -> Dict[str, Any]:
+            return {
+                "run_id": self_agent.run_id,
+                "status": "completed",
+                "iterations": 0,
+                "goal": goal,
+                "threshold": 50000.0,
+                "summary": "done",
+            }
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+            patch("backend.redis_client.get_redis_client", return_value=mock_redis),
+            patch("backend.browser.get_browser_session", new=lambda *a, **k: _BlockingSession()),
+            patch("backend.agent.ReActAgent.run", new=quick_run),
+            patch.object(run_event_hub, "publish", new=AsyncMock()),
+        ):
+            task = asyncio.create_task(_execute_agent_run_background(run_id, "Process invoices"))
+            await asyncio.wait_for(release_started.wait(), timeout=5.0)
+
+            # The run finished and teardown is suspended inside the close.
+            task.cancel()
+            # Nothing closes until this is set, so a teardown that honoured the
+            # cancellation would leave the remote browser session open.
+            release_gate.set()
+
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(released, ["closed"], "the session close must run to completion")
+        self.assertTrue(task.cancelled(), "the cancellation must still propagate")
+
     async def test_sse_poll_delivers_step_persisted_after_connect(self) -> None:
         """A step committed after connect must reach an open stream with no hub event at all."""
         run_id = uuid.uuid4()
