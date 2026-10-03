@@ -42,6 +42,7 @@ class RunEventHub:
     def __init__(self) -> None:
         """Initialize the run event hub subscriber registry dictionary."""
         self._subscribers: Dict[str, Set[asyncio.Queue]] = {}
+        self._unserved_publishes = 0
 
     def subscribe(self, run_id: str) -> asyncio.Queue:
         """Subscribe and return a new asynchronous event queue for the specified run ID."""
@@ -60,12 +61,32 @@ class RunEventHub:
 
     async def publish(self, run_id: str, event: Dict[str, Any]) -> None:
         """Publish an event dictionary to all active subscriber queues for the specified run ID."""
-        if run_id in self._subscribers:
-            for q in list(self._subscribers[run_id]):
-                try:
-                    await q.put(event)
-                except Exception:
-                    pass
+        if run_id not in self._subscribers:
+            # No local subscriber. Either nobody is streaming this run, or the
+            # publisher sits on a different Lambda execution environment than the
+            # stream -- the two are indistinguishable from here. A durable step is
+            # still recoverable, because the SSE stream tails agent_steps; a
+            # non-durable event (run_started, step_start, paused, ...) is not, so
+            # this counter is the only evidence that one was dropped.
+            self._unserved_publishes += 1
+            if self._unserved_publishes == 1:
+                logger.debug(
+                    f"Run event hub has no local subscriber for run {run_id} "
+                    f"(event type={event.get('type')}); durable steps still reach "
+                    f"the stream via the agent_steps cursor tail"
+                )
+            elif self._unserved_publishes % 100 == 0:
+                logger.warning(
+                    f"{self._unserved_publishes} events published with no local "
+                    f"subscriber (latest run {run_id}, type={event.get('type')}); "
+                    f"cross-instance delivery of non-durable events is not available"
+                )
+            return
+        for q in list(self._subscribers[run_id]):
+            try:
+                await q.put(event)
+            except Exception:
+                pass
 
 
 run_event_hub = RunEventHub()
@@ -723,6 +744,91 @@ async def get_agent_state(
     )
 
 
+# The SSE stream's authoritative event source. `agent_steps` rows are committed
+# before the matching event is emitted, and they are what history replay reads, so
+# a row is durable evidence of a step in a way the in-process hub never is: the
+# hub is per-Lambda-execution-environment, this table is shared.
+#
+# `(timestamp, step_id)` is the cursor. `timestamp` alone is not a total order --
+# steps committed inside the same clock tick tie -- so the row comparison and the
+# ORDER BY must agree, or the tail either replays or skips a tied step.
+_STEP_COLUMNS = "step_id, action, result, screenshot_b64, timestamp"
+_STEP_CURSOR_ORDER = "ORDER BY timestamp ASC, step_id ASC"
+
+# Whole-run read. Shared by history replay and by the cursor tail's "no row was
+# replayed yet" case, which must read from the start rather than invent a
+# timestamp sentinel.
+_STEP_ALL_FOR_RUN_SQL = f"""
+    SELECT {_STEP_COLUMNS}
+    FROM agent_steps
+    WHERE run_id = $1
+    {_STEP_CURSOR_ORDER};
+    """
+
+# Incremental read strictly past the last row this connection already emitted.
+_STEP_TAIL_SQL = f"""
+    SELECT {_STEP_COLUMNS}
+    FROM agent_steps
+    WHERE run_id = $1 AND (timestamp, step_id) > ($2, $3)
+    {_STEP_CURSOR_ORDER};
+    """
+
+# The durable step events. A live frame carrying one of these types and a step_id
+# already streamed on this connection is a duplicate of a durable row and is
+# dropped; a frame without a step_id cannot be correlated and is always delivered.
+_DURABLE_STEP_EVENT_TYPES = frozenset(
+    {"step_complete", "step_failed", "step_unknown", "session_lost"}
+)
+
+
+def _step_row_to_event(row: Any, run_id_str: str, step_index: int) -> Dict[str, Any]:
+    """
+    Classify one `agent_steps` row into its SSE frame.
+
+    History replay and the cursor tail both route through here so the two
+    delivery paths cannot classify the same persisted row differently -- a split
+    would make a step look like it failed on one path and succeeded on the other.
+    """
+    res_str = row["result"] or ""
+    lowered = res_str.lower()
+    persisted_action = row["action"] or ""
+    is_terminal_session_lost = persisted_action == "session_lost"
+    is_unknown = lowered.startswith("outcome unknown")
+    is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
+    if is_terminal_session_lost:
+        event_type = "session_lost"
+    elif is_unknown:
+        event_type = "step_unknown"
+    else:
+        event_type = "step_failed" if is_fail else "step_complete"
+    event_data = {
+        "type": event_type,
+        "run_id": run_id_str,
+        "step_id": str(row["step_id"]),
+        "step_index": step_index,
+        "action": row["action"],
+        "result": res_str,
+        "timestamp": row["timestamp"].isoformat(),
+        "has_screenshot": bool(row["screenshot_b64"]),
+    }
+    if is_terminal_session_lost:
+        event_data["terminal"] = True
+        event_data["reattached"] = False
+    if is_fail or is_unknown:
+        event_data["error"] = res_str
+    return {
+        "event": event_type,
+        "data": json.dumps(event_data)
+    }
+
+
+async def _fetch_step_rows(sql: str, run_id: uuid.UUID, *params: Any) -> list:
+    """Execute a step read for the SSE stream and return its rows."""
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        return list(await conn.fetch(sql, run_id, *params))
+
+
 @app.get("/agent/runs/{run_id}/stream", response_class=EventSourceResponse)
 async def stream_agent_run_endpoint(
     run_id: uuid.UUID,
@@ -736,6 +842,16 @@ async def stream_agent_run_endpoint(
 
     async def event_generator():
         """Asynchronous generator yielding historical and live SSE events."""
+        # Per-connection delivery state. The agent commits a step before emitting
+        # its live event, so the same step can legitimately reach this stream three
+        # ways: history replay, the hub queue, and the cursor tail. The client
+        # appends blindly, so every durable frame is gated on this set.
+        seen_step_ids: Set[str] = set()
+        step_index = 0
+        # (timestamp, step_id) of the last durable row emitted on this connection,
+        # or None while nothing has been replayed yet.
+        cursor: Optional[tuple] = None
+
         # 1. History playback from Neon database
         try:
             pool = await get_db_pool()
@@ -755,47 +871,12 @@ async def stream_agent_run_endpoint(
                         })
                     }
 
-                step_rows = await conn.fetch(
-                    """
-                    SELECT step_id, action, result, screenshot_b64, timestamp
-                    FROM agent_steps
-                    WHERE run_id = $1
-                    ORDER BY timestamp ASC;
-                    """,
-                    run_id,
-                )
-                for idx, r in enumerate(step_rows, start=1):
-                    res_str = r["result"] or ""
-                    lowered = res_str.lower()
-                    persisted_action = r["action"] or ""
-                    is_terminal_session_lost = persisted_action == "session_lost"
-                    is_unknown = lowered.startswith("outcome unknown")
-                    is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
-                    if is_terminal_session_lost:
-                        event_type = "session_lost"
-                    elif is_unknown:
-                        event_type = "step_unknown"
-                    else:
-                        event_type = "step_failed" if is_fail else "step_complete"
-                    event_data = {
-                        "type": event_type,
-                        "run_id": run_id_str,
-                        "step_id": str(r["step_id"]),
-                        "step_index": idx,
-                        "action": r["action"],
-                        "result": res_str,
-                        "timestamp": r["timestamp"].isoformat(),
-                        "has_screenshot": bool(r["screenshot_b64"]),
-                    }
-                    if is_terminal_session_lost:
-                        event_data["terminal"] = True
-                        event_data["reattached"] = False
-                    if is_fail or is_unknown:
-                        event_data["error"] = res_str
-                    yield {
-                        "event": event_type,
-                        "data": json.dumps(event_data)
-                    }
+                step_rows = await conn.fetch(_STEP_ALL_FOR_RUN_SQL, run_id)
+                for r in step_rows:
+                    step_index += 1
+                    seen_step_ids.add(str(r["step_id"]))
+                    cursor = (r["timestamp"], r["step_id"])
+                    yield _step_row_to_event(r, run_id_str, step_index)
         except Exception as db_err:
             logger.warning(f"Error fetching historical steps for SSE stream {run_id_str}: {db_err}")
 
@@ -806,11 +887,47 @@ async def stream_agent_run_endpoint(
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15.0)
                     event_type = event.get("type", "message")
+                    hub_step_id = event.get("step_id")
+                    if (
+                        event_type in _DURABLE_STEP_EVENT_TYPES
+                        and hub_step_id is not None
+                        and str(hub_step_id) in seen_step_ids
+                    ):
+                        # Already delivered from agent_steps on this connection.
+                        continue
                     yield {
                         "event": event_type,
                         "data": json.dumps(event)
                     }
                 except asyncio.TimeoutError:
+                    # The hub went quiet. Before the keep-alive, tail the durable
+                    # table past the cursor: this is what makes live delivery
+                    # independent of which execution environment produced the step.
+                    try:
+                        if cursor is None:
+                            tail_rows = await _fetch_step_rows(
+                                _STEP_ALL_FOR_RUN_SQL, run_id
+                            )
+                        else:
+                            tail_rows = await _fetch_step_rows(
+                                _STEP_TAIL_SQL, run_id, cursor[0], cursor[1]
+                            )
+                    except Exception as tail_err:
+                        logger.warning(
+                            f"Error tailing agent_steps for SSE stream "
+                            f"{run_id_str}: {tail_err}"
+                        )
+                        tail_rows = []
+                    for r in tail_rows:
+                        step_id = str(r["step_id"])
+                        # Advance the read cursor for every row read, emitted or
+                        # not: the cursor tracks the table, not the client.
+                        cursor = (r["timestamp"], r["step_id"])
+                        if step_id in seen_step_ids:
+                            continue
+                        seen_step_ids.add(step_id)
+                        step_index += 1
+                        yield _step_row_to_event(r, run_id_str, step_index)
                     # Keep-alive ping event / comment
                     yield {
                         "event": "ping",

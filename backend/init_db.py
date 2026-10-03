@@ -56,7 +56,13 @@ CREATE TABLE IF NOT EXISTS agent_steps (
 
 -- Foreign key & query performance indexes
 DROP INDEX IF EXISTS idx_agent_steps_run_id;
-CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp ON agent_steps(run_id, timestamp ASC);
+-- The SSE stream tails agent_steps on a (timestamp, step_id) cursor, so the index
+-- must carry both columns in that order or every poll degrades into a sort of the
+-- whole run. Dropped before recreating because CREATE INDEX IF NOT EXISTS would
+-- silently keep the old two-column definition.
+DROP INDEX IF EXISTS idx_agent_steps_run_timestamp;
+CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp_step
+    ON agent_steps(run_id, timestamp ASC, step_id ASC);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_po_number ON invoices(po_number);
 """
