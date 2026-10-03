@@ -571,17 +571,29 @@ async def take_screenshot(
                     )
 
                     if saved_step_id:
+                        # The caller owns this step's identity: persist the row
+                        # under exactly that step_id whether or not it exists
+                        # yet, so the durable row and the live SSE event for the
+                        # step can be correlated. An existing row (the failure
+                        # screenshot path attaches to one) keeps its action and
+                        # result and only gains the screenshot.
                         step_uuid = uuid.UUID(str(saved_step_id))
-                        await conn.execute(
+                        new_step_id = await conn.fetchval(
                             """
-                            UPDATE agent_steps
-                            SET screenshot_b64 = $1, result = COALESCE($2, result)
-                            WHERE step_id = $3;
+                            INSERT INTO agent_steps (step_id, run_id, action, result, screenshot_b64)
+                            VALUES ($1, $2, $3, COALESCE($4::text, 'screenshot captured'), $5)
+                            ON CONFLICT (step_id) DO UPDATE SET
+                                screenshot_b64 = EXCLUDED.screenshot_b64,
+                                result = COALESCE($4::text, agent_steps.result)
+                            RETURNING step_id;
                             """,
-                            b64_str,
-                            result,
                             step_uuid,
+                            run_uuid,
+                            action or "take_screenshot",
+                            result,
+                            b64_str,
                         )
+                        saved_step_id = str(new_step_id)
                         persisted = True
                     else:
                         new_step_id = await conn.fetchval(
@@ -826,9 +838,19 @@ class PlaywrightTools:
         """Check if entity exists in database."""
         return await check_exists(entity_type=entity_type, identifier=identifier, pool=self.pool)
 
-    async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def execute(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        step_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Dynamically dispatch tool execution by name and arguments (matching LLM function calls).
+
+        `step_id` is the identity the agent loop already assigned to this step.
+        take_screenshot persists a row itself, so it must persist it under this
+        id rather than minting its own, otherwise the durable row and the live
+        event for the same step carry different identities.
         """
         name = tool_name.strip().lower()
         if name == "navigate":
@@ -843,7 +865,7 @@ class PlaywrightTools:
             return await self.select(selector=arguments.get("selector", ""), value=arguments.get("value", ""))
         elif name == "take_screenshot":
             return await self.take_screenshot(
-                step_id=arguments.get("step_id"),
+                step_id=step_id if step_id is not None else arguments.get("step_id"),
                 action=arguments.get("action", "take_screenshot"),
                 result=arguments.get("result"),
             )
