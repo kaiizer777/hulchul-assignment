@@ -836,60 +836,67 @@ async def stream_agent_run_endpoint(
 
     async def event_generator():
         """Asynchronous generator yielding historical and live SSE events."""
-        # 1. History playback from Neon database
-        try:
-            pool = await get_db_pool()
-            async with pool.acquire() as conn:
-                run_row = await conn.fetchrow(
-                    "SELECT run_id, goal, status, created_at FROM agent_runs WHERE run_id = $1;",
-                    run_id,
-                )
-                if run_row:
-                    yield {
-                        "event": "status_change",
-                        "data": json.dumps({
-                            "type": "status_change",
-                            "run_id": run_id_str,
-                            "status": run_row["status"],
-                            "timestamp": run_row["created_at"].isoformat(),
-                        })
-                    }
-
-                step_rows = await conn.fetch(
-                    """
-                    SELECT step_id, action, result, screenshot_b64, timestamp
-                    FROM agent_steps
-                    WHERE run_id = $1
-                    ORDER BY timestamp ASC;
-                    """,
-                    run_id,
-                )
-                for idx, r in enumerate(step_rows, start=1):
-                    res_str = r["result"] or ""
-                    is_fail = "failed" in res_str.lower() or "aborted" in res_str.lower()
-                    event_type = "step_failed" if is_fail else "step_complete"
-                    event_data = {
-                        "type": event_type,
-                        "run_id": run_id_str,
-                        "step_id": str(r["step_id"]),
-                        "step_index": idx,
-                        "action": r["action"],
-                        "result": res_str,
-                        "timestamp": r["timestamp"].isoformat(),
-                        "has_screenshot": bool(r["screenshot_b64"]),
-                    }
-                    if is_fail:
-                        event_data["error"] = res_str
-                    yield {
-                        "event": event_type,
-                        "data": json.dumps(event_data)
-                    }
-        except Exception as db_err:
-            logger.warning(f"Error fetching historical steps for SSE stream {run_id_str}: {db_err}")
-
-        # 2. Live event queue subscription
+        # Subscribe before reading history. An event published between the history
+        # SELECT and the subscription would land in neither delivery path and be
+        # lost from a still-open stream, so the queue buffers anything that arrives
+        # during the replay below. Replayed history can duplicate a buffered live
+        # event, which the frontend drops via its step_id dedupe.
         queue = run_event_hub.subscribe(run_id_str)
         try:
+            # 1. History playback from Neon database
+            try:
+                pool = await get_db_pool()
+                async with pool.acquire() as conn:
+                    run_row = await conn.fetchrow(
+                        "SELECT run_id, goal, status, created_at FROM agent_runs WHERE run_id = $1;",
+                        run_id,
+                    )
+                    if run_row:
+                        yield {
+                            "event": "status_change",
+                            "data": json.dumps({
+                                "type": "status_change",
+                                "run_id": run_id_str,
+                                "status": run_row["status"],
+                                "timestamp": run_row["created_at"].isoformat(),
+                            })
+                        }
+
+                    step_rows = await conn.fetch(
+                        """
+                        SELECT step_id, action, result, screenshot_b64, timestamp
+                        FROM agent_steps
+                        WHERE run_id = $1
+                        ORDER BY timestamp ASC;
+                        """,
+                        run_id,
+                    )
+                    for idx, r in enumerate(step_rows, start=1):
+                        res_str = r["result"] or ""
+                        is_fail = "failed" in res_str.lower() or "aborted" in res_str.lower()
+                        event_type = "step_failed" if is_fail else "step_complete"
+                        event_data = {
+                            "type": event_type,
+                            "run_id": run_id_str,
+                            "step_id": str(r["step_id"]),
+                            "step_index": idx,
+                            "action": r["action"],
+                            "result": res_str,
+                            "timestamp": r["timestamp"].isoformat(),
+                            "has_screenshot": bool(r["screenshot_b64"]),
+                        }
+                        if is_fail:
+                            event_data["error"] = res_str
+                        yield {
+                            "event": event_type,
+                            "data": json.dumps(event_data)
+                        }
+            except Exception as db_err:
+                # Falling through to the live loop keeps buffered events flowing
+                # instead of leaving them stranded in the queue.
+                logger.warning(f"Error fetching historical steps for SSE stream {run_id_str}: {db_err}")
+
+            # 2. Live event queue subscription, including events buffered above
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=15.0)

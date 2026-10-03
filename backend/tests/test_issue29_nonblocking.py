@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import unittest
 import uuid
@@ -137,6 +138,8 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(task.done())
 
     async def test_sse_mid_run_receives_live_event(self) -> None:
+        from backend.main import stream_agent_run_endpoint
+
         mock_pool = _make_mock_pool()
 
         async def fake_get_pool() -> MagicMock:
@@ -186,33 +189,33 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resp.status_code, 202)
                 run_id = resp.json()["run_id"]
 
-                # The SSE endpoint uses the same run_event_hub subscription as a
-                # live EventSource: subscribing mid-run must receive live events,
-                # not just history replay + ping.
-                queue = run_event_hub.subscribe(run_id)
+                # Subscribe through the real SSE endpoint *before* the run
+                # publishes, and assert the step_complete frame actually arrives on
+                # the stream. A timeout here is a delivery regression, not a pass.
+                # Frames are read from the response body iterator directly: httpx's
+                # ASGITransport buffers a whole response body, so an endless SSE
+                # stream never surfaces chunks through the HTTP client.
+                stream_resp = await stream_agent_run_endpoint(
+                    uuid.UUID(run_id),
+                    _session=Session(sub="operator", exp=9999999999),
+                )
+                frames = stream_resp.body_iterator
+                delivered: Dict[str, Any] = {}
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=6.0)
-                    self.assertEqual(event["run_id"], run_id)
-                    self.assertEqual(event["type"], "step_complete")
-                    self.assertIn("mid-run", str(event.get("result", "")))
+                    while not delivered:
+                        frame = await asyncio.wait_for(frames.__anext__(), timeout=10.0)
+                        payload = json.loads(frame["data"])
+                        if payload.get("type") == "step_complete":
+                            delivered = payload
                 finally:
-                    run_event_hub.unsubscribe(run_id, queue)
+                    await frames.aclose()
 
-                # The HTTP SSE endpoint itself must be openable mid-run while the
-                # background task is still active.
-                try:
-                    async with asyncio.timeout(2.0):
-                        async with ac.stream(
-                            "GET",
-                            f"/agent/runs/{run_id}/stream",
-                        ) as stream_resp:
-                            self.assertEqual(stream_resp.status_code, 200)
-                            self.assertIn(
-                                "text/event-stream",
-                                stream_resp.headers.get("content-type", ""),
-                            )
-                except asyncio.TimeoutError:
-                    pass
+                self.assertTrue(
+                    delivered,
+                    "SSE stream must deliver the mid-run step_complete frame",
+                )
+                self.assertEqual(delivered["run_id"], run_id)
+                self.assertIn("mid-run", str(delivered.get("result", "")))
 
                 task = _active_agent_tasks.get(run_id)
                 if task is not None:
@@ -481,3 +484,122 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(run_id, _reserved_agent_runs)
         self.assertNotIn(run_id, _active_agent_tasks)
+
+    async def test_sse_stream_has_no_history_to_live_gap(self) -> None:
+        """An event published during the history fetch must still reach the subscriber."""
+        from backend.main import stream_agent_run_endpoint
+
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = str(uuid.uuid4())
+        in_flight_step_id = str(uuid.uuid4())
+        history_step_id = str(uuid.uuid4())
+
+        history_row = {
+            "step_id": uuid.UUID(history_step_id),
+            "action": "navigate",
+            "result": "history step",
+            "screenshot_b64": None,
+            "timestamp": datetime.now(timezone.utc),
+        }
+
+        async def fetch_with_inflight_publish(*args: Any, **kwargs: Any) -> List[Any]:
+            # Simulates a step persisted + published after the subscription but
+            # while history is still being read: it is in neither the history rows
+            # nor a post-subscription live read.
+            await run_event_hub.publish(
+                run_id,
+                {
+                    "type": "step_complete",
+                    "run_id": run_id,
+                    "step_id": in_flight_step_id,
+                    "step_index": 2,
+                    "action": "click",
+                    "result": "in-flight step",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return [history_row]
+
+        mock_pool._mock_conn.fetch.side_effect = fetch_with_inflight_publish
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+        ):
+            response = await stream_agent_run_endpoint(
+                uuid.UUID(run_id),
+                _session=Session(sub="operator", exp=9999999999),
+            )
+            frames = response.body_iterator
+
+            received: List[str] = []
+            try:
+                for _ in range(2):
+                    frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+                    received.append(frame["data"])
+            finally:
+                await frames.aclose()
+
+        self.assertEqual(len(received), 2)
+        payloads = [json.loads(d) for d in received]
+        step_ids = [p.get("step_id") for p in payloads]
+        self.assertIn(history_step_id, step_ids, "history replay must still be delivered")
+        self.assertIn(
+            in_flight_step_id,
+            step_ids,
+            "event published during the history fetch must not be lost",
+        )
+
+    async def test_sse_stream_unsubscribes_when_history_fetch_fails(self) -> None:
+        """A failing history read must not leak the subscription or strand buffered events."""
+        from backend.main import stream_agent_run_endpoint
+
+        mock_pool = _make_mock_pool()
+
+        async def fake_get_pool() -> MagicMock:
+            return mock_pool
+
+        run_id = str(uuid.uuid4())
+
+        async def failing_fetch(*args: Any, **kwargs: Any) -> List[Any]:
+            # Publish, then fail: the event is buffered in the already-created
+            # subscription and must still be forwarded by the live loop.
+            await run_event_hub.publish(
+                run_id,
+                {
+                    "type": "step_complete",
+                    "run_id": run_id,
+                    "step_index": 1,
+                    "action": "navigate",
+                    "result": "ok",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            raise RuntimeError("history read failed")
+
+        mock_pool._mock_conn.fetch.side_effect = failing_fetch
+
+        with (
+            patch("backend.main.get_db_pool", new=fake_get_pool),
+            patch("backend.db.get_db_pool", new=fake_get_pool),
+        ):
+            response = await stream_agent_run_endpoint(
+                uuid.UUID(run_id),
+                _session=Session(sub="operator", exp=9999999999),
+            )
+            frames = response.body_iterator
+
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            self.assertEqual(json.loads(frame["data"])["action"], "navigate")
+            self.assertIn(run_id, run_event_hub._subscribers)
+            await frames.aclose()
+
+        self.assertNotIn(
+            run_id,
+            run_event_hub._subscribers,
+            "subscription must be released exactly once on exit",
+        )
