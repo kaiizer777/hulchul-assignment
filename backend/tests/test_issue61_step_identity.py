@@ -43,6 +43,7 @@ class _FakeConn:
         self._pool = pool
 
     async def fetchval(self, query: str, *args: Any) -> Any:
+        """Record an agent_steps insert and hand back the id it was written under."""
         flat = " ".join(query.split())
         if flat.startswith("SELECT count(*) FROM agent_steps"):
             return len(self._pool.rows)
@@ -69,6 +70,7 @@ class _FakeConn:
         return step_id
 
     async def execute(self, query: str, *args: Any) -> str:
+        """Serve the run-status writes and screenshot attachment updates."""
         flat = " ".join(query.split())
         if "INSERT INTO agent_runs" in flat:
             self._pool.runs.setdefault(args[0], "running")
@@ -91,9 +93,11 @@ class _FakeStepPool:
         self.conn = _FakeConn(self)
 
     def acquire(self) -> _FakeAcquire:
+        """Return the asyncpg acquire() context manager shape."""
         return _FakeAcquire(self.conn)
 
     def rows_for(self, action: str) -> List[Dict[str, Any]]:
+        """Every persisted row carrying this action."""
         return [row for row in self.rows.values() if row["action"] == action]
 
 
@@ -107,6 +111,7 @@ def _mock_redis() -> MagicMock:
 
 
 def _mock_tools() -> MagicMock:
+    """Tool double whose every dispatch succeeds, so the loop reaches the emits."""
     tools = MagicMock(spec=PlaywrightTools)
     tools.page = MagicMock()
     tools.page.is_closed = MagicMock(return_value=False)
@@ -121,6 +126,7 @@ def _mock_tools() -> MagicMock:
 
 
 def _session_lost_snapshot() -> Dict[str, Any]:
+    """A read_page result the loop must classify as a lost browser session."""
     return {
         "success": False,
         "error": "Target page, context or browser has been closed",
@@ -129,6 +135,7 @@ def _session_lost_snapshot() -> Dict[str, Any]:
 
 
 def _groq_tool_call(name: str, arguments: Dict[str, Any]) -> MagicMock:
+    """One Groq completion carrying a single tool call."""
     message = MagicMock()
     call = MagicMock()
     call.id = f"call_{name}"
@@ -140,6 +147,7 @@ def _groq_tool_call(name: str, arguments: Dict[str, Any]) -> MagicMock:
 
 
 def _groq_done(text: str = "Done.") -> MagicMock:
+    """One Groq completion with no tool calls, which ends the loop."""
     message = MagicMock()
     message.tool_calls = None
     message.content = text
@@ -147,6 +155,7 @@ def _groq_done(text: str = "Done.") -> MagicMock:
 
 
 def _groq(responses: List[Any]) -> MagicMock:
+    """A Groq double replaying `responses` in order."""
     completions = MagicMock()
     completions.create = AsyncMock(side_effect=responses)
     groq = MagicMock()
@@ -162,8 +171,10 @@ def _agent(
     max_iterations: int = 5,
     reconnect: Any = None,
 ) -> ReActAgent:
+    """A runnable agent whose emitted events are collected into `events`."""
 
     async def _on_event(event: Dict[str, Any]) -> None:
+        """Append one emitted event."""
         events.append(event)
 
     return ReActAgent(
@@ -187,11 +198,20 @@ class TestStepIdentityOnFailurePaths(unittest.IsolatedAsyncioTestCase):
         events: List[Dict[str, Any]] = []
         tools = _mock_tools()
 
-        async def _boom(*args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("groq upstream 503")
+        # A list side_effect is never awaited by AsyncMock, so the 503 has to
+        # come from a callable that raises on the first call and lets the second
+        # one through, or the run would never take the failure path at all.
+        calls = {"n": 0}
+
+        async def _create(*args: Any, **kwargs: Any) -> Any:
+            """Fail the first completion with a 503, then let the next one through."""
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("groq upstream 503")
+            return _groq_done()
 
         completions = MagicMock()
-        completions.create = AsyncMock(side_effect=[_boom(), _groq_done()])
+        completions.create = AsyncMock(side_effect=_create)
         groq = MagicMock()
         groq.chat = MagicMock(completions=completions)
 
@@ -263,6 +283,7 @@ class TestStepIdentityOnFailurePaths(unittest.IsolatedAsyncioTestCase):
         )
 
         async def _reconnect() -> Any:
+            """Hand back a fresh open page, as the CDP reconnect callback would."""
             page = MagicMock()
             page.is_closed = MagicMock(return_value=False)
             return page

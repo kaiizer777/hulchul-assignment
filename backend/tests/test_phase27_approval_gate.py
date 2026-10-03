@@ -433,8 +433,12 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
         # Track tool executions
         executed_tools: List[str] = []
 
-        async def mock_execute(tool_name: str, args: Dict[str, Any]):
-            """Mock tool execution callback tracking executed tool names."""
+        async def mock_execute(tool_name: str, args: Dict[str, Any], step_id: Optional[str] = None):
+            """Mock tool execution callback tracking executed tool names.
+
+            `step_id` mirrors PlaywrightTools.execute, which the agent loop now
+            passes as the identity it already minted for the step.
+            """
             executed_tools.append(tool_name)
             return {"success": True, "action": tool_name}
 
@@ -544,8 +548,12 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         executed_tools: List[str] = []
 
-        async def mock_execute(tool_name: str, args: Dict[str, Any]):
-            """Mock tool execution callback tracking executed tool names."""
+        async def mock_execute(tool_name: str, args: Dict[str, Any], step_id: Optional[str] = None):
+            """Mock tool execution callback tracking executed tool names.
+
+            `step_id` mirrors PlaywrightTools.execute, which the agent loop now
+            passes as the identity it already minted for the step.
+            """
             executed_tools.append(tool_name)
             return {"success": True, "action": tool_name}
 

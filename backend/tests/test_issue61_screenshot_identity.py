@@ -59,6 +59,7 @@ class _FakeConn:
         self._pool = pool
 
     async def fetchval(self, query: str, *args: Any) -> Any:
+        """Serve every single-row read/write the loop and the tool issue."""
         flat = " ".join(query.split())
         if flat.startswith("SELECT count(*) FROM agent_steps"):
             return len(self._pool.rows)
@@ -122,6 +123,7 @@ class _FakeConn:
         return step_id
 
     async def execute(self, query: str, *args: Any) -> str:
+        """Serve the run upserts and the screenshot attachment update."""
         flat = " ".join(query.split())
         if "INSERT INTO agent_runs" in flat:
             self._pool.runs.setdefault(args[0], "running")
@@ -141,6 +143,7 @@ class _FakeConn:
         raise AssertionError(f"unexpected execute query: {flat}")
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
+        """Serve the agent_runs read behind the stream's status_change replay."""
         flat = " ".join(query.split())
         if flat.startswith("SELECT run_id, goal, status, created_at FROM agent_runs"):
             run_id = args[0]
@@ -188,13 +191,16 @@ class _FakeStepPool:
         self.conn = _FakeConn(self)
 
     def acquire(self) -> _FakeAcquire:
+        """Return the asyncpg acquire() context manager shape."""
         return _FakeAcquire(self.conn)
 
     def rows_for(self, action: str) -> List[Dict[str, Any]]:
+        """Every persisted row carrying this action."""
         return [row for row in self.rows.values() if row["action"] == action]
 
 
 def _mock_redis() -> MagicMock:
+    """Unconfigured Redis, so the run skips pause and resume handling."""
     redis = MagicMock()
     redis.is_configured = False
     redis.set_session_state = AsyncMock(return_value=True)
@@ -203,6 +209,7 @@ def _mock_redis() -> MagicMock:
 
 
 def _fake_page(screenshot_b64: str = "c2NyZWVuc2hvdA==") -> MagicMock:
+    """A Playwright-shaped page whose screenshot returns real PNG bytes."""
     page = MagicMock()
     page.is_closed = MagicMock(return_value=False)
     page.screenshot = AsyncMock(return_value=b"png-bytes")
@@ -223,6 +230,7 @@ def _real_tools(pool: _FakeStepPool, run_id: str) -> PlaywrightTools:
 
 
 def _groq(responses: List[Any]) -> MagicMock:
+    """A Groq double replaying `responses` in order."""
     completions = MagicMock()
     completions.create = AsyncMock(side_effect=responses)
     groq = MagicMock()
@@ -231,6 +239,7 @@ def _groq(responses: List[Any]) -> MagicMock:
 
 
 def _groq_tool_call(name: str, arguments: Dict[str, Any]) -> MagicMock:
+    """One Groq completion carrying a single tool call."""
     message = MagicMock()
     call = MagicMock()
     call.id = f"call_{name}"
@@ -242,6 +251,7 @@ def _groq_tool_call(name: str, arguments: Dict[str, Any]) -> MagicMock:
 
 
 def _groq_done(text: str = "All invoices processed.") -> MagicMock:
+    """One Groq completion with no tool calls, which ends the loop."""
     message = MagicMock()
     message.tool_calls = None
     message.content = text
@@ -249,6 +259,7 @@ def _groq_done(text: str = "All invoices processed.") -> MagicMock:
 
 
 def _screenshot_run_groq() -> MagicMock:
+    """A run that takes one screenshot and then reports the goal done."""
     return _groq(
         [
             _groq_tool_call("take_screenshot", {}),
@@ -258,7 +269,10 @@ def _screenshot_run_groq() -> MagicMock:
 
 
 def _collect(events: List[Dict[str, Any]]) -> Any:
+    """An on_event callback that appends every emitted event."""
+
     async def _on_event(event: Dict[str, Any]) -> None:
+        """Append one emitted event."""
         events.append(event)
 
     return _on_event
@@ -266,6 +280,7 @@ def _collect(events: List[Dict[str, Any]]) -> Any:
 
 class TestTakeScreenshotStepIdentity(unittest.IsolatedAsyncioTestCase):
     async def _agent(self, pool: _FakeStepPool, run_id: str, tools: Any, groq: Any, max_iterations: int = 5) -> ReActAgent:
+        """An agent with its run row already in place, ready to run."""
         agent = ReActAgent(
             run_id=run_id,
             tools=tools,
@@ -281,6 +296,7 @@ class TestTakeScreenshotStepIdentity(unittest.IsolatedAsyncioTestCase):
         """Open the real SSE endpoint against the in-memory table, poll interval collapsed."""
 
         async def fake_get_pool() -> _FakeStepPool:
+            """Point every pool lookup at the in-memory table."""
             return pool
 
         for active in (
