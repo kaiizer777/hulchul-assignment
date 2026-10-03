@@ -8,4 +8,5 @@ httpx
 pytest
 pytest-asyncio
 sse-starlette
+argon2-cffi
 

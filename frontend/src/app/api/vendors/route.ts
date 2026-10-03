@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { unauthorizedIfNoSession } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { VendorDTO } from '@/lib/types';
 
@@ -20,7 +21,13 @@ function toVendorId(name: string): string {
     .replace(/(^-|-$)/g, '');
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  // Checked before the query: the catch block below degrades to a hardcoded
+  // vendor list on failure, so a guard placed after it would be bypassable by
+  // anything that could make the database error out.
+  const denied = await unauthorizedIfNoSession(request);
+  if (denied) return denied;
+
   try {
     const sql = getDb();
     const rows = (await sql`

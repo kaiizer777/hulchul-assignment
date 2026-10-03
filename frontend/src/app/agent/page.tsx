@@ -2,7 +2,33 @@
 
 import React, { useState, useEffect, useRef, useTransition } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
-import { getBackendUrl, unreachableBackendMessage } from '@/lib/backend-url';
+
+/**
+ * Every agent request goes through this origin's own proxy instead of the
+ * backend's absolute URL.
+ *
+ * `EventSource` cannot attach a session cookie to a cross-origin request, so a
+ * stream opened against the backend host directly would always come back
+ * unauthenticated. Routing through `/api/agent` keeps the browser same-origin,
+ * which is what makes both the cookie and the stream work.
+ */
+const AGENT_API_BASE = '/api/agent';
+
+/**
+ * Builds the message for a request that failed below the HTTP layer, where no
+ * response was ever produced.
+ *
+ * It deliberately does not claim the server never saw the request: a rejected
+ * fetch cannot distinguish "never arrived" from "arrived and was refused", and
+ * `POST /agent/run` only returns a run id after the agent loop has already
+ * executed on the backend. Asserting no run started would invite a duplicate
+ * submission of side-effecting work, so the operator is told to check the run
+ * status instead.
+ */
+const agentProxyUnreachableMessage = (): string =>
+  `Cannot read a response from the agent proxy at ${AGENT_API_BASE} on this origin. ` +
+  'The request may have reached the backend, so the run status may be unknown: ' +
+  'check it before retrying. This origin, its proxy, or the backend behind it may be down.';
 
 /**
  * Interface representing a recorded agent step event.
@@ -173,11 +199,13 @@ export default function AgentControlPage() {
     if (!runId) return;
     setIsFetchingVerification(true);
     setVerificationError(null);
-    const backendUrl = getBackendUrl();
     try {
       let res: Response;
       try {
-        res = await fetch(`${backendUrl}/agent/runs/${runId}/verification`);
+        res = await fetch(
+          `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/verification`,
+          { credentials: 'include' }
+        );
       } catch {
         throw new BackendUnreachableError();
       }
@@ -190,7 +218,7 @@ export default function AgentControlPage() {
     } catch (err: unknown) {
       setVerificationError(
         err instanceof BackendUnreachableError
-          ? unreachableBackendMessage(backendUrl)
+          ? agentProxyUnreachableMessage()
           : err instanceof Error
             ? err.message
             : 'Failed to fetch verification report'
@@ -221,13 +249,12 @@ export default function AgentControlPage() {
     setStatus("running");
     submittedNonceRef.current = null;
 
-    const backendUrl = getBackendUrl();
-
     try {
       let res: Response;
       try {
-        res = await fetch(`${backendUrl}/agent/run`, {
+        res = await fetch(`${AGENT_API_BASE}/run`, {
           method: 'POST',
+          credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ goal: goal.trim() }),
         });
@@ -249,7 +276,7 @@ export default function AgentControlPage() {
       // gets its own message, so "backend unreachable" stays trustworthy.
       setError(
         err instanceof BackendUnreachableError
-          ? unreachableBackendMessage(backendUrl)
+          ? agentProxyUnreachableMessage()
           : err instanceof Error
             ? err.message
             : 'Failed to start agent run'
@@ -269,7 +296,9 @@ export default function AgentControlPage() {
     const abortController = new AbortController();
 
     try {
-      eventSource = new EventSource(`${getBackendUrl()}/agent/runs/${runId}/stream`);
+      // Same-origin, so the session cookie rides along automatically and the
+      // stream needs no CORS preflight to stay open.
+      eventSource = new EventSource(`${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/stream`);
 
       eventSource.onmessage = (event) => {
         try {
@@ -332,9 +361,13 @@ export default function AgentControlPage() {
     // Poll approval endpoint periodically while run is active or awaiting approval
     pollInterval = setInterval(async () => {
       try {
-        const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/approval`, {
-          signal: abortController.signal,
-        });
+        const res = await fetch(
+          `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/approval`,
+          {
+            signal: abortController.signal,
+            credentials: 'include',
+          }
+        );
         if (res.ok) {
           const data = await res.json();
           if (data.pending && data.approval_data) {
@@ -370,9 +403,13 @@ export default function AgentControlPage() {
     const endpoint = isCurrentlyPaused ? 'resume' : 'pause';
 
     try {
-      const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/${endpoint}`, {
-        method: 'POST',
-      });
+      const res = await fetch(
+        `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/${endpoint}`,
+        {
+          method: 'POST',
+          credentials: 'include',
+        }
+      );
       if (!res.ok) throw new Error(`Failed to ${endpoint} run`);
       setStatus(isCurrentlyPaused ? 'running' : 'paused');
     } catch (err: unknown) {
@@ -392,14 +429,18 @@ export default function AgentControlPage() {
     submittedNonceRef.current = approvalData.nonce;
 
     try {
-      const res = await fetch(`${getBackendUrl()}/agent/runs/${runId}/approval`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          decision,
-          nonce: approvalData.nonce,
-        }),
-      });
+      const res = await fetch(
+        `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/approval`,
+        {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            decision,
+            nonce: approvalData.nonce,
+          }),
+        }
+      );
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
@@ -423,7 +464,10 @@ export default function AgentControlPage() {
     if (!stepIdentifier) return;
     setIsFetchingScreenshot(true);
     try {
-      const res = await fetch(`${getBackendUrl()}/agent/steps/${stepIdentifier}`);
+      const res = await fetch(
+        `${AGENT_API_BASE}/steps/${encodeURIComponent(stepIdentifier)}`,
+        { credentials: 'include' }
+      );
       if (!res.ok) throw new Error('Failed to load screenshot');
       const data = await res.json();
       if (data.screenshot_b64) {

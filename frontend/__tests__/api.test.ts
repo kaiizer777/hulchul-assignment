@@ -7,6 +7,16 @@ vi.mock('@/lib/db', () => ({
   getDb: () => mockSql,
 }));
 
+// Every handler is session-guarded inside the handler itself. These tests cover
+// the query and mapping behaviour behind the guard, so a valid session is
+// stubbed; the 401 path is covered in agent-api.test.ts.
+vi.mock('@/lib/auth', () => ({
+  unauthorizedIfNoSession: async () => null,
+}));
+
+const request = (path: string, init?: RequestInit) =>
+  new Request(`http://localhost:3051${path}`, init);
+
 describe('API Route Unit Tests', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -38,7 +48,7 @@ describe('API Route Unit Tests', () => {
       mockSql.mockResolvedValueOnce(mockRows);
 
       const { GET } = await import('@/app/api/invoices/route');
-      const response = await GET();
+      const response = await GET(request('/api/invoices'));
 
       expect(response.status).toBe(200);
 
@@ -148,7 +158,7 @@ describe('API Route Unit Tests', () => {
       mockSql.mockResolvedValueOnce(mockPoRows);
 
       const { GET } = await import('@/app/api/purchase-orders/route');
-      const response = await GET();
+      const response = await GET(request('/api/purchase-orders'));
 
       expect(response.status).toBe(200);
 
@@ -183,7 +193,7 @@ describe('API Route Unit Tests', () => {
       mockSql.mockResolvedValueOnce(mockVendorRows);
 
       const { GET } = await import('@/app/api/vendors/route');
-      const response = await GET();
+      const response = await GET(request('/api/vendors'));
 
       expect(response.status).toBe(200);
 
