@@ -198,9 +198,12 @@ class TestStepIdentityOnFailurePaths(unittest.IsolatedAsyncioTestCase):
         events: List[Dict[str, Any]] = []
         tools = _mock_tools()
 
-        # A list side_effect is never awaited by AsyncMock, so the 503 has to
-        # come from a callable that raises on the first call and lets the second
-        # one through, or the run would never take the failure path at all.
+        # AsyncMock hands an iterable side_effect entry back as the call's value
+        # and never awaits it: an exception entry is raised, a coroutine entry is
+        # returned unrun. So the simulated 503 has to come from a callable that
+        # raises on the first call and returns a completion on the next, or the
+        # loop would take the failure path by tripping over a coroutine object
+        # instead of over the error.
         calls = {"n": 0}
 
         async def _create(*args: Any, **kwargs: Any) -> Any:

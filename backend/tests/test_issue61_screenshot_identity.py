@@ -161,18 +161,22 @@ class _FakeConn:
         """Serve the two SSE step queries over the in-memory table."""
         if query not in (_SSE_STEPS_ALL_SQL, _SSE_STEPS_AFTER_CURSOR_SQL):
             raise AssertionError(f"unexpected agent_steps query: {' '.join(query.split())}")
-        self._pool.step_reads += 1
         ordered = sorted(
             (r for r in self._pool.rows.values() if r["run_id"] == run_uuid),
             key=lambda r: (r["timestamp"], r["step_id"]),
         )
         if query == _SSE_STEPS_AFTER_CURSOR_SQL:
             cursor_timestamp, cursor_step_id = args
-            return [
+            result = [
                 r for r in ordered
                 if (r["timestamp"], r["step_id"]) > (cursor_timestamp, cursor_step_id)
             ]
-        return list(ordered)
+        else:
+            result = list(ordered)
+        # Record what each read returned, so a test can tell the connect-time
+        # replay apart from a poll that ran after the run committed its rows.
+        self._pool.reads.append([r["step_id"] for r in result])
+        return result
 
 
 class _FakeStepPool:
@@ -185,8 +189,10 @@ class _FakeStepPool:
         self.write_counts: Dict[str, int] = {}
         # Step ids tools.take_screenshot persisted under the caller's id.
         self.tool_written_step_ids: List[uuid.UUID] = []
-        # Times the stream read agent_steps, over either SSE query.
-        self.step_reads = 0
+        # Step ids returned by each agent_steps read, in order. The first entry is
+        # the connect-time replay, so a test can assert on the reads that happened
+        # after the run committed its rows rather than on a bare read count.
+        self.reads: List[List[uuid.UUID]] = []
         self.created_at = datetime.now(timezone.utc)
         self.conn = _FakeConn(self)
 
@@ -333,6 +339,10 @@ class TestTakeScreenshotStepIdentity(unittest.IsolatedAsyncioTestCase):
             payloads.append(json.loads(frame["data"]))
             self.assertEqual(payloads[0]["type"], "status_change")
 
+            # Everything the stream read before this point is the connect-time
+            # replay, which happens while agent_steps is still empty.
+            replay_reads = len(pool.reads)
+
             await agent.run(goal="Process all pending invoices")
 
             # Drain every queued live frame and every poll cycle over the rows
@@ -378,10 +388,14 @@ class TestTakeScreenshotStepIdentity(unittest.IsolatedAsyncioTestCase):
             pool.tool_written_step_ids,
             "the durable screenshot row must be the one the live event names",
         )
-        self.assertGreaterEqual(
-            pool.step_reads,
-            1,
-            "the poll must have run over the row, or the duplicate could not have surfaced",
+        # The poll has to have read the row the run committed, otherwise the
+        # duplicate this test guards could not have surfaced and the assertion
+        # above would hold for the wrong reason.
+        screenshot_step_id = pool.tool_written_step_ids[0]
+        self.assertTrue(
+            any(screenshot_step_id in read for read in pool.reads[replay_reads:]),
+            "no read after the run returned the screenshot row, so the poll never "
+            f"saw it: reads were {pool.reads}",
         )
 
     async def test_screenshot_step_inserts_exactly_one_row(self) -> None:
