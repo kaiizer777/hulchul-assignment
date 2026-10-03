@@ -102,6 +102,108 @@ class TestPhase27ApprovalGateUnit(unittest.TestCase):
             {"run_id": agent.run_id, "error": "Redis not configured"},
         )
 
+    def test_05_missing_nonce_on_pending_fails_closed(self):
+        """Verify POST approval fails closed (400) when pending record has no nonce."""
+        async def _run():
+            import time
+            from backend.auth import Session, require_session
+            test_run_id = f"test-nonce-missing-{uuid.uuid4().hex[:6]}"
+            mock_redis = MagicMock()
+            mock_redis.get_approval_pending = AsyncMock(
+                return_value={
+                    "run_id": test_run_id,
+                    "status": "awaiting_approval",
+                    "vendor": "Acme Corp",
+                    "amount": 85000.0,
+                }
+            )
+            mock_redis.set_approval_decision = AsyncMock(return_value=True)
+            app.dependency_overrides[require_session] = lambda: Session(
+                sub="operator", exp=int(time.time()) + 3600
+            )
+            try:
+                with patch("backend.redis_client.get_redis_client", return_value=mock_redis):
+                    transport = ASGITransport(app=app)
+                    async with AsyncClient(transport=transport, base_url="http://test") as client:
+                        res_with_nonce = await client.post(
+                            f"/agent/runs/{test_run_id}/approval",
+                            json={"decision": "approved", "nonce": "anything"},
+                        )
+                        self.assertEqual(res_with_nonce.status_code, 400)
+                        res_no_nonce = await client.post(
+                            f"/agent/runs/{test_run_id}/approval",
+                            json={"decision": "approved"},
+                        )
+                        self.assertEqual(res_no_nonce.status_code, 400)
+                        res_reject = await client.post(
+                            f"/agent/runs/{test_run_id}/approval",
+                            json={"decision": "rejected", "nonce": "anything"},
+                        )
+                        self.assertEqual(res_reject.status_code, 400)
+                        mock_redis.set_approval_decision.assert_not_called()
+            finally:
+                app.dependency_overrides.pop(require_session, None)
+        asyncio.run(_run())
+
+    def test_06_bare_string_decision_not_accepted(self):
+        """Verify bare-string and nonce-less decisions are not accepted as approved."""
+        async def _run_redis():
+            redis = UpstashRedisClient(url="http://127.0.0.1:1", token="dummy")
+            redis.execute_command = AsyncMock(return_value="approved")
+            self.assertIsNone(await redis.get_approval_decision_record("run-123"))
+            redis.execute_command = AsyncMock(
+                return_value=json.dumps({"decision": "approved"})
+            )
+            self.assertIsNone(await redis.get_approval_decision_record("run-123"))
+            redis.execute_command = AsyncMock(
+                return_value=json.dumps({"decision": "approved", "nonce": None})
+            )
+            self.assertIsNone(await redis.get_approval_decision_record("run-123"))
+            redis.execute_command = AsyncMock(
+                return_value=json.dumps({"decision": "approved", "nonce": "abc123"})
+            )
+            rec = await redis.get_approval_decision_record("run-123")
+            self.assertIsNotNone(rec)
+            self.assertEqual(rec["decision"], "approved")
+            self.assertEqual(rec["nonce"], "abc123")
+        asyncio.run(_run_redis())
+
+        async def _run_agent():
+            import dataclasses
+            import backend.agent as agent_module
+            orig_settings = agent_module.settings
+            agent_module.settings = dataclasses.replace(
+                orig_settings, APPROVAL_TIMEOUT_SECONDS=0.3
+            )
+            try:
+                mock_redis = MagicMock(spec=UpstashRedisClient)
+                mock_redis.is_configured = True
+                mock_redis.execute_command = AsyncMock(return_value=None)
+                mock_redis.set_approval_pending = AsyncMock(return_value=True)
+                mock_redis.set_session_state = AsyncMock(return_value=True)
+                mock_redis.get_approval_decision_record = AsyncMock(
+                    return_value={"decision": "approved", "nonce": None}
+                )
+                mock_redis.clear_approval = AsyncMock(return_value=True)
+                agent = ReActAgent(
+                    run_id=str(uuid.uuid4()),
+                    tools=MagicMock(spec=PlaywrightTools),
+                    redis_client=mock_redis,
+                )
+                agent.update_run_status = AsyncMock()
+                agent.emit_event = AsyncMock()
+                agent.persist_step = AsyncMock(return_value="step-id")
+                outcome = await agent.handle_approval_gate(
+                    vendor="Acme Corp",
+                    amount=62000.0,
+                    invoice_id="inv-123",
+                    po_number="PO-1006",
+                )
+                self.assertEqual(outcome, "stalled")
+            finally:
+                agent_module.settings = orig_settings
+        asyncio.run(_run_agent())
+
 
 @unittest.skipUnless(
     bool(settings.DATABASE_URL and settings.UPSTASH_REDIS_REST_URL),

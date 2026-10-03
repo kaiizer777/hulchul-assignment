@@ -632,9 +632,9 @@ class ReActAgent:
 
             if dec_record:
                 dec_nonce = dec_record.get("nonce")
-                # If a nonce was attached, ensure it matches current request
-                if dec_nonce and dec_nonce != request_nonce:
-                    logger.warning(f"Agent {self.run_id}: Stale decision nonce {dec_nonce} != {request_nonce}; ignoring.")
+                # Fail closed: require a matching nonce for the current request
+                if not dec_nonce or dec_nonce != request_nonce:
+                    logger.warning(f"Agent {self.run_id}: Ignoring decision without valid matching nonce (got {dec_nonce!r}).")
                     continue
                 dec_str = dec_record.get("decision")
                 if dec_str in ("approved", "rejected"):

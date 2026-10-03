@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from typing import Any, Dict, Optional, Union
 import httpx
 
@@ -144,12 +145,14 @@ class UpstashRedisClient:
         data: Dict[str, Any],
         ttl_seconds: int = 86400,
     ) -> bool:
-        """Write approval-pending state to Redis."""
+        """Write approval-pending state to Redis. Generates and persists a nonce when missing."""
         key = f"hulchul:approval:{run_id}"
         # Ensure status is awaiting_approval
         payload = dict(data)
         payload["run_id"] = run_id
         payload["status"] = "awaiting_approval"
+        if not payload.get("nonce"):
+            payload["nonce"] = uuid.uuid4().hex[:12]
         res = await self.execute_command("SET", key, json.dumps(payload), "EX", ttl_seconds)
         return res == "OK"
 
@@ -196,7 +199,7 @@ class UpstashRedisClient:
         return None
 
     async def get_approval_decision_record(self, run_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve detailed approval decision record with nonce."""
+        """Retrieve detailed approval decision record with nonce. Fail closed on nonce-less records."""
         key = f"hulchul:decision:{run_id}"
         res = await self.execute_command("GET", key)
         if not res:
@@ -205,11 +208,13 @@ class UpstashRedisClient:
             try:
                 parsed = json.loads(res)
                 if isinstance(parsed, dict) and "decision" in parsed:
+                    if not parsed.get("nonce"):
+                        return None
                     return parsed
             except Exception:
                 pass
-            if res in ("approved", "rejected"):
-                return {"decision": res, "nonce": None}
+            # Bare-string legacy format carries no nonce: fail closed, do not accept.
+            return None
         return None
 
     async def clear_approval(self, run_id: str) -> bool:
