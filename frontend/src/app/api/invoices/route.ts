@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { unauthorizedIfNoSession } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { CreateInvoiceSchema, formatInvoice, RawInvoiceRow } from '@/lib/types';
 
@@ -50,9 +51,16 @@ function shouldSimulateFailure(request: Request, url: URL): boolean {
 /**
  * Handles GET requests to retrieve all invoices ordered by creation date and ID descending.
  *
+ * @param request - The incoming HTTP request, used for the session guard.
  * @returns NextResponse containing the array of formatted invoices or an error response.
  */
-export async function GET() {
+export async function GET(request: Request) {
+  // Re-verified per request inside the handler, before any query runs. Route
+  // handlers are public endpoints regardless of what the UI links to, so the
+  // session cannot be checked anywhere less direct than this.
+  const denied = await unauthorizedIfNoSession(request);
+  if (denied) return denied;
+
   try {
     const sql = getDb();
     const rows = (await sql`
@@ -79,6 +87,11 @@ export async function GET() {
  * @returns NextResponse with the created invoice, validation errors, or simulated ERP failure.
  */
 export async function POST(request: Request) {
+  // Guard first: an unauthenticated caller must not be able to reach the failure
+  // injection counter, the validator or the database.
+  const denied = await unauthorizedIfNoSession(request);
+  if (denied) return denied;
+
   try {
     const url = new URL(request.url);
     try {

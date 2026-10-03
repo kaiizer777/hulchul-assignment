@@ -24,10 +24,21 @@ class Settings:
     UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
     NEXT_PUBLIC_API_URL: str = os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3051")
     PORT: int = int(os.getenv("PORT", "8051"))
+    # Exact origins only. A bare "*" is invalid alongside allow_credentials and a
+    # literal "https://*.pages.dev" is silently ignored by Starlette, so both used
+    # to be dead config that made the wildcard the real allowlist.
     CORS_ORIGINS: str = os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:3051,http://127.0.0.1:3051,https://*.pages.dev,*"
+        "http://localhost:3051,http://127.0.0.1:3051,https://hulchul-frontend.sufiyanx.workers.dev"
     )
+
+    # Auth settings. AUTH_PASSWORD_HASH is an argon2id PHC string; leaving it unset
+    # disables login entirely (503) rather than falling back to any default secret.
+    AUTH_PASSWORD_HASH: str = os.getenv("AUTH_PASSWORD_HASH", "")
+    AUTH_SESSION_TTL_SECONDS: int = int(os.getenv("AUTH_SESSION_TTL_SECONDS", "86400"))
+    # /docs, /redoc and /openapi.json sit outside the session guard and publish
+    # every route to anonymous callers, so they stay off unless asked for.
+    ENABLE_API_DOCS: bool = os.getenv("ENABLE_API_DOCS", "false").lower() == "true"
     SIMULATE_FAILURE_AFTER: Optional[int] = (
         int(os.getenv("SIMULATE_FAILURE_AFTER"))
         if os.getenv("SIMULATE_FAILURE_AFTER")

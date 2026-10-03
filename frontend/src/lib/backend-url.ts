@@ -11,7 +11,10 @@ const LOCAL_HOSTNAMES = ['localhost', '127.0.0.1'];
  *      build time. This is the only tier that works for a deployed bundle.
  *   2. `http://localhost:8051`, but only when the page is actually being served
  *      from a local development host.
- *   3. The production Lambda Function URL, as an explicit default.
+ *   3. `http://localhost:8051` for server-side calls outside production
+ *      (`NODE_ENV !== 'production'`, inlined at build time), so a local dev
+ *      login never POSTs a real password to the production backend.
+ *   4. The production Lambda Function URL, as an explicit default.
  *
  * The last tier is deliberately not `localhost`. A browser that resolves to
  * `http://localhost:8051` sends the request to the visitor's own machine, which
@@ -25,6 +28,9 @@ export const getBackendUrl = (): string => {
     return configured.replace(/\/$/, '');
   }
   if (typeof window !== 'undefined' && LOCAL_HOSTNAMES.includes(window.location.hostname)) {
+    return LOCAL_BACKEND_URL;
+  }
+  if (process.env.NODE_ENV !== 'production') {
     return LOCAL_BACKEND_URL;
   }
   return PRODUCTION_BACKEND_URL;

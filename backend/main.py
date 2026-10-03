@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, Set
-from fastapi import FastAPI, Depends, status, HTTPException, Query
+from fastapi import FastAPI, Depends, Request, Response, status, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
 import asyncpg
@@ -15,6 +15,23 @@ from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
 from backend.verification import VerificationReport, generate_verification_report
+from backend.auth import (
+    AUTH_UNAVAILABLE_DETAIL,
+    INVALID_CREDENTIALS_DETAIL,
+    Session,
+    clear_login_failures,
+    clear_session_cookie,
+    client_ip,
+    create_session,
+    destroy_session,
+    enforce_login_rate_limit,
+    is_https_request,
+    read_session_token,
+    record_login_failure,
+    require_session,
+    set_session_cookie,
+    verify_password,
+)
 
 
 class RunEventHub:
@@ -81,27 +98,49 @@ app = FastAPI(
     version="0.2.0",
     description="FastAPI ReAct Agent Backend with Remote CDP Browser Automation",
     lifespan=lifespan,
+    # The interactive docs and the OpenAPI schema are unauthenticated and are not
+    # covered by the session guard, so leaving them on publishes every route --
+    # including /auth/login -- to anyone who can reach the Lambda URL. Off unless
+    # explicitly requested; the contract is deny-by-default.
+    docs_url="/docs" if settings.ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if settings.ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if settings.ENABLE_API_DOCS else None,
 )
 
 # CORS configuration for Next.js frontend and Cloudflare Workers via dynamic settings
 def get_allowed_origins() -> list[str]:
     """
-    Parse and return allowed CORS origins from settings.CORS_ORIGINS and NEXT_PUBLIC_API_URL.
-    Supports comma-separated lists, wildcards, and Cloudflare Workers domains.
+    Build the CORS origin allowlist as exact origins only.
+
+    Wildcards are dropped rather than expanded: `*` is invalid together with
+    allow_credentials, and Starlette has never supported host globs, so both used
+    to be dead config that left `*` doing all the work.
     """
-    origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
-    if settings.NEXT_PUBLIC_API_URL and settings.NEXT_PUBLIC_API_URL not in origins:
-        origins.append(settings.NEXT_PUBLIC_API_URL)
+    candidates = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    candidates.append(settings.NEXT_PUBLIC_API_URL)
+
+    origins: list[str] = []
+    for origin in candidates:
+        if not origin or "*" in origin:
+            if origin:
+                logger.warning(f"Ignoring non-exact CORS origin '{origin}'")
+            continue
+        if origin not in origins:
+            origins.append(origin)
     return origins
+
 
 allowed_origins = get_allowed_origins()
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    # Credentials stay on because the session rides in a cookie. Per the CORS spec
+    # `*` is not a legal value alongside credentials, so removing `*` above also
+    # fixes that latent misconfiguration.
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "Cookie"],
 )
 
 
@@ -157,6 +196,50 @@ class ToolsResponse(BaseModel):
     tools: list[Dict[str, Any]]
 
 
+# ---------------------------------------------------------------------------
+# Authentication (single operator, cookie session)
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    """Login credential payload. JSON only: python-multipart is intentionally absent."""
+    model_config = ConfigDict(extra="forbid")
+    password: str
+
+
+@app.post("/auth/login", response_model=Session)
+async def login(payload: LoginRequest, request: Request, response: Response) -> Session:
+    """Exchange the operator password for a session cookie."""
+    ip = client_ip(request)
+    # Throttle first: argon2 is intentionally expensive and must not be reachable
+    # for free by anyone who can guess passwords.
+    await enforce_login_rate_limit(ip)
+
+    if not await verify_password(payload.password):
+        await record_login_failure(ip)
+        raise HTTPException(status_code=401, detail=INVALID_CREDENTIALS_DETAIL)
+
+    await clear_login_failures(ip)
+    issued = await create_session()
+    if issued is None:
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE_DETAIL)
+
+    set_session_cookie(response, issued.token, is_https_request(request))
+    return issued.session
+
+
+@app.post("/auth/logout", status_code=204)
+async def logout(request: Request, response: Response) -> None:
+    """Revoke the current session and clear the cookie. Idempotent by design."""
+    await destroy_session(read_session_token(request))
+    clear_session_cookie(response, is_https_request(request))
+
+
+@app.get("/auth/session", response_model=Session)
+async def auth_session(session: Session = Depends(require_session)) -> Session:
+    """Return the active session, or 401 when there is no valid one."""
+    return session
+
+
 @app.get("/", response_model=RootResponse)
 async def root() -> RootResponse:
     """Root API endpoint returning basic service status."""
@@ -208,7 +291,7 @@ async def redis_health_check() -> Dict[str, Any]:
 
 
 @app.get("/tools", response_model=ToolsResponse)
-async def list_tools() -> ToolsResponse:
+async def list_tools(_session: Session = Depends(require_session)) -> ToolsResponse:
     """List available LLM agent tool definitions with parameters and schemas."""
     from backend.tools import TOOL_DEFINITIONS
     return ToolsResponse(
@@ -218,7 +301,10 @@ async def list_tools() -> ToolsResponse:
 
 
 @app.post("/tools/check-exists", response_model=CheckExistsResponse)
-async def check_exists_endpoint(payload: CheckExistsRequest) -> CheckExistsResponse:
+async def check_exists_endpoint(
+    payload: CheckExistsRequest,
+    _session: Session = Depends(require_session),
+) -> CheckExistsResponse:
     """Idempotency check endpoint verifying entity presence in Neon database."""
     from backend.tools import check_exists
     res = await check_exists(entity_type=payload.entity_type, identifier=payload.identifier)
@@ -322,7 +408,10 @@ class AgentSessionStateResponse(BaseModel):
 
 
 @app.post("/agent/run", response_model=AgentRunResponse)
-async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
+async def run_agent_endpoint(
+    payload: AgentRunRequest,
+    _session: Session = Depends(require_session),
+) -> AgentRunResponse:
     """Execute the ReAct agent loop for a given goal with real-time event broadcasting."""
     from backend.browser import get_browser_session
     from backend.tools import PlaywrightTools
@@ -350,7 +439,10 @@ async def run_agent_endpoint(payload: AgentRunRequest) -> AgentRunResponse:
 
 
 @app.get("/agent/runs/{run_id}", response_model=AgentRunDetailResponse)
-async def get_agent_run(run_id: uuid.UUID) -> AgentRunDetailResponse:
+async def get_agent_run(
+    run_id: uuid.UUID,
+    _session: Session = Depends(require_session),
+) -> AgentRunDetailResponse:
     """Fetch run details and step history from Neon database."""
     from fastapi import HTTPException
     from backend.db import get_db_pool
@@ -400,6 +492,7 @@ async def get_agent_run(run_id: uuid.UUID) -> AgentRunDetailResponse:
 async def list_agent_run_steps(
     run_id: uuid.UUID,
     include_screenshots: bool = Query(default=False, description="Include base64 screenshot buffers in response"),
+    _session: Session = Depends(require_session),
 ) -> AgentStepsListResponse:
     """Fetch all persisted execution steps for an agent run ordered chronologically (Phase 2.6)."""
     pool = await get_db_pool()
@@ -438,7 +531,10 @@ async def list_agent_run_steps(
 
 
 @app.get("/agent/steps/{step_id}", response_model=AgentStepDetailResponse)
-async def get_agent_step(step_id: uuid.UUID) -> AgentStepDetailResponse:
+async def get_agent_step(
+    step_id: uuid.UUID,
+    _session: Session = Depends(require_session),
+) -> AgentStepDetailResponse:
     """Fetch single step details including base64 screenshot buffer from Neon DB (Phase 2.6)."""
     pool = await get_db_pool()
     async with pool.acquire() as conn:
@@ -465,7 +561,10 @@ async def get_agent_step(step_id: uuid.UUID) -> AgentStepDetailResponse:
 
 
 @app.get("/agent/runs/{run_id}/verification", response_model=VerificationReport)
-async def get_agent_run_verification(run_id: uuid.UUID) -> VerificationReport:
+async def get_agent_run_verification(
+    run_id: uuid.UUID,
+    _session: Session = Depends(require_session),
+) -> VerificationReport:
     """
     Fetch comprehensive verification report for an agent run, comparing actual invoice states
     in Neon against expected seed rules, including incomplete items and failed step screenshots (Phase 4).
@@ -480,7 +579,10 @@ async def get_agent_run_verification(run_id: uuid.UUID) -> VerificationReport:
 
 
 @app.post("/agent/runs/{run_id}/pause", response_model=PauseResumeResponse)
-async def pause_agent_run(run_id: str) -> PauseResumeResponse:
+async def pause_agent_run(
+    run_id: str,
+    _session: Session = Depends(require_session),
+) -> PauseResumeResponse:
     """Set pause flag in Redis for an active agent run."""
     from fastapi import HTTPException
     from backend.redis_client import get_redis_client
@@ -496,7 +598,10 @@ async def pause_agent_run(run_id: str) -> PauseResumeResponse:
 
 
 @app.post("/agent/runs/{run_id}/resume", response_model=PauseResumeResponse)
-async def resume_agent_run(run_id: str) -> PauseResumeResponse:
+async def resume_agent_run(
+    run_id: str,
+    _session: Session = Depends(require_session),
+) -> PauseResumeResponse:
     """Clear pause flag in Redis for an active agent run."""
     from fastapi import HTTPException
     from backend.redis_client import get_redis_client
@@ -512,7 +617,10 @@ async def resume_agent_run(run_id: str) -> PauseResumeResponse:
 
 
 @app.get("/agent/runs/{run_id}/approval", response_model=ApprovalPendingResponse)
-async def get_pending_approval(run_id: str) -> ApprovalPendingResponse:
+async def get_pending_approval(
+    run_id: str,
+    _session: Session = Depends(require_session),
+) -> ApprovalPendingResponse:
     """Fetch pending approval request details from Redis if awaiting approval (Phase 2.7 / Phase 3)."""
     from backend.redis_client import get_redis_client
     redis = get_redis_client()
@@ -523,7 +631,11 @@ async def get_pending_approval(run_id: str) -> ApprovalPendingResponse:
 
 
 @app.post("/agent/runs/{run_id}/approval", response_model=ApprovalDecisionResponse)
-async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
+async def submit_approval_decision(
+    run_id: str,
+    payload: ApprovalDecisionRequest,
+    _session: Session = Depends(require_session),
+) -> ApprovalDecisionResponse:
     """Record human approval decision ('approved' or 'rejected') in Redis with active request and nonce check."""
     from fastapi import HTTPException
     from backend.redis_client import get_redis_client
@@ -561,7 +673,10 @@ async def submit_approval_decision(run_id: str, payload: ApprovalDecisionRequest
 
 
 @app.get("/agent/runs/{run_id}/state", response_model=AgentSessionStateResponse)
-async def get_agent_state(run_id: str) -> AgentSessionStateResponse:
+async def get_agent_state(
+    run_id: str,
+    _session: Session = Depends(require_session),
+) -> AgentSessionStateResponse:
     """Fetch active session state from Redis."""
     from backend.redis_client import get_redis_client
     redis = get_redis_client()
@@ -573,7 +688,10 @@ async def get_agent_state(run_id: str) -> AgentSessionStateResponse:
 
 
 @app.get("/agent/runs/{run_id}/stream", response_class=EventSourceResponse)
-async def stream_agent_run_endpoint(run_id: uuid.UUID) -> EventSourceResponse:
+async def stream_agent_run_endpoint(
+    run_id: uuid.UUID,
+    _session: Session = Depends(require_session),
+) -> EventSourceResponse:
     """
     Server-Sent Events (SSE) streaming endpoint: GET /agent/runs/{run_id}/stream.
     Streams structured real-time agent execution events and history playback from Neon DB.

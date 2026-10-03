@@ -10,4 +10,17 @@ binding = "ASSETS"
 [vars]
 NEXT_PUBLIC_BACKEND_URL = "https://gmruxxvvxbypxv4d74kix7l6aq0ppwmd.lambda-url.us-east-1.on.aws/"
 NEXT_PUBLIC_API_URL = "https://hulchul-frontend.sufiyanx.workers.dev"
+# Public endpoint of the Upstash Redis REST API. Not a secret: the token below is
+# the only credential, and it is read from process.env in frontend/src/lib/auth.ts.
+UPSTASH_REDIS_REST_URL = "https://mature-doberman-225309.upstash.io"
+
+# UPSTASH_REDIS_REST_TOKEN is intentionally NOT in this file. A secret in
+# wrangler.toml is committed to git; this one must be provisioned out of band:
+#
+#   npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
+#
+# Without it the Worker still builds, and every session check fails closed to
+# "unauthenticated" (frontend/src/lib/auth.ts returns null when the binding is
+# absent), so a missed provisioning shows up as a 401 storm rather than a
+# security hole.
 

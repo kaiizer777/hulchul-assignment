@@ -397,8 +397,11 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            from conftest import issue_test_session
+            auth = {"Cookie": issue_test_session()}
+
             # 1. Fetch steps list without screenshots
-            res = await client.get(f"/agent/runs/{test_run_id}/steps")
+            res = await client.get(f"/agent/runs/{test_run_id}/steps", headers=auth)
             self.assertEqual(res.status_code, 200)
             data = res.json()
             self.assertEqual(data["run_id"], test_run_id)
@@ -407,13 +410,13 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(data["steps"][1]["has_screenshot"])
 
             # 2. Fetch steps list with screenshots
-            res_full = await client.get(f"/agent/runs/{test_run_id}/steps?include_screenshots=true")
+            res_full = await client.get(f"/agent/runs/{test_run_id}/steps?include_screenshots=true", headers=auth)
             self.assertEqual(res_full.status_code, 200)
             data_full = res_full.json()
             self.assertEqual(data_full["steps"][1]["screenshot_b64"], "YXBpX3Rlc3Rfc2NyZWVuc2hvdA==")
 
             # 3. Fetch single step by step_id
-            res_single = await client.get(f"/agent/steps/{s2}")
+            res_single = await client.get(f"/agent/steps/{s2}", headers=auth)
             self.assertEqual(res_single.status_code, 200)
             data_single = res_single.json()
             self.assertEqual(data_single["step_id"], s2)
@@ -421,10 +424,10 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data_single["screenshot_b64"], "YXBpX3Rlc3Rfc2NyZWVuc2hvdA==")
 
             # 4. 404 for non-existent run and step
-            res_404_run = await client.get(f"/agent/runs/{uuid.uuid4()}/steps")
+            res_404_run = await client.get(f"/agent/runs/{uuid.uuid4()}/steps", headers=auth)
             self.assertEqual(res_404_run.status_code, 404)
 
-            res_404_step = await client.get(f"/agent/steps/{uuid.uuid4()}")
+            res_404_step = await client.get(f"/agent/steps/{uuid.uuid4()}", headers=auth)
             self.assertEqual(res_404_step.status_code, 404)
 
 

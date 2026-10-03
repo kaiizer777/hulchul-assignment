@@ -54,9 +54,14 @@ class TestPhase31SSE(unittest.IsolatedAsyncioTestCase):
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            from conftest import issue_test_session
             try:
                 async with asyncio.timeout(1.5):
-                    async with ac.stream("GET", f"/agent/runs/{self.run_id}/stream") as response:
+                    async with ac.stream(
+                        "GET",
+                        f"/agent/runs/{self.run_id}/stream",
+                        headers={"Cookie": issue_test_session()},
+                    ) as response:
                         self.assertEqual(response.status_code, 200)
                         content_type = response.headers.get("content-type", "")
                         self.assertIn("text/event-stream", content_type)

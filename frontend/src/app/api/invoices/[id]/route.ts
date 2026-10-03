@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
+import { unauthorizedIfNoSession } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import {
   formatInvoice,
@@ -12,9 +13,14 @@ export const dynamic = 'force-dynamic';
 const UuidSchema = z.string().uuid();
 
 export async function GET(
-  _request: Request,
+  request: Request,
   props: { params: Promise<{ id: string }> }
 ) {
+  // Checked before the id is even parsed: a session check that ran after the
+  // lookup would still have leaked the not-found/or-found distinction.
+  const denied = await unauthorizedIfNoSession(request);
+  if (denied) return denied;
+
   try {
     const { id } = await props.params;
 
@@ -48,6 +54,11 @@ export async function PATCH(
   request: Request,
   props: { params: Promise<{ id: string }> }
 ) {
+  // Checked before the id or the body is read, so an unauthenticated caller
+  // cannot mutate a row or probe which ids exist.
+  const denied = await unauthorizedIfNoSession(request);
+  if (denied) return denied;
+
   try {
     const { id } = await props.params;
 

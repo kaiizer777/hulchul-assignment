@@ -536,8 +536,11 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            from conftest import issue_test_session
+            auth = {"Cookie": issue_test_session()}
+
             # 1. GET when no approval pending
-            res_get_empty = await client.get(f"/agent/runs/{test_run_id}/approval")
+            res_get_empty = await client.get(f"/agent/runs/{test_run_id}/approval", headers=auth)
             self.assertEqual(res_get_empty.status_code, 200)
             self.assertFalse(res_get_empty.json()["pending"])
             self.assertIsNone(res_get_empty.json()["approval_data"])
@@ -556,7 +559,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
             await self.redis.set_approval_pending(test_run_id, approval_payload)
 
             # 3. GET when approval is pending
-            res_get_pending = await client.get(f"/agent/runs/{test_run_id}/approval")
+            res_get_pending = await client.get(f"/agent/runs/{test_run_id}/approval", headers=auth)
             self.assertEqual(res_get_pending.status_code, 200)
             data_pending = res_get_pending.json()
             self.assertTrue(data_pending["pending"])
@@ -568,6 +571,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
             res_bad_decision = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "undecided"},
+                headers=auth,
             )
             self.assertEqual(res_bad_decision.status_code, 400)
 
@@ -575,6 +579,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
             res_bad_nonce = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "approved", "nonce": "wrong-nonce"},
+                headers=auth,
             )
             self.assertEqual(res_bad_nonce.status_code, 400)
 
@@ -582,6 +587,7 @@ class TestPhase27ApprovalGateIntegration(unittest.IsolatedAsyncioTestCase):
             res_ok = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "Approved", "nonce": test_nonce},
+                headers=auth,
             )
             self.assertEqual(res_ok.status_code, 200)
             self.assertTrue(res_ok.json()["recorded"])

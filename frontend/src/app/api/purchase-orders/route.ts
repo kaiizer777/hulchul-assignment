@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { unauthorizedIfNoSession } from '@/lib/auth';
 import { getDb } from '@/lib/db';
 import { PurchaseOrderDTO } from '@/lib/types';
 
@@ -11,7 +12,11 @@ interface RawPurchaseOrderRow {
   status: string;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
+  // Re-verified per request inside the handler, before the query runs.
+  const denied = await unauthorizedIfNoSession(request);
+  if (denied) return denied;
+
   try {
     const sql = getDb();
     const rows = (await sql`

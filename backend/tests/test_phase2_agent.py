@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unittest
 import uuid
 from typing import Any, Dict, List, Optional
@@ -139,13 +140,19 @@ class TestPhase24Unit(unittest.TestCase):
     def test_06_pause_unconfigured_redis_returns_503(self):
         """Verify that pausing or resuming when Redis is unconfigured returns 503."""
         from fastapi.testclient import TestClient
+        from conftest import issue_test_session
         client = TestClient(app)
-        mock_redis = MagicMock()
+        cookie = issue_test_session()
+        mock_redis = MagicMock(spec=UpstashRedisClient)
+        mock_redis.is_configured = True
+        mock_redis.get_auth_session = AsyncMock(
+            return_value={"sub": "operator", "exp": int(time.time()) + 3600}
+        )
         mock_redis.set_pause_flag = AsyncMock(return_value=False)
         with patch("backend.redis_client.get_redis_client", return_value=mock_redis):
-            res_pause = client.post("/agent/runs/any-run-id/pause")
+            res_pause = client.post("/agent/runs/any-run-id/pause", headers={"Cookie": cookie})
             self.assertEqual(res_pause.status_code, 503)
-            res_resume = client.post("/agent/runs/any-run-id/resume")
+            res_resume = client.post("/agent/runs/any-run-id/resume", headers={"Cookie": cookie})
             self.assertEqual(res_resume.status_code, 503)
 
     def test_07_invalid_amount_submission_rejected(self):
@@ -561,6 +568,10 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         """Verify /health/redis, /agent/runs/{run_id}/pause, resume, UUID validation, and approval endpoints."""
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            from conftest import issue_test_session
+            cookie = issue_test_session()
+            auth = {"Cookie": cookie}
+
             # 1. Redis health
             res_redis = await client.get("/health/redis")
             self.assertEqual(res_redis.status_code, 200)
@@ -568,18 +579,26 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(data_redis["connected"])
             self.assertEqual(data_redis["status"], "healthy")
 
-            # 2. Path parameter validation: malformed UUID must return 422
+            # 2. Unauthenticated callers are rejected before path validation, so a
+            # malformed UUID yields 401 rather than leaking 422 shape information.
             res_bad_uuid = await client.get("/agent/runs/not-a-valid-uuid")
-            self.assertEqual(res_bad_uuid.status_code, 422)
+            self.assertEqual(res_bad_uuid.status_code, 401)
+
+            # 2b. Authenticated callers still get real path validation -- the guard
+            # must not have swallowed the 422 contract, only deferred it.
+            res_bad_uuid_authed = await client.get(
+                "/agent/runs/not-a-valid-uuid", headers=auth
+            )
+            self.assertEqual(res_bad_uuid_authed.status_code, 422)
 
             # 3. Pause endpoint
             test_run_id = f"test-pause-{uuid.uuid4().hex[:6]}"
-            res_pause = await client.post(f"/agent/runs/{test_run_id}/pause")
+            res_pause = await client.post(f"/agent/runs/{test_run_id}/pause", headers=auth)
             self.assertEqual(res_pause.status_code, 200)
             self.assertTrue(res_pause.json()["paused"])
 
             # 4. Resume endpoint
-            res_resume = await client.post(f"/agent/runs/{test_run_id}/resume")
+            res_resume = await client.post(f"/agent/runs/{test_run_id}/resume", headers=auth)
             self.assertEqual(res_resume.status_code, 200)
             self.assertFalse(res_resume.json()["paused"])
 
@@ -587,6 +606,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
             res_no_pending = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "approved"},
+                headers=auth,
             )
             self.assertEqual(res_no_pending.status_code, 400)
 
@@ -601,6 +621,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
             res_wrong_nonce = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "approved", "nonce": "invalid-nonce-val"},
+                headers=auth,
             )
             self.assertEqual(res_wrong_nonce.status_code, 400)
 
@@ -608,6 +629,7 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
             res_app = await client.post(
                 f"/agent/runs/{test_run_id}/approval",
                 json={"decision": "approved", "nonce": test_nonce},
+                headers=auth,
             )
             self.assertEqual(res_app.status_code, 200)
             self.assertTrue(res_app.json()["recorded"])

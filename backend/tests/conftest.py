@@ -1,6 +1,10 @@
+import hashlib
+import json
 import os
+import secrets
 import socket
 import threading
+import time
 import pytest
 from fastapi import FastAPI, Request
 import uvicorn
@@ -55,3 +59,21 @@ def mock_upstash_redis_server():
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     yield
+
+
+def issue_test_session(ttl_seconds: int = 3600) -> str:
+    """
+    Mint a session straight into the mock Upstash store and return a Cookie header
+    value carrying it.
+
+    Writes the record the way login does (raw token kept client-side, only the
+    SHA-256 digest keyed in Redis) so protected-route tests authenticate without
+    depending on argon2 or the login rate limiter.
+    """
+    token = secrets.token_urlsafe(32)
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = int(time.time())
+    storage[f"hulchul:auth:session:{digest}"] = json.dumps(
+        {"sub": "operator", "iat": now, "exp": now + ttl_seconds}
+    )
+    return f"hulchul_session={token}"

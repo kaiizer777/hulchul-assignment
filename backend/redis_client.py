@@ -8,6 +8,10 @@ from backend.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Dedicated namespace for the auth feature; never reused by run/pause/approval keys.
+AUTH_SESSION_KEY_PREFIX = "hulchul:auth:session:"
+AUTH_LOGIN_FAIL_KEY_PREFIX = "hulchul:auth:login_fail:"
+
 
 class UpstashRedisError(Exception):
     """Raised when an operation on Upstash Redis fails."""
@@ -216,11 +220,75 @@ class UpstashRedisClient:
         await self.execute_command("DEL", k2)
         return True
 
+    async def create_auth_session(
+        self,
+        token_hash: str,
+        payload: Dict[str, Any],
+        ttl_seconds: int,
+    ) -> bool:
+        """Persist a session record under the SHA-256 digest of its raw token."""
+        key = f"{AUTH_SESSION_KEY_PREFIX}{token_hash}"
+        res = await self.execute_command("SET", key, json.dumps(payload), "EX", ttl_seconds)
+        return res == "OK"
+
+    async def get_auth_session(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        """Fetch a session record by token digest. None when absent or unreadable."""
+        key = f"{AUTH_SESSION_KEY_PREFIX}{token_hash}"
+        raw = await self.execute_command("GET", key)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    async def delete_auth_session(self, token_hash: str) -> bool:
+        """Revoke a session record by token digest. Idempotent."""
+        key = f"{AUTH_SESSION_KEY_PREFIX}{token_hash}"
+        res = await self.execute_command("DEL", key)
+        return bool(res)
+
+    async def get_login_failure_count(self, ip: str) -> int:
+        """Read the failed-login counter for an IP bucket. Missing key counts as zero."""
+        key = f"{AUTH_LOGIN_FAIL_KEY_PREFIX}{ip}"
+        raw = await self.execute_command("GET", key)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    async def record_login_failure(self, ip: str, window_seconds: int) -> int:
+        """
+        Increment the failed-login counter and (re)arm its window.
+
+        INCR is the atomic part; EXPIRE on every failure only ever extends how
+        long an exhausted bucket stays blocked, it cannot lower the count.
+        """
+        key = f"{AUTH_LOGIN_FAIL_KEY_PREFIX}{ip}"
+        count = await self.execute_command("INCR", key)
+        await self.execute_command("EXPIRE", key, window_seconds)
+        try:
+            return int(count)
+        except (TypeError, ValueError):
+            return 0
+
+    async def clear_login_failures(self, ip: str) -> None:
+        """Reset the failed-login counter after a successful authentication."""
+        key = f"{AUTH_LOGIN_FAIL_KEY_PREFIX}{ip}"
+        await self.execute_command("DEL", key)
+
     async def close(self) -> None:
         """Close the underlying HTTP client if locally owned."""
         if not self._external_client and self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+            try:
+                await self._client.aclose()
+            except Exception as e:
+                # The client can be bound to an event loop that has already closed
+                # (shared singleton reused across loops). Discard it either way so a
+                # dead client is never handed to the next caller.
+                logger.warning(f"Upstash Redis client close failed, discarding it: {e}")
+            finally:
+                self._client = None
 
 
 _global_redis_client: Optional[UpstashRedisClient] = None

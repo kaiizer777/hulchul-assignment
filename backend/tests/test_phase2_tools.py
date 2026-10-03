@@ -248,8 +248,11 @@ class TestPhase23Tools(unittest.IsolatedAsyncioTestCase):
         """
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
+            from conftest import issue_test_session
+            auth = {"Cookie": issue_test_session()}
+
             # Test GET /tools
-            res_tools = await client.get("/tools")
+            res_tools = await client.get("/tools", headers=auth)
             self.assertEqual(res_tools.status_code, 200)
             data_tools = res_tools.json()
             self.assertEqual(data_tools["count"], 7)
@@ -259,6 +262,7 @@ class TestPhase23Tools(unittest.IsolatedAsyncioTestCase):
             res_check_exist = await client.post(
                 "/tools/check-exists",
                 json={"entity_type": "purchase_order", "identifier": "PO-1001"},
+                headers=auth,
             )
             self.assertEqual(res_check_exist.status_code, 200)
             data_check_exist = res_check_exist.json()
@@ -269,6 +273,7 @@ class TestPhase23Tools(unittest.IsolatedAsyncioTestCase):
             res_check_missing = await client.post(
                 "/tools/check-exists",
                 json={"entity_type": "purchase_order", "identifier": "PO-MISSING-000"},
+                headers=auth,
             )
             self.assertEqual(res_check_missing.status_code, 200)
             data_check_missing = res_check_missing.json()
