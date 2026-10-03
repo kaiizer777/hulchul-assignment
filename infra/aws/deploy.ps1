@@ -91,12 +91,79 @@ if (Test-Path "terraform.tfvars") {
     Write-Host "WARNING: infra/aws/terraform.tfvars exists and is shadowed by the generated terraform.tfvars.json. Edits to it have no effect." -ForegroundColor Yellow
 }
 
+# AUTH_PASSWORD_HASH is required: without it every login 503s by design and the
+# deployed app can never mint a session. Refuse to deploy rather than ship a
+# locked-out backend. The value itself is never echoed.
+if (-not $envDict.ContainsKey("auth_password_hash") -or [string]::IsNullOrWhiteSpace($envDict["auth_password_hash"])) {
+    Write-Error "backend/.env has no auth_password_hash. Generate one (argon2id PHC) and add AUTH_PASSWORD_HASH to backend/.env before deploying."
+    exit 1
+}
+
+# A non-empty value is not enough: a truncated or non-argon2 string also passes
+# the check above, but backend/auth.py verify_password treats an unparseable
+# hash as a credential failure for every password, shipping a locked-out prod.
+# Validate with the real argon2 PHC parser: verify() against a dummy probe
+# raises VerifyMismatchError when the format is OK (probe mismatch, accept) and
+# InvalidHash/VerificationError when it cannot be parsed (reject).
+# Tooling absence hard-fails fail-closed because warn-and-continue would still ship a locked-out prod; the error tells exactly how to unblock.
+$authHashCandidate = $envDict["auth_password_hash"]
+$pythonCmd = $null
+$foundPython = Get-Command python -ErrorAction SilentlyContinue
+if ($foundPython) {
+    $pythonCmd = $foundPython.Source
+} else {
+    $foundPython3 = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($foundPython3) { $pythonCmd = $foundPython3.Source }
+}
+if (-not $pythonCmd) {
+    Write-Error "backend/.env auth_password_hash cannot be validated: no python found in PATH. Install Python 3 with 'pip install argon2-cffi' and re-run deploy."
+    exit 1
+}
+$env:AUTH_PASSWORD_HASH_CANDIDATE = $authHashCandidate
+try {
+    $validateScript = @'
+import os, sys
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import InvalidHash, VerificationError, VerifyMismatchError
+except ImportError:
+    print('argon2-cffi is not installed (pip install argon2-cffi)', file=sys.stderr)
+    sys.exit(2)
+candidate = os.environ.get('AUTH_PASSWORD_HASH_CANDIDATE', '')
+try:
+    PasswordHasher().verify(candidate, 'deploy-format-probe')
+except VerifyMismatchError:
+    sys.exit(0)
+except InvalidHash:
+    sys.exit(1)
+except VerificationError:
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+else:
+    sys.exit(0)
+'@
+    & $pythonCmd -c $validateScript
+    $validateExit = $LASTEXITCODE
+    if ($validateExit -eq 2) {
+        Write-Error "backend/.env auth_password_hash cannot be validated: argon2-cffi is not installed. Run 'pip install argon2-cffi' and re-run deploy."
+        exit 1
+    }
+    if ($validateExit -ne 0) {
+        Write-Error "backend/.env auth_password_hash is not a valid argon2 PHC hash. Generate one (argon2id PHC) and update AUTH_PASSWORD_HASH before deploying."
+        exit 1
+    }
+} finally {
+    Remove-Item Env:\AUTH_PASSWORD_HASH_CANDIDATE -ErrorAction SilentlyContinue
+}
+
 $tfvarsObj = @{
     database_url             = $envDict["database_url"]
     groq_api_key             = $envDict["groq_api_key"]
     upstash_redis_rest_url   = $envDict["upstash_redis_rest_url"]
     upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
     browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
+    auth_password_hash       = $envDict["auth_password_hash"]
     frontend_url             = $frontendUrl
     cors_origins             = $corsOrigins
 }
