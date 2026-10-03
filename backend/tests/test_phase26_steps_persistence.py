@@ -1,40 +1,103 @@
 import asyncio
 import base64
+import contextlib
 import json
+import sys
 import unittest
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncpg
 from httpx import ASGITransport, AsyncClient
 from groq import AsyncGroq
 
 from backend.config import settings
-from backend.db import get_db_pool, close_db_pool
 from backend.main import app
 from backend.agent import ReActAgent
 from backend.tools import PlaywrightTools
 from backend.redis_client import UpstashRedisClient, get_redis_client
+
+_TRANSIENT_DB_ERRORS = (
+    asyncpg.PostgresConnectionError,
+    asyncpg.CannotConnectNowError,
+    asyncpg.AdminShutdownError,
+    asyncpg.TooManyConnectionsError,
+    OSError,
+    asyncio.TimeoutError,
+)
 
 
 class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
     """
     Comprehensive tests for Phase 2.6:
     Persist every step to agent_steps table in Neon (action, result, screenshot_b64, timestamp).
+
+    Test isolation (issue #41): each test owns a dedicated asyncpg pool that is
+    closed in tearDown. This class never reads or closes the process-global
+    backend.db._db_pool, so a sibling module's teardown cannot close the pool
+    mid-setup (previously surfaced as ConnectionDoesNotExistError in
+    asyncSetUp). Global pool lookups are patched to the isolated pool for the
+    duration of each test so the FastAPI endpoints under test read the same
+    rows. Only transient Neon connection failures retry-then-skip legibly
+    instead of erroring; authentication, catalog and syntax errors propagate
+    and fail the test. A pool that was already created is closed on every
+    failed validation path, transient or fatal, because a fatal error exits
+    asyncSetUp and never reaches asyncTearDown.
     """
 
+    async def _init_isolated_pool(self):
+        """Create a per-test pool; retry once on transient failure, else SkipTest."""
+        if not settings.DATABASE_URL:
+            raise unittest.SkipTest("DATABASE_URL is not set; skipping live-Neon phase26 tests")
+        last_exc = None
+        for attempt in (1, 2):
+            try:
+                pool = await asyncpg.create_pool(
+                    dsn=settings.DATABASE_URL,
+                    min_size=1,
+                    max_size=2,
+                )
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.fetchval("SELECT 1")
+                except BaseException:
+                    with contextlib.suppress(Exception):
+                        await pool.close()
+                    raise
+                return pool
+            except _TRANSIENT_DB_ERRORS as exc:
+                last_exc = exc
+                if attempt == 2:
+                    raise unittest.SkipTest(
+                        f"Neon unavailable for phase26 (attempt {attempt}): "
+                        f"{type(last_exc).__name__}: {last_exc}"
+                    ) from exc
+        raise unittest.SkipTest(f"Neon unavailable for phase26: {last_exc}")
+
     async def asyncSetUp(self):
-        self.pool = await get_db_pool()
+        """Initialize the isolated Neon pool, patched pool lookups, and Redis client."""
+        self._db_patchers = []
+        self.pool = await self._init_isolated_pool()
+        for target in (
+            "backend.db.get_db_pool",
+            "backend.main.get_db_pool",
+            "backend.agent.get_db_pool",
+        ):
+            with contextlib.suppress(AttributeError, ModuleNotFoundError):
+                patcher = patch(target, new=AsyncMock(return_value=self.pool))
+                patcher.start()
+                self._db_patchers.append(patcher)
         self.redis = get_redis_client()
         self.test_run_ids: List[str] = []
 
     async def asyncTearDown(self):
-        # Cleanup test records
-        if self.test_run_ids:
-            try:
+        """Clean up created test run records, then release pool and Redis client."""
+        cleanup_error = None
+        try:
+            if getattr(self, "test_run_ids", None) and getattr(self, "pool", None) is not None:
                 valid_uuids = []
                 for r in self.test_run_ids:
                     try:
@@ -42,13 +105,31 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
                     except (ValueError, TypeError):
                         pass
                 if valid_uuids:
-                    async with self.pool.acquire() as conn:
-                        await conn.execute("DELETE FROM agent_steps WHERE run_id = ANY($1::uuid[]);", valid_uuids)
-                        await conn.execute("DELETE FROM agent_runs WHERE run_id = ANY($1::uuid[]);", valid_uuids)
-            except Exception:
-                pass
-        await self.redis.close()
-        await close_db_pool()
+                    try:
+                        async with self.pool.acquire() as conn:
+                            await conn.execute("DELETE FROM agent_steps WHERE run_id = ANY($1::uuid[]);", valid_uuids)
+                            await conn.execute("DELETE FROM agent_runs WHERE run_id = ANY($1::uuid[]);", valid_uuids)
+                    except _TRANSIENT_DB_ERRORS as exc:
+                        cleanup_error = exc
+        finally:
+            for patcher in getattr(self, "_db_patchers", []):
+                with contextlib.suppress(RuntimeError):
+                    patcher.stop()
+            self._db_patchers = []
+            pool = getattr(self, "pool", None)
+            self.pool = None
+            if pool is not None:
+                with contextlib.suppress(*_TRANSIENT_DB_ERRORS):
+                    await pool.close()
+            redis = getattr(self, "redis", None)
+            if redis is not None:
+                with contextlib.suppress(Exception):
+                    await redis.close()
+        if cleanup_error is not None:
+            raise AssertionError(
+                f"phase26 cleanup failed, test rows may be leaked: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            ) from cleanup_error
 
     # -----------------------------------------------------------------------
     # 1. Step Creation, Verification & Timestamps in Neon
@@ -429,6 +510,192 @@ class TestPhase26StepsPersistence(unittest.IsolatedAsyncioTestCase):
 
             res_404_step = await client.get(f"/agent/steps/{uuid.uuid4()}", headers=auth)
             self.assertEqual(res_404_step.status_code, 404)
+
+
+def _mock_pool(fetchval_side_effect=None, execute_side_effect=None, close_side_effect=None):
+    """Build a stand-in asyncpg pool whose acquire() yields a configurable conn."""
+    conn = MagicMock()
+    conn.fetchval = AsyncMock(side_effect=fetchval_side_effect, return_value=1)
+    conn.execute = AsyncMock(side_effect=execute_side_effect)
+    pool = MagicMock()
+    pool.acquire.return_value.__aenter__.return_value = conn
+    pool.close = AsyncMock(side_effect=close_side_effect)
+    return pool, conn
+
+
+class TestPhase26PoolInitErrorClassification(unittest.IsolatedAsyncioTestCase):
+    """Verify pool init retries-and-skips only transient failures, never fatal ones."""
+
+    def _case(self):
+        """Return a bare phase26 instance to drive lifecycle methods directly."""
+        return TestPhase26StepsPersistence("test_01_persist_step_basic_and_timestamps")
+
+    def _settings_patch(self):
+        """Patch this module's settings with a fake DATABASE_URL, since it is frozen."""
+        return patch.object(
+            sys.modules[__name__],
+            "settings",
+            MagicMock(DATABASE_URL="postgresql://user:pw@127.0.0.1:5432/postgres"),
+        )
+
+    async def test_transient_failure_then_success_returns_pool_without_skip(self):
+        """A transient ConnectionDoesNotExistError on attempt 1 retries and returns the pool."""
+        broken, _ = _mock_pool(fetchval_side_effect=asyncpg.ConnectionDoesNotExistError("gone"))
+        healthy, _ = _mock_pool()
+        create_pool = AsyncMock(side_effect=[broken, healthy])
+
+        with self._settings_patch(), patch("asyncpg.create_pool", new=create_pool):
+            pool = await self._case()._init_isolated_pool()
+
+        self.assertIs(pool, healthy)
+        self.assertEqual(create_pool.await_count, 2)
+        broken.close.assert_awaited_once()
+
+    async def test_transient_failure_on_both_attempts_skips(self):
+        """Two transient failures skip the test instead of erroring."""
+        first, _ = _mock_pool(fetchval_side_effect=asyncpg.ConnectionDoesNotExistError("gone"))
+        second, _ = _mock_pool(fetchval_side_effect=asyncpg.ConnectionDoesNotExistError("gone again"))
+        create_pool = AsyncMock(side_effect=[first, second])
+
+        with self._settings_patch(), \
+                patch("asyncpg.create_pool", new=create_pool), \
+                self.assertRaises(unittest.SkipTest) as raised:
+            await self._case()._init_isolated_pool()
+
+        self.assertIn("ConnectionDoesNotExistError", str(raised.exception))
+        self.assertIsInstance(raised.exception.__cause__, asyncpg.ConnectionDoesNotExistError)
+        self.assertEqual(create_pool.await_count, 2)
+        first.close.assert_awaited_once()
+        second.close.assert_awaited_once()
+
+    async def test_transient_pool_close_failure_does_not_mask_skip(self):
+        """A pool that also fails to close still skips on the original transient error."""
+        first, _ = _mock_pool(
+            fetchval_side_effect=asyncpg.ConnectionDoesNotExistError("gone"),
+            close_side_effect=asyncpg.ConnectionDoesNotExistError("close failed"),
+        )
+        second, _ = _mock_pool(
+            fetchval_side_effect=asyncpg.ConnectionDoesNotExistError("gone"),
+            close_side_effect=asyncpg.ConnectionDoesNotExistError("close failed"),
+        )
+        create_pool = AsyncMock(side_effect=[first, second])
+
+        with self._settings_patch(), \
+                patch("asyncpg.create_pool", new=create_pool), \
+                self.assertRaises(unittest.SkipTest):
+            await self._case()._init_isolated_pool()
+
+    async def test_fatal_validation_error_propagates_after_closing_created_pool(self):
+        """A fatal error once the pool exists propagates unchanged, and the pool is closed."""
+        for stage in ("acquire", "fetchval"):
+            with self.subTest(stage=stage):
+                cause = ValueError("root cause")
+                fatal = asyncpg.UndefinedTableError("relation missing")
+                fatal.__cause__ = cause
+                pool, conn = _mock_pool()
+                if stage == "fetchval":
+                    conn.fetchval = AsyncMock(side_effect=fatal)
+                else:
+                    pool.acquire.side_effect = fatal
+                create_pool = AsyncMock(return_value=pool)
+
+                with self._settings_patch(), \
+                        patch("asyncpg.create_pool", new=create_pool), \
+                        self.assertRaises(asyncpg.UndefinedTableError) as raised:
+                    await self._case()._init_isolated_pool()
+
+                self.assertIs(raised.exception, fatal)
+                self.assertIs(raised.exception.__cause__, cause)
+                self.assertNotIsInstance(raised.exception, unittest.SkipTest)
+                self.assertEqual(create_pool.await_count, 1)
+                pool.close.assert_awaited_once()
+
+    async def test_auth_and_catalog_errors_propagate_without_retry_or_skip(self):
+        """Bad credentials or a bad database name fail the test on the first attempt."""
+        for exc_cls in (asyncpg.InvalidPasswordError, asyncpg.InvalidCatalogNameError):
+            with self.subTest(exc_cls=exc_cls.__name__):
+                create_pool = AsyncMock(side_effect=exc_cls("nope"))
+                with self._settings_patch(), \
+                        patch("asyncpg.create_pool", new=create_pool), \
+                        self.assertRaises(exc_cls) as raised:
+                    await self._case()._init_isolated_pool()
+                self.assertNotIsInstance(raised.exception, unittest.SkipTest)
+                self.assertEqual(create_pool.await_count, 1)
+
+    async def test_malformed_dsn_propagates_as_configuration_error(self):
+        """A malformed DSN is a configuration error, so it must not be swallowed."""
+        create_pool = AsyncMock(side_effect=asyncpg.ClientConfigurationError("invalid DSN"))
+
+        with self._settings_patch(), \
+                patch("asyncpg.create_pool", new=create_pool), \
+                self.assertRaises(asyncpg.ClientConfigurationError):
+            await self._case()._init_isolated_pool()
+
+        self.assertEqual(create_pool.await_count, 1)
+
+    async def test_missing_database_url_skips_without_touching_network(self):
+        """An unset DATABASE_URL skips without ever calling asyncpg.create_pool."""
+        create_pool = AsyncMock()
+
+        with patch.object(sys.modules[__name__], "settings", MagicMock(DATABASE_URL=None)), \
+                patch("asyncpg.create_pool", new=create_pool), \
+                self.assertRaises(unittest.SkipTest):
+            await self._case()._init_isolated_pool()
+
+        create_pool.assert_not_awaited()
+
+    async def test_setup_and_teardown_leave_global_db_pool_untouched(self):
+        """asyncSetUp/asyncTearDown never read, replace or close backend.db._db_pool."""
+        import backend.db
+
+        initial_pool = backend.db._db_pool
+        pool, conn = _mock_pool()
+        redis = MagicMock()
+        redis.close = AsyncMock()
+        case = self._case()
+
+        with self._settings_patch(), \
+                patch("asyncpg.create_pool", new=AsyncMock(return_value=pool)), \
+                patch.object(sys.modules[__name__], "get_redis_client", return_value=redis):
+            await case.asyncSetUp()
+            self.assertEqual(len(case._db_patchers), 3)
+            self.assertIs(backend.db._db_pool, initial_pool)
+            case.test_run_ids.append(str(uuid.uuid4()))
+            await case.asyncTearDown()
+            self.assertIs(backend.db._db_pool, initial_pool)
+
+        self.assertEqual(conn.execute.await_count, 2)
+        pool.close.assert_awaited_once()
+        redis.close.assert_awaited_once()
+
+    async def test_failed_cleanup_delete_is_reported_after_resources_released(self):
+        """A failed cleanup DELETE surfaces as a failure, but the pool still closes."""
+        cases = (
+            (asyncpg.ConnectionDoesNotExistError("connection closed mid-delete"), AssertionError),
+            (asyncpg.UndefinedTableError("relation missing"), asyncpg.UndefinedTableError),
+        )
+        for exc, expected in cases:
+            with self.subTest(exc=type(exc).__name__):
+                pool, _ = _mock_pool(execute_side_effect=exc)
+                redis = MagicMock()
+                redis.close = AsyncMock()
+                case = self._case()
+                case.pool = pool
+                case.redis = redis
+                case._db_patchers = []
+                case.test_run_ids = [str(uuid.uuid4())]
+
+                with self.assertRaises(expected) as raised:
+                    await case.asyncTearDown()
+
+                self.assertIsNone(case.pool)
+                pool.close.assert_awaited_once()
+                redis.close.assert_awaited_once()
+                if expected is AssertionError:
+                    self.assertIn("phase26 cleanup failed", str(raised.exception))
+                    self.assertIsInstance(raised.exception.__cause__, type(exc))
+                else:
+                    self.assertIsInstance(raised.exception, type(exc))
 
 
 if __name__ == "__main__":
