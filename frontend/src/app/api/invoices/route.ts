@@ -13,18 +13,19 @@ let invoiceSubmissionCount = 0;
 /**
  * Determines whether to simulate an internal server error based on `fail_after` query parameter
  * or `SIMULATE_FAILURE_AFTER` environment variable, or resets the counter if `reset_failure=true`.
- * Gates failure injection behind test environment checks and validates fail_after format.
+ * In production failure injection is disabled unless `ENABLE_TEST_FAILURE_INJECTION` is set;
+ * client-supplied headers are never consulted.
  *
- * @param request - The incoming HTTP request.
+ * @param request - The incoming HTTP request (unused; headers must not enable injection).
  * @param url - The incoming request URL containing search parameters.
  * @returns True if failure should be simulated, false otherwise.
  */
 function shouldSimulateFailure(request: Request, url: URL): boolean {
+  void request;
   const isProd = process.env.NODE_ENV === 'production';
   const enableTestInjection = process.env.ENABLE_TEST_FAILURE_INJECTION === 'true';
-  const testHeader = request.headers.get('x-test-failure-injection') === 'true' || request.headers.get('x-test-mode') === 'true';
 
-  if (isProd && !enableTestInjection && !testHeader) {
+  if (isProd && !enableTestInjection) {
     return false;
   }
 

@@ -1,12 +1,18 @@
 /**
  * Post-build guard for the Cloudflare Worker bundle.
  *
- * The client used to talk to the FastAPI backend directly, so `NEXT_PUBLIC_BACKEND_URL`
- * had to be inlined into the client bundle at build time: a bundle built without
- * it silently fell back to http://localhost:8051 and every browser request failed
- * with an opaque "Failed to fetch" pointing at the visitor's own machine.
+ * Before the same-origin `/api/agent` proxy, the client talked to the FastAPI
+ * backend directly, so `NEXT_PUBLIC_BACKEND_URL` had to be inlined into the
+ * client bundle at build time: a bundle built without it silently fell back to
+ * http://localhost:8051 and every browser request failed with an opaque
+ * "Failed to fetch" pointing at the visitor's own machine.
  *
- * That is no longer the topology. Agent traffic now goes through this origin's own
+ * That direct-talk topology is gone. The browser now only talks same-origin to
+ * `/api/agent` (see `AGENT_API_BASE` in `src/app/agent/page.tsx`) and
+ * `NEXT_PUBLIC_BACKEND_URL` is read server-side by `getBackendUrl`
+ * (`src/lib/backend-url.ts`) for the proxy.
+ *
+ * Agent traffic goes through this origin's own
  * `/api/agent` proxy, which exists because `EventSource` cannot attach a session
  * cookie to a cross-origin request. Two invariants are therefore asserted on the
  * built artifact:
