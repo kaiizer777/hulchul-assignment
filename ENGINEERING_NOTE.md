@@ -3,22 +3,23 @@
 **Author / Candidate Submission**  
 **Role:** Senior Autonomous Systems / AI Engineer  
 **Repository:** [hulchul-assignment](https://github.com/kaiizer777/hulchul-assignment)  
-**Live Stack:** FastAPI (AWS Lambda) · Next.js 16 App Router (Cloudflare Workers) · Playwright Remote CDP · Neon Serverless PostgreSQL · Upstash Redis · Groq (`openai/gpt-oss-120b`)
+**Live Stack:** FastAPI (AWS Lambda via Web Adapter) · Next.js 16 App Router (Cloudflare Workers) · Zustand Reactive State · Playwright Remote CDP · Neon Serverless PostgreSQL · Upstash Redis · Groq (`openai/gpt-oss-120b`)
 
 ---
 
 ## 1. Executive Summary & System Architecture
 
-Modern enterprise enterprise resource planning (ERP) systems (e.g., SAP S/4HANA, NetSuite, Coupa) often lack comprehensive, reliable APIs for edge reconciliation tasks or legacy third-party interfaces. Automating these workflows requires an autonomous agent capable of operating human-facing web interfaces with the same precision, caution, and auditability as a senior accounting operator.
+Modern enterprise resource planning (ERP) systems (e.g., SAP S/4HANA, NetSuite, Coupa) often lack comprehensive, reliable APIs for edge reconciliation tasks or legacy third-party interfaces. Automating these workflows requires an autonomous agent capable of operating human-facing web interfaces with the same precision, caution, and auditability as a senior accounting operator.
 
 This system implements an end-to-end autonomous browser agent designed to reconcile vendor invoices against purchase orders within an ERP. The architecture decouples the autonomous intelligence engine from browser execution and interface rendering, achieving sub-second operational latency, zero local browser container bloat, and durable multi-tier auditability.
 
 ```mermaid
 graph TD
-    subgraph Client & Edge ["Edge & Control Layer (Cloudflare Workers / Next.js)"]
+    subgraph Client & Edge ["Edge & Control Layer (Cloudflare Workers / Next.js 16)"]
         UI["Tactile Control UI (/agent)"]
+        Store["Zustand Reactive Store (useAgentStore)"]
         ERP["Target ERP Surface (/invoices, /purchase-orders)"]
-        SSE_Client["SSE Telemetry Consumer"]
+        SSE_Client["SSE Telemetry Consumer (get/set accessors)"]
     end
 
     subgraph Orchestrator ["Agent Core (AWS Lambda / FastAPI)"]
@@ -30,24 +31,28 @@ graph TD
     end
 
     subgraph Infra ["State & Remote Execution Services"]
-        Redis[("Upstash Redis\n(Session Lease, Pause, Approval Gates)")]
+        Redis[("Upstash Redis\n(Session Lease, Pause, Approval Nonces)")]
         Neon[("Neon Postgres\n(Durable Audit Trail & Base64 Evidence)")]
         CDP["Remote CDP Node (Browserless / Steel.dev)"]
     end
 
-    UI -->|1. Submit Goal & Threshold| Router
-    Router -->|2. Acquire Run Lease & Init Run| Neon
-    Router -->|3. Establish SSE Stream| SSE_Client
-    ReAct -->|4. Request Compact A11y Tree| Tools
-    Tools -->|5. CDP Snapshot / Action| CDP
-    CDP -->|6. DOM Mutate & Read| ERP
-    ReAct -->|7. Multi-step Context Prompt| LLM
-    LLM -->|8. Structured Tool Call| ReAct
-    ReAct -->|9. Atomic Check & Gate| Redis
-    ReAct -->|10. Persist Step & Base64 Screenshot| Neon
-    ReAct -->|11. Push Real-Time Event| SSE_Client
-    ReAct -->|12. Final State Diff & Report| Verifier
-    Verifier -->|13. Persist Pass/Fail Table| Neon
+    UI -->|1. Select Preset / Goal| Store
+    Store -->|2. POST /api/agent/run| Router
+    Router -->|3. Acquire Distributed Lease| Redis
+    Router -->|4. Initialize Run Record| Neon
+    Router -->|5. Open SSE Stream| SSE_Client
+    ReAct -->|6. Request Compact A11y Tree| Tools
+    Tools -->|7. CDP Snapshot / Action| CDP
+    CDP -->|8. DOM Mutate & Read| ERP
+    ReAct -->|9. Multi-step Context Prompt| LLM
+    LLM -->|10. Structured Tool Call| ReAct
+    ReAct -->|11. Atomic Check & Gate| Redis
+    ReAct -->|12. Persist Step & Base64 Screenshot| Neon
+    ReAct -->|13. Push Real-Time Event| SSE_Client
+    SSE_Client -->|14. Idempotent Upsert| Store
+    ReAct -->|15. Final State Diff & Report| Verifier
+    Verifier -->|16. Persist Pass/Fail Table| Neon
+    Store -->|17. Render Telemetry & Report| UI
 ```
 
 ### Architectural Principles & Design Choices
@@ -67,7 +72,60 @@ graph TD
 
 ---
 
-## 2. Assignment Alignment: The 5 Core Pillars
+## 2. Frontend State Architecture (Zustand)
+
+The operator control workstation (`/agent`) requires sub-millisecond reactive updates, reliable state hydration across browser refreshes, and resilient handling of asynchronous telemetry streams. This is managed by a centralized **Zustand** store ([`useAgentStore.ts`](frontend/src/app/store/useAgentStore.ts)).
+
+```mermaid
+graph LR
+    subgraph Zustand Store ["Zustand Store (useAgentStore)"]
+        PState["Persisted State\n(goal, presetId, autoScroll)"]
+        RState["Runtime State\n(status, steps, logs, metrics, approvalData)"]
+        Reducers["Idempotent Reducers\n(upsertStepEvent, calculateMetrics)"]
+    end
+
+    subgraph Inputs ["State Inputs"]
+        Storage["localStorage / URL Query"]
+        SSE["SSE EventSource Stream"]
+        Poll["Approval Poll (2500ms Fallback)"]
+        UIAct["User Actions (start, pause, approve)"]
+    end
+
+    Storage -->|persist middleware & sync| PState
+    SSE -->|handleFrame via get()/set()| Reducers
+    Poll -->|fetch approval data| Reducers
+    UIAct -->|dispatch async action| Reducers
+    Reducers --> RState
+```
+
+### Key Zustand Architectural Highlights
+
+1. **Single Source of Truth**:
+   - Centralizes the entire execution lifecycle: execution statuses (`idle`, `starting`, `running`, `paused`, `awaiting_approval`, `completed`, `done`, `failed`, `stalled`, `session_lost`), connection telemetry (`disconnected`, `connecting`, `connected`, `reconnecting`, `closed`), step timelines, approval gate modals, verification reports, and performance metrics (`durationMs`, `passedSteps`, `failedSteps`).
+
+2. **`persist` Middleware with Hydration Guard**:
+   - Utilizes Zustand's `persist` middleware with `createJSONStorage` to persist critical user configurations (`goal`, `selectedPresetId`, `autoScroll`) across browser sessions and reloads.
+   - Implements `hasHydrated` state flags and `onRehydrateStorage` hooks to prevent React SSR hydration mismatches in Next.js 16.
+   - Supports bi-directional synchronization with URL query parameters via `syncFromStorageOrUrl` (e.g., `?preset=vendor_acme` or `?goal=Process+all+invoices`), enabling shareable deep links for operator tasks.
+
+3. **Idempotent Step Deduplication (`upsertStepEvent`)**:
+   - Telemetry events from SSE streams or fallback polls can arrive out of order or be retransmitted upon network reconnects.
+   - The store's reducer performs deterministic deduplication:
+     - Matches existing steps primarily by unique `step_id`.
+     - Falls back to matching by `step_index` if `step_id` is pending assignment.
+     - Merges incremental payloads (e.g., attaching screenshots, execution durations, or errors to previously logged start events) without duplicating timeline entries or disrupting list ordering.
+
+4. **Zero Stale Closures in SSE Telemetry**:
+   - Streaming event listeners (`EventSource`) and fallback polling timers (`setInterval`) operate outside the React component render cycle.
+   - `setupRunStreamAndPoll` leverages Zustand's `get()` and `set()` accessors directly, guaranteeing that event handlers always read current execution nonces, status flags, and run IDs without capturing stale React closure state.
+
+5. **Defensive Resource Lifecycle & Fallback Polling**:
+   - `cleanupActiveStream` explicitly closes existing `EventSource` connections, clears active polling intervals, and fires `AbortController.abort()` signals before initializing new runs or on terminal states (`done`, `failed`, `stalled`).
+   - A secondary 2,500ms polling fallback monitors `/api/agent/runs/:id/approval`, ensuring human approval requests are never dropped even under aggressive SSE proxy buffering.
+
+---
+
+## 3. Assignment Alignment: The 5 Core Pillars
 
 ```mermaid
 flowchart LR
@@ -107,7 +165,7 @@ The agent executes dynamic operational variants purely from prompt interpretatio
 
 ---
 
-## 3. Personal Contribution
+## 4. Personal Contribution
 
 As the lead engineer on this submission, my personal contributions span the end-to-end design, implementation, and hardening of the system:
 
@@ -115,13 +173,13 @@ As the lead engineer on this submission, my personal contributions span the end-
    - Architected the dual-deployment topology (FastAPI on AWS Lambda with Web Adapter + Next.js 16 on Cloudflare Workers).
    - Designed the serverless remote CDP integration pattern, eliminating 1GB+ container dependencies while achieving sub-second startup times.
 
-2. **Custom Browser Tool Engine & A11y Tree Parser**:
+2. **Zustand Reactive Store & Real-Time Pipeline**:
+   - Designed and built the centralized Zustand store (`useAgentStore.ts`), implementing `persist` middleware, idempotent step deduplication, zero-stale-closure SSE streaming, and URL synchronization.
+   - Built the asynchronous `RunEventHub` and `EventSourceResponse` pipeline with SSE padding blocks to bypass AWS Lambda HTTP response buffering.
+
+3. **Custom Browser Tool Engine & A11y Tree Parser**:
    - Authored the core Playwright wrapper tools (`navigate`, `read_page`, `click`, `fill`, `select`, `take_screenshot`, `check_exists`).
    - Implemented an accessibility-tree DOM condensation algorithm reducing raw 500KB HTML DOMs into clean, semantically rich 2–5KB YAML/JSON trees optimized for LLM token limits and context clarity.
-
-3. **Real-Time SSE Streaming & Lease Protocol**:
-   - Engineered the asynchronous `RunEventHub` and `EventSourceResponse` pipeline with SSE padding blocks to bypass AWS Lambda HTTP response buffering.
-   - Built a distributed run-lease mechanism in PostgreSQL (`backend/run_lease.py`) preventing duplicate concurrent runs and automatically reaping orphaned processes.
 
 4. **Deterministic Verification Engine**:
    - Designed the multi-entity state comparison engine (`backend/verification.py`) that independently queries Neon PostgreSQL to score agent accuracy without relying on LLM self-reporting.
@@ -131,13 +189,13 @@ As the lead engineer on this submission, my personal contributions span the end-
 
 ---
 
-## 4. Tools & AI Assistance Disclosure
+## 5. Tools & AI Assistance Disclosure
 
 In alignment with modern senior engineering practices, this project was developed utilizing AI-accelerated pair programming tools alongside standard industry toolchains.
 
 ### Toolchain & Frameworks
 - **Runtime & Orchestration**: Python 3.12, FastAPI, Uvicorn, Pydantic v2, `asyncpg`, `sse-starlette`.
-- **Frontend & UI**: Next.js 16 App Router, TypeScript, Tailwind CSS v4, Lucide Icons.
+- **Frontend & State**: Next.js 16 App Router, Zustand, TypeScript, Tailwind CSS v4, Lucide Icons.
 - **Browser Automation**: Microsoft Playwright (`playwright.async_api`), Chrome DevTools Protocol (CDP).
 - **Cloud & Data**: AWS Lambda, Cloudflare Workers, Neon PostgreSQL, Upstash Redis, Docker.
 - **Language Models**: Groq Cloud API serving `openai/gpt-oss-120b`.
@@ -148,13 +206,13 @@ In alignment with modern senior engineering practices, this project was develope
   - Used for generating unit and integration test fixtures across edge cases.
 - **Human Engineering & Ownership (100% Manual Execution & Direction)**:
   - System architecture design, database schema topology, and distributed transaction boundaries.
-  - Core ReAct loop logic, idempotency protocols, and recovery state machines.
+  - Core ReAct loop logic, idempotency protocols, Zustand state reducer logic, and recovery state machines.
   - Cloud infrastructure configuration, CORS policies, and serverless streaming adapters.
   - Code review, vulnerability mitigation, and end-to-end verification.
 
 ---
 
-## 5. Known Limitations & Failure Modes
+## 6. Known Limitations & Failure Modes
 
 While resilient and production-capable for standard enterprise web applications, the system exhibits specific operational boundaries:
 
@@ -172,7 +230,7 @@ While resilient and production-capable for standard enterprise web applications,
 
 ---
 
-## 6. What to Build Next: Enterprise Roadmap
+## 7. What to Build Next: Enterprise Roadmap
 
 To scale this prototype into an enterprise-wide autonomous workforce platform, the following architectural milestones are planned:
 

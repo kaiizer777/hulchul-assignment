@@ -1,93 +1,107 @@
 # Autonomous Browser Agent for ERP Operations & Invoice Processing
 
-Production-grade, resilient autonomous AI agent executing browser-based ERP workflows, invoice reconciliation, and automated exception handling with human-in-the-loop approval gates.
+[![Frontend](https://img.shields.io/badge/Frontend-Next.js%2016%20%7C%20Zustand-black?style=flat-square&logo=nextdotjs)](https://nextjs.org/)
+[![Backend](https://img.shields.io/badge/Backend-FastAPI%20%7C%20Python%203.12-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
+[![Browser](https://img.shields.io/badge/Browser-Playwright%20Remote%20CDP-2EAD33?style=flat-square&logo=playwright)](https://playwright.dev/)
+[![Database](https://img.shields.io/badge/Database-Neon%20Postgres%20%7C%20Upstash%20Redis-00E599?style=flat-square&logo=postgresql)](https://neon.tech/)
+[![LLM](https://img.shields.io/badge/LLM-Groq%20(GPT--OSS--120B)-F55036?style=flat-square)](https://groq.com/)
 
-> 📄 **Submission Documentation**: Comprehensive architecture review, 5-pillar alignment, recovery protocols, and enterprise roadmap are documented in the [**Engineering Submission Note**](ENGINEERING_NOTE.md).
+A production-grade, resilient autonomous AI browser agent engineered for enterprise ERP workflows, invoice reconciliation, and exception handling with human-in-the-loop (HITL) approval gates.
 
----
-
-## Tech Stack
-
-- **AWS Lambda** through Terraform (`infra/aws`: `lambda.tf`, `ecr.tf`, `iam.tf`) via AWS Lambda Web Adapter — runs FastAPI Backend Orchestrator (Python 3.12, Uvicorn, Pydantic v2).
-- **Cloudflare Workers** (`@opennextjs/cloudflare`) — serves Next.js 16 Frontend & Mock ERP (App Router, Turbopack, TypeScript, Tailwind CSS v4).
-- **Database**: Neon Serverless PostgreSQL (`asyncpg`), storing invoices, purchase orders, agent runs, and step audit trails with base64 screenshots.
-- **State & Coordination**: Upstash Redis (Serverless REST API) for active session state, pause/resume flags, and nonces for human-in-the-loop approval gates.
-- **AI / LLM**: Groq API running `openai/gpt-oss-120b` for ReAct (Reason + Act) loop orchestration.
-- **Browser Automation**: Playwright connecting over Remote CDP (Browserless / Steel.dev) — zero local browser binaries in serverless containers.
+> 📄 **Detailed Engineering Submission**: For deep-dive architectural trade-offs, state machine internals, recovery mechanics, and enterprise roadmap, see [**ENGINEERING_NOTE.md**](ENGINEERING_NOTE.md).
 
 ---
 
-## Architecture & Flow
+## 🎯 5 Core Assignment Pillars
+
+| Pillar | Implementation | Highlight |
+| :--- | :--- | :--- |
+| **1. Working Execution** | Autonomous multi-page navigation across `/invoices`, `/purchase-orders`, `/vendors`, and `/invoices/new` | Reconciles line items, extracts PO numbers, handles form inputs, and records audit logs |
+| **2. Dynamic Adaptability** | Zero-code prompt interpretation for custom vendor filters & dynamic approval thresholds | E.g. *"Hold anything over ₹25,000 for approval"* dynamically reconfigures execution boundaries |
+| **3. Recovery & Idempotency** | Pre-mutation `check_exists` guards, session re-attachment, and crash resumption | Safely resumes from last successful step (`step_index + 1`) on simulated 500s or network drops |
+| **4. Verified Completion** | Deterministic post-execution SQL verification engine | Compares ERP database mutations against ground truth with cryptographic pass/fail receipts |
+| **5. Human-in-the-Loop** | Non-blocking pause, SSE event broadcasting, and real-time approval modals | High-value invoices trigger approval gates resolved via atomic Upstash Redis nonces |
+
+---
+
+## 🏗️ Architecture & Telemetry Flow
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant ControlUI as Next.js Control UI (/agent)
-    participant FastAPI as FastAPI Backend (ReAct Loop)
-    participant Redis as Upstash Redis (Session/Approval)
-    participant Groq as Groq LLM (GPT-OSS-120b)
-    participant CDP as Remote Playwright CDP (Browserless)
-    participant ERP as Mock Next.js ERP (/invoices)
+    participant User as Operator (Control UI)
+    participant Store as Zustand Store (Client)
+    participant API as FastAPI (AWS Lambda)
+    participant Redis as Upstash Redis (Lease/Gate)
+    participant Groq as Groq (GPT-OSS-120B)
+    participant CDP as Remote CDP (Playwright)
+    participant ERP as Mock ERP (/invoices)
     participant DB as Neon PostgreSQL
 
-    User->>ControlUI: Enter plain-English goal & threshold
-    ControlUI->>FastAPI: POST /api/agent/run (Goal)
-    FastAPI->>DB: Create agent_run record
-    loop ReAct Orchestration Loop
-        FastAPI->>CDP: read_page() (Accessibility tree snapshot)
-        CDP-->>FastAPI: DOM Accessibility Tree (~2-5KB)
-        FastAPI->>Groq: Send Context (Goal + History + Snapshot)
-        Groq-->>FastAPI: Tool Call (navigate, fill, click, check_exists)
-        alt Approval Required (>₹50k or custom threshold)
-            FastAPI->>Redis: Set state awaiting_approval
-            FastAPI->>ControlUI: SSE Event: needs_approval
-            ControlUI->>User: Display Approval Modal
-            User->>ControlUI: Click Approve / Reject
-            ControlUI->>FastAPI: POST /api/agent/approve
-            FastAPI->>Redis: Set state approved
+    User->>Store: Select Preset / Enter Custom Goal
+    Store->>API: POST /api/agent/run
+    API->>DB: Initialize Run & Acquire Distributed Lease
+    API-->>Store: Return run_id & Open SSE Stream
+    loop ReAct Autonomous Loop
+        API->>CDP: read_page() (Compact A11y Tree 2-5KB)
+        CDP->>ERP: Inspect DOM Elements
+        API->>Groq: Prompt (Goal + Step History + A11y Snapshot)
+        Groq-->>API: Tool Action (navigate, fill, click, check_exists)
+        alt Threshold Exceeded (>₹25k or custom)
+            API->>Redis: Set state = awaiting_approval + nonce
+            API-->>Store: SSE Event: needs_approval
+            Store->>User: Render Interactive Approval Modal
+            User->>Store: Click Approve / Reject
+            Store->>API: POST /api/agent/runs/:id/approval
+            API->>Redis: Resolve nonce & resume loop
         end
-        FastAPI->>CDP: Execute Tool Action
-        CDP->>ERP: Interact with ERP UI
-        ERP-->>CDP: Response / DOM state
-        FastAPI->>DB: Persist step result & base64 screenshot
-        FastAPI->>ControlUI: SSE Event: step result
+        API->>CDP: Execute Tool Action on ERP
+        API->>DB: Persist Step Record & Base64 Screenshot
+        API-->>Store: SSE Event: step_complete / step_failed
+        Store->>Store: Deduplicate & Upsert Step (Idempotent)
     end
-    FastAPI->>DB: Final state verification & verification report
-    FastAPI->>ControlUI: SSE Event: done (Summary & Verification Table)
+    API->>DB: Run Deterministic Verification Sweep
+    API-->>Store: SSE Event: done + Verification Report
 ```
 
 ---
 
-## Local Setup & Running
+## ⚡ Frontend State Architecture (Zustand)
+
+The control workstation (`/agent`) is powered by a centralized **Zustand** store ([`useAgentStore.ts`](frontend/src/app/store/useAgentStore.ts)) engineered for real-time telemetry and zero-latency UI reactivity:
+
+- **Single Source of Truth**: Centralizes agent execution status, SSE connection states (`disconnected`, `connecting`, `connected`, `reconnecting`, `closed`), step timeline, verification reports, approval nonces, and execution metrics.
+- **`persist` Middleware & URL Synchronization**: Persists active goals, preset selections (`all_pending`, `vendor_acme`, `approval_threshold`), and auto-scroll preferences in `localStorage` across page refreshes, automatically synchronizing with URL query parameters (`?preset=vendor_acme`).
+- **Idempotent Step Deduplication**: `upsertStepEvent` matches incoming telemetry by unique `step_id` or `step_index`, seamlessly merging incremental results, errors, and screenshots without timeline jitter or duplicate entries.
+- **Zero Stale Closures in SSE Streams**: Stream listeners and approval fallback polling access state dynamically via Zustand's `get()`/`set()` references, eliminating stale closure bugs during rapid event bursts.
+- **Defensive Connection Lifecycle**: Auto-cleans active streams, aborts pending fetch signals via `AbortController`, and recovers from transient connection drops with automatic exponential backoff.
+
+---
+
+## 🚀 Quick Start & Local Setup
 
 ### Prerequisites
-- Node.js v18+ and `npm`
-- Python 3.12+ and `pip`
-- Accounts for Neon Postgres, Upstash Redis, Groq, and Browserless/Steel.dev (or local Playwright CDP instance).
+- Node.js v18+ & Python 3.12+
+- Neon PostgreSQL, Upstash Redis, Groq API key, and Remote CDP endpoint (Browserless or local Chromium)
 
-### 1. Clone Repository & Install Dependencies
+### 1. Clone & Install
 
 ```bash
 git clone https://github.com/kaiizer777/hulchul-assignment.git
 cd hulchul-assignment
 
-# Install Frontend dependencies
-cd frontend
-npm install
-cd ..
+# Frontend dependencies
+cd frontend && npm install && cd ..
 
-# Install Backend dependencies
+# Backend dependencies & virtualenv
 cd backend
 python -m venv .venv
-# Activate virtual environment:
-# Windows PowerShell: .\.venv\Scripts\Activate.ps1
-# Linux/macOS: source .venv/bin/activate
+# Activate: .\.venv\Scripts\Activate.ps1 (Win) or source .venv/bin/activate (Linux/Mac)
 pip install -r requirements.txt
 cd ..
 ```
 
-### 2. Configure Environment Variables
-Copy `.env.example` to `.env` in the root (or configure individual environment variables):
+### 2. Environment Configuration
+Copy `.env.example` to `.env` in the root:
 
 ```env
 GROQ_API_KEY=your_groq_api_key
@@ -96,11 +110,9 @@ UPSTASH_REDIS_REST_URL=https://your-redis.upstash.io
 UPSTASH_REDIS_REST_TOKEN=your_redis_token
 BROWSER_WS_ENDPOINT=wss://chrome.browserless.io?token=your_token
 NEXT_PUBLIC_API_URL=http://localhost:3051
-SIMULATE_FAILURE_AFTER=
 ```
 
-### 3. Database Schema Setup & Seeding
-
+### 3. Initialize Database & Seed
 ```bash
 cd backend
 python init_db.py
@@ -108,112 +120,34 @@ python seed_db.py
 cd ..
 ```
 
-### 4. Running Locally
+### 4. Run Locally
+```bash
+# Terminal 1: Next.js Frontend & Mock ERP (Port 3051)
+cd frontend && npm run dev
 
-- **Start Mock ERP & Control UI (Frontend)**:
-  ```bash
-  cd frontend
-  npm run dev
-  ```
-  Runs on `http://localhost:3051`.
+# Terminal 2: FastAPI Orchestrator (Port 8051)
+cd backend && uvicorn main:app --reload --port 8051
+```
 
-- **Start FastAPI Orchestrator (Backend)**:
-  ```bash
-  cd backend
-  uvicorn main:app --reload --port 8051
-  ```
-  Runs on `http://localhost:8051` (API docs at `http://localhost:8051/docs`).
+- Control UI: `http://localhost:3051/agent`
+- Mock ERP: `http://localhost:3051/invoices`
+- API Docs: `http://localhost:8051/docs`
 
 ---
 
-## Environment Variables Reference
+## 🧪 Testing
 
-| Variable | Description | Required | Default |
-| :--- | :--- | :--- | :--- |
-| `GROQ_API_KEY` | Groq API key for LLM ReAct loop execution (`openai/gpt-oss-120b`) | Yes | None |
-| `DATABASE_URL` | Neon Serverless PostgreSQL connection string | Yes | None |
-| `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL for session and approval gates | Yes | None |
-| `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST token | Yes | None |
-| `BROWSER_WS_ENDPOINT` | WebSocket CDP endpoint for remote browser (Browserless/Steel.dev) | Yes | None |
-| `NEXT_PUBLIC_API_URL` | ERP frontend base URL used for backend navigation | Yes | `http://localhost:3051` |
-| `NEXT_PUBLIC_BACKEND_URL` | Backend base URL inlined into the **client bundle at build time**. Must be set when building for Cloudflare. A `[vars]` entry of the same name in `wrangler.toml` is a runtime Worker binding and is **not** visible to the browser | Yes (for Cloudflare builds) | Production Lambda URL via `frontend/.env.production` |
-| `SIMULATE_FAILURE_AFTER` | Simulates ERP 500 error after N invoice submissions for recovery testing | No | Empty (Disabled) |
+```bash
+# Frontend Unit & Store Tests
+cd frontend && npm test
+
+# Backend Integration & Agent Tests
+cd backend && python -m pytest backend/tests/
+```
 
 ---
 
-## Deployment
+## 📦 Deployment Overview
 
-### Frontend (Cloudflare Worker)
-
-```bash
-cd frontend
-npm run deploy:cloudflare
-```
-
-This builds the OpenNext bundle, asserts that `NEXT_PUBLIC_BACKEND_URL` was actually
-inlined into a client chunk (`npm run verify:cloudflare`), and only then deploys with
-Wrangler. Run the steps separately while iterating:
-
-```bash
-npm run build:cloudflare
-npm run verify:cloudflare
-npm run verify:secrets
-npx wrangler deploy
-```
-
-Both `DATABASE_URL` (Neon) and `UPSTASH_REDIS_REST_TOKEN` (Upstash Redis) must be
-provisioned on the Worker **before** deploying, because both are read from
-`process.env` at request time and a missing one is not a build error — it only shows
-up as `/api/*` routes failing once the deploy is live. `npm run deploy:cloudflare`
-now runs `npm run verify:secrets` between the bundle check and the upload and refuses
-to deploy if either secret is absent or unverifiable. Provision them out of band:
-
-```bash
-cd frontend
-npx wrangler secret put DATABASE_URL
-npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
-```
-
-`DATABASE_URL` must be a Worker **secret**, not a `[vars]` entry in `wrangler.toml`:
-it embeds the Neon account password, and `wrangler.toml` is committed to git. The
-check reads secret *names* only and never values.
-
-### Backend (AWS Lambda via ECR)
-
-```powershell
-cd infra/aws
-.\deploy.ps1
-```
-
-The Docker build uses the **repository root** as its context so that the `backend`
-package layout is preserved inside the image.
-
-#### Manual gate: container image import check
-
-CI cannot run Docker, so the image layout is asserted statically in
-`backend/tests/test_phase7_deploy.py`. After changing `backend/Dockerfile` or the build
-context, run the behavioural check by hand before deploying:
-
-```bash
-docker build -t hulchul-backend:check -f backend/Dockerfile .
-docker run --rm --entrypoint python hulchul-backend:check -c "import backend.main"
-```
-
-A failure here means `from backend.config import settings` cannot resolve inside the
-image, and every Lambda endpoint will return `Extension.Crash`.
-
----
-
-## Test Execution
-
-### Frontend Tests
-```bash
-cd frontend
-npm test
-```
-
-### Backend Tests
-```bash
-cd backend
-python -m pytest backend/tests/
-```
+- **Frontend (Cloudflare Workers)**: Built via `@opennextjs/cloudflare` with static asset bundling and Edge API routes (`npm run deploy:cloudflare`).
+- **Backend (AWS Lambda via ECR)**: Packaged as a lightweight container (~80MB) using the AWS Lambda Web Adapter (`infra/aws/deploy.ps1`).
