@@ -48,7 +48,7 @@ export async function POST(request: Request) {
       body: JSON.stringify({ password: parsed.data.password }),
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)]),
     });
-    return await relayAuthResponse(upstream);
+    return await relayAuthResponse(upstream, request);
   } catch {
     // The submitted password is never included in the log line.
     console.error('[auth] POST /api/auth/login upstream request failed');

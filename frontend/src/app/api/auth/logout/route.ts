@@ -32,7 +32,7 @@ export async function POST(request: Request) {
       },
       signal: AbortSignal.any([request.signal, AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)]),
     });
-    return await relayAuthResponse(upstream);
+    return await relayAuthResponse(upstream, request);
   } catch {
     // No local cookie clear on this path. Without the upstream DELETE the Redis
     // key survives, so clearing the cookie would only hide a still-valid session
