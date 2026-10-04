@@ -51,6 +51,9 @@ ACTIVE_STATUS_GUARD = "status = ANY($4::text[])"
 UPSERT_LEASE_GUARD = "agent_runs.lease_expires_at IS NULL"
 UPSERT_EXPIRED_GUARD = "agent_runs.lease_expires_at <= now()"
 UPSERT_SAME_OWNER_GUARD = "agent_runs.owner_id = EXCLUDED.owner_id"
+# The sweep's rollout guard: a row this lease scheme has never owned is not a candidate.
+ATTEMPTED_GUARD = "AND attempt > 0"
+OWNER_RECHECK_QUERY = "SELECT owner_id FROM agent_runs"
 
 
 def _now() -> datetime:
@@ -75,8 +78,9 @@ class _FakeConn:
         self._pool.record(query, args)
         self._pool.maybe_fail(query)
 
-        # The row-lock probe issued before the claim. Returns the row as it stands
-        # so a caller can see what it locked; it changes nothing.
+        # The row-lock probe is gone: `pool.acquire()` is not a transaction, so such a
+        # SELECT autocommits and drops its lock before the UPDATE could use it. Kept
+        # here only so a reintroduced probe shows up as an unexpected extra statement.
         if "FOR UPDATE" in query:
             for row in self._pool.rows:
                 if str(row["run_id"]) == str(args[0]):
@@ -130,12 +134,40 @@ class _FakeConn:
         self._pool.record(query, args)
         self._pool.maybe_fail(query)
         if "SELECT" in query and "agent_runs" in query:
-            # Deliberately over-broad: returns every seeded row regardless of the
-            # WHERE clause. That is what makes the CAS in reconcile_orphaned_agent_runs
-            # the load-bearing protection -- if the sweep ever lost its status guard,
-            # a paused or awaiting_approval run would be failed by these rows.
-            return [dict(r) for r in self._pool.rows]
+            # Deliberately over-broad on the filter: returns every seeded row
+            # regardless of the WHERE clause. That is what makes the CAS in
+            # reconcile_orphaned_agent_runs the load-bearing protection -- if the
+            # sweep ever lost its status guard, a paused or awaiting_approval run
+            # would be failed by these rows.
+            rows = [dict(r) for r in self._pool.rows]
+            if "LIMIT $1" in query and args:
+                # LIMIT is honoured because it is real database behaviour the batch
+                # drain in reconcile_orphaned_agent_runs depends on, unlike the WHERE
+                # clause which is deliberately not modelled so the CAS stays the thing
+                # under test. Status is ordered ahead of the rest for the same reason:
+                # Postgres filters before it limits, so without this a second batch
+                # would keep re-reading the rows the first batch already reclaimed.
+                # Non-running rows are still delivered once the running ones run out,
+                # which is what keeps the CAS load-bearing.
+                if STATUS_GUARD in query:
+                    running = [r for r in rows if r["status"] == "running"]
+                    others = [r for r in rows if r["status"] != "running"]
+                    rows = (running + others)[: int(args[0])]
+                else:
+                    rows = rows[: int(args[0])]
+            return rows
         return []
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        """Post-sweep ownership re-read that gates the Redis / hub mirrors."""
+        self._pool.record(query, args)
+        self._pool.maybe_fail(query)
+        if OWNER_RECHECK_QUERY in query:
+            for row in self._pool.rows:
+                if str(row["run_id"]) == str(args[0]):
+                    return row.get("owner_id")
+            return None
+        return None
 
     async def execute(self, query: str, *args: Any) -> str:
         self._pool.record(query, args)
@@ -233,6 +265,8 @@ class _FakePool:
         if OWNER_SCOPED_GUARD in query and len(args) > 1:
             if row.get("owner_id") != args[1]:
                 return False
+        if ATTEMPTED_GUARD in query and int(row.get("attempt") or 0) < 1:
+            return False
         return True
 
     def upsert_guards_pass(self, row: Dict[str, Any], query: str, owner_id: Any) -> bool:
@@ -450,19 +484,26 @@ class TestRunLeaseClaim(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await claim_run_lease(pool, "not-a-uuid", "owner-a", 900.0))
         self.assertEqual(pool.executed, [], "a malformed id must never reach the database")
 
-    async def test_07_claim_locks_the_row_before_claiming(self) -> None:
+    async def test_07_claim_is_a_single_conditional_update(self) -> None:
+        """No row-lock probe: `pool.acquire()` is not a transaction.
+
+        A `SELECT ... FOR UPDATE SKIP LOCKED` issued outside a transaction autocommits
+        and releases its row lock before the UPDATE runs, so it excluded nobody and cost
+        a round trip. The conditional UPDATE is what serialises claimants: the second
+        one blocks on the first's row lock and re-evaluates its WHERE against the
+        committed row. This pins that the claim is still exactly one statement carrying
+        every guard, so the property does not depend on a probe coming back.
+        """
         run_id = str(uuid.uuid4())
         pool = _FakePool([_row(status="running", run_id=run_id)])
 
         await claim_run_lease(pool, run_id, "owner-a", 900.0)
 
-        locks = pool.find("FOR UPDATE SKIP LOCKED")
-        self.assertEqual(len(locks), 1)
-        self.assertLess(
-            pool.executed.index(locks[0]),
-            pool.executed.index(pool.find("UPDATE agent_runs")[0]),
-            "the lock must be taken before the claim",
-        )
+        self.assertEqual(pool.find("FOR UPDATE"), [])
+        claims = pool.find("UPDATE agent_runs")
+        self.assertEqual(len(claims), 1, "the claim must be a single statement")
+        self.assertIn(STATUS_GUARD, claims[0][0])
+        self.assertIn(LEASE_FREE_GUARD, claims[0][0])
 
 
 class TestRunLeaseRenewRelease(unittest.IsolatedAsyncioTestCase):
@@ -593,17 +634,21 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
         pool: _FakePool,
         redis: Optional[_FakeRedis] = None,
         hub: Optional[_FakeHub] = None,
+        limit: int = 50,
+        max_batches: int = 10,
     ) -> List[str]:
         redis = redis or _FakeRedis()
         hub = hub or _FakeHub()
         with patch("backend.run_lease.get_redis_client", return_value=redis), patch(
             "backend.main.run_event_hub", hub
         ):
-            return await reconcile_orphaned_agent_runs(pool)
+            return await reconcile_orphaned_agent_runs(
+                pool, limit=limit, max_batches=max_batches
+            )
 
     async def test_01_sweeps_expired_running_row_and_records_the_reason(self) -> None:
         run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", owner_id="dead", lease_expires_at=_expired(), run_id=run_id)])
+        pool = _FakePool([_row(status="running", owner_id="dead", lease_expires_at=_expired(), attempt=1, run_id=run_id)])
 
         reclaimed = await self._reconcile(pool)
 
@@ -618,7 +663,7 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
         this proves the conditional UPDATE is what protects these runs rather than
         the SELECT's WHERE clause alone.
         """
-        expired_running = _row(status="running", owner_id="dead", lease_expires_at=_expired())
+        expired_running = _row(status="running", owner_id="dead", lease_expires_at=_expired(), attempt=1)
         paused = _row(status="paused", owner_id=None, lease_expires_at=None)
         awaiting = _row(status="awaiting_approval", owner_id=None, lease_expires_at=None)
         stalled = _row(status="stalled", owner_id=None, lease_expires_at=None)
@@ -650,7 +695,7 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
 
     async def test_05_hits_db_redis_and_hub_for_each_orphan(self) -> None:
         run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), run_id=run_id)])
+        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), attempt=1, run_id=run_id)])
         redis, hub = _FakeRedis(), _FakeHub()
 
         await self._reconcile(pool, redis, hub)
@@ -668,7 +713,7 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
 
     async def test_06_survives_redis_failure_and_still_terminalises(self) -> None:
         run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), run_id=run_id)])
+        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), attempt=1, run_id=run_id)])
         hub = _FakeHub()
 
         reclaimed = await self._reconcile(pool, _FakeRedis(fail=True), hub)
@@ -679,7 +724,7 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
 
     async def test_07_survives_hub_failure_and_still_mirrors_to_redis(self) -> None:
         run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), run_id=run_id)])
+        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), attempt=1, run_id=run_id)])
         redis = _FakeRedis()
 
         reclaimed = await self._reconcile(pool, redis, _FakeHub(fail=True))
@@ -691,7 +736,7 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
     async def test_08_survives_step_insert_failure(self) -> None:
         run_id = str(uuid.uuid4())
         pool = _FakePool(
-            [_row(status="running", lease_expires_at=_expired(), run_id=run_id)],
+            [_row(status="running", lease_expires_at=_expired(), attempt=1, run_id=run_id)],
             fail_on=["INSERT INTO agent_steps"],
         )
         redis, hub = _FakeRedis(), _FakeHub()
@@ -704,14 +749,14 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
 
     async def test_09_primary_db_write_failure_reclaims_nothing(self) -> None:
         pool = _FakePool(
-            [_row(status="running", lease_expires_at=_expired())],
+            [_row(status="running", lease_expires_at=_expired(), attempt=1)],
             fail_on=["SET status = $2"],
         )
         with self.assertLogs("backend.run_lease", level="ERROR"):
             self.assertEqual(await self._reconcile(pool), [])
 
     async def test_10_candidate_enumeration_failure_reclaims_nothing(self) -> None:
-        pool = _FakePool([_row(status="running", lease_expires_at=_expired())], fail_on=["SELECT run_id"])
+        pool = _FakePool([_row(status="running", lease_expires_at=_expired(), attempt=1)], fail_on=["SELECT run_id"])
         with self.assertLogs("backend.run_lease", level="ERROR"):
             self.assertEqual(await self._reconcile(pool), [])
 
@@ -719,6 +764,93 @@ class TestReconcileOrphanedAgentRuns(unittest.IsolatedAsyncioTestCase):
         """A novel status would leave the frontend's terminal set hanging."""
         self.assertIn(ORPHANED_RUN_STATUS, TERMINAL_RUN_STATUSES)
         self.assertEqual(ORPHANED_RUN_STATUS, "failed")
+
+    async def test_12_never_sweeps_a_row_the_lease_scheme_never_owned(self) -> None:
+        """Rollout safety: a pre-lease execution is live, not orphaned.
+
+        An execution started by the pre-lease code writes no owner_id and no
+        lease_expires_at, so a sweep in a freshly deployed environment sees a NULL lease
+        on a run that is still driving a browser. Failing it declares the run dead
+        while it keeps clicking in the ERP. attempt = 0 means "no lease-aware
+        execution has ever owned this row", which is exactly the set the sweep must
+        decline.
+        """
+        legacy = _row(status="running", owner_id=None, lease_expires_at=None, attempt=0)
+        leased_once = _row(
+            status="running", owner_id=None, lease_expires_at=None, attempt=1
+        )
+        pool = _FakePool([legacy, leased_once])
+        hub = _FakeHub()
+
+        reclaimed = await self._reconcile(pool, _FakeRedis(), hub)
+
+        self.assertEqual(reclaimed, [leased_once["run_id"]])
+        self.assertEqual(pool.row(legacy["run_id"])["status"], "running")
+        self.assertIn(ATTEMPTED_GUARD, pool.find("SET status = $2")[0][0])
+        self.assertNotIn(legacy["run_id"], [r for r, _ in hub.published])
+
+    async def test_13_drains_more_than_one_batch(self) -> None:
+        """A backlog larger than one batch must not wait for the next cold start."""
+        pool = _FakePool(
+            [
+                _row(status="running", lease_expires_at=_expired(), attempt=1)
+                for _ in range(5)
+            ]
+        )
+
+        reclaimed = await self._reconcile(pool, limit=2)
+
+        self.assertEqual(len(reclaimed), 5)
+        self.assertEqual(len(pool.find("SELECT run_id")), 3, "2 + 2 + 1 batches")
+
+    async def test_14_batch_count_is_bounded(self) -> None:
+        """The drain must not become an unbounded write burst on a cold start."""
+        pool = _FakePool(
+            [
+                _row(status="running", lease_expires_at=_expired(), attempt=1)
+                for _ in range(10)
+            ]
+        )
+
+        with self.assertLogs("backend.run_lease", level="ERROR"):
+            reclaimed = await self._reconcile(pool, limit=1, max_batches=3)
+
+        self.assertEqual(len(reclaimed), 3)
+        self.assertEqual(len(pool.find("SELECT run_id")), 3)
+
+    async def test_15_new_owner_keeps_the_read_models(self) -> None:
+        """The mirrors are not the source of truth and must not clobber a live owner.
+
+        Between the sweep's UPDATE and the Redis write, a resume or duplicate dispatch
+        can legitimately claim the row (its upsert takes over a terminal row with a
+        NULL lease). set_session_state replaces the whole hash, so writing here would
+        overwrite the new owner's running snapshot and broadcast a terminal status for a
+        run being executed right now.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", lease_expires_at=_expired(), attempt=1, run_id=run_id)]
+        )
+        redis, hub = _FakeRedis(), _FakeHub()
+        agent = _agent(pool, run_id)
+
+        async def _reclaim(*args: Any, **kwargs: Any) -> Any:
+            # A new owner claims the run the instant the sweep has written its status.
+            taken = await agent.ensure_run_record("goal")
+            self.assertTrue(taken)
+            return "INSERT 0 1"
+
+        with patch.object(_FakeConn, "execute", side_effect=_reclaim):
+            reclaimed = await self._reconcile(pool, redis, hub)
+
+        self.assertEqual(reclaimed, [run_id])
+        self.assertEqual(pool.row(run_id)["owner_id"], agent._run_owner_id)
+        self.assertEqual(hub.published, [], "a terminal status was broadcast over a live owner")
+        self.assertNotIn(run_id, redis.states)
+        self.assertTrue(
+            any(OWNER_RECHECK_QUERY in q for q in pool.queries()),
+            "the mirrors must be gated on a fresh ownership read",
+        )
 
 
 class TestEnsureRunRecordLease(unittest.IsolatedAsyncioTestCase):
@@ -976,6 +1108,60 @@ class TestRunStatusFencing(unittest.IsolatedAsyncioTestCase):
         row = pool.row(agent.run_id)
         self.assertEqual(row["owner_id"], "owner-new")
         self.assertEqual(row["status"], "running")
+
+    async def test_08_a_failed_status_write_keeps_the_lease(self) -> None:
+        """Releasing on the failure path would hand a live run to the sweep.
+
+        The write raises, so agent_runs.status stays 'running' -- and clearing
+        owner_id / lease_expires_at then makes the row match the orphan predicate
+        exactly. The next startup sweep, or a duplicate request, can claim a run this
+        execution is still driving, and nothing renews or fences it any more. Leaving
+        the lease in place is safe: it lapses on its own.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-me", lease_expires_at=_live(), run_id=run_id)]
+        )
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = "owner-me"
+        agent.emit_event = AsyncMock()
+
+        with patch.object(_FakeConn, "execute", side_effect=RuntimeError("db blip")):
+            await agent.update_run_status("completed")
+
+        row = pool.row(run_id)
+        self.assertEqual(row["status"], "running", "the write must not have landed")
+        self.assertEqual(row["owner_id"], "owner-me", "the lease was released anyway")
+        self.assertIsNotNone(row["lease_expires_at"])
+        self.assertIsNone(agent._run_heartbeat_task)
+        agent.emit_event.assert_not_awaited()
+
+    async def test_09_a_successful_terminal_write_still_releases(self) -> None:
+        """The landed case must keep releasing, or finished runs hold a live lease."""
+        pool, agent = self._leased_agent("owner-me", "owner-me")
+
+        await agent.update_run_status("completed")
+
+        row = pool.row(agent.run_id)
+        self.assertEqual(row["status"], "completed")
+        self.assertIsNone(row["owner_id"])
+        self.assertIsNone(row["lease_expires_at"])
+
+    async def test_10_a_fenced_out_terminal_write_does_not_release(self) -> None:
+        """A superseded owner must not touch the new owner's lease at all.
+
+        The renew the heartbeat depends on is owner-scoped, so a superseded execution
+        cannot keep a lease alive either way -- but clearing state it does not own is
+        needless, and `stop_run_lease` is exactly the call that would do it.
+        """
+        pool, agent = self._leased_agent("owner-new", "owner-old")
+
+        await agent.update_run_status("completed")
+
+        row = pool.row(agent.run_id)
+        self.assertEqual(row["owner_id"], "owner-new")
+        self.assertIsNotNone(row["lease_expires_at"])
+        self.assertEqual(pool.find("owner_id = NULL"), [])
 
 
 class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
@@ -1516,6 +1702,69 @@ class TestOwnershipLossStopsTheRun(unittest.IsolatedAsyncioTestCase):
         )
         harness.tools.execute.assert_not_awaited()
 
+    async def test_12_ownership_lost_while_emitting_step_start_blocks_the_action(self) -> None:
+            """The pre-action guard does not span the step_start emit.
+
+            `emit_event` awaits the on_event callback and the hub publish, so ownership can
+            be reported lost while it is in flight. One check cannot cover a window it does
+            not span: the click that creates an invoice must not begin on a lease this
+            execution has already lost.
+            """
+            harness = _LoopHarness(
+                [_tool_call_message("c1", "click", {"selector": "Create Invoice"})]
+            )
+            agent = harness.agent
+            harness.read_page_ok()
+            harness.tools.execute = AsyncMock(return_value={"success": True})
+
+            async def _on_event(evt: Dict[str, Any]) -> None:
+                harness.events.append(evt)
+                if evt.get("type") == "step_start":
+                    agent._mark_run_lease_lost()
+
+            agent.on_event = _on_event
+
+            result = await self._run(harness)
+
+            harness.tools.execute.assert_not_awaited()
+            self.assertIn("step_start", harness.event_types())
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("lease", result["summary"])
+
+    async def test_13_approval_gate_does_not_consume_a_decision_it_lost_ownership_of(self) -> None:
+            """The decision read is an await, so the check cannot sit only before it.
+
+            Consuming the decision anyway would clear the approval keys and, on the
+            rejection path, mark the invoice skipped in Neon -- for a run this execution no
+            longer owns.
+            """
+            harness = _LoopHarness([_text_message("still working")])
+            agent = harness.agent
+            redis = _unconfigured_redis()
+            redis.is_configured = True
+            redis.execute_command = AsyncMock(return_value=True)
+            redis.set_approval_pending = AsyncMock(return_value=True)
+            redis.clear_approval = AsyncMock(return_value=True)
+            redis.set_session_state = AsyncMock(return_value=True)
+
+            async def _decide(run_id: str) -> Optional[Dict[str, Any]]:
+                agent._mark_run_lease_lost()
+                return {"nonce": "wrong-nonce", "decision": "approved"}
+
+            redis.get_approval_decision_record = AsyncMock(side_effect=_decide)
+            agent.get_redis = AsyncMock(return_value=redis)
+
+            outcome = await asyncio.wait_for(
+                agent.handle_approval_gate(
+                    vendor="Acme", amount=60000.0, invoice_id="inv-1", po_number="PO-1"
+                ),
+                timeout=20.0,
+            )
+
+            self.assertEqual(outcome, "lease_lost")
+            redis.clear_approval.assert_not_awaited()
+            self.assertEqual(agent.update_run_status.await_count, 1)
+            self.assertEqual(agent.persist_step.await_count, 1)
 
 class TestStartupReconciliationHook(unittest.IsolatedAsyncioTestCase):
     """backend/main.py: reconciliation must run after pool init and never block boot."""
@@ -1616,6 +1865,21 @@ class TestRunLeaseConfiguration(unittest.TestCase):
             content = f.read()
         self.assertIn("RUN_LEASE_SECONDS", content)
         self.assertIn("RUN_HEARTBEAT_SECONDS", content)
+
+    def test_05_non_finite_timings_are_rejected(self) -> None:
+        """NaN and Infinity slip through comparison-only checks.
+
+        `nan <= x` and `nan >= x` are both False, so every inequality in
+        validate_run_lease_settings passes and the bad value only surfaces later as a
+        Postgres error on `make_interval(secs => 'NaN')` -- on the first run claim,
+        mid-flight, rather than at boot.
+        """
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    validate_run_lease_settings(bad, 60.0, 300.0)
+                with self.assertRaises(ValueError):
+                    validate_run_lease_settings(900.0, bad, 300.0)
 
 
 class TestLeaseDdl(unittest.TestCase):

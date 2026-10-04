@@ -3,6 +3,7 @@ Configuration management module for FastAPI backend settings.
 Loads environment variables and provides structured typed settings.
 """
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -87,7 +88,18 @@ def validate_run_lease_settings(
        between two renewals and the owner loses a run it is still executing.
 
     Raised rather than ``assert`` so the check survives ``python -O``.
+
+    Non-finite values are rejected first: every check below is a comparison, and
+    ``float('nan') <= x`` and ``float('nan') >= x`` are both False, so a NaN lease or
+    heartbeat sails through all of them and only fails later as a Postgres error on
+    ``make_interval(secs => 'NaN')`` -- on the first run claim, not at boot.
     """
+    for name, value in (
+        ("RUN_LEASE_SECONDS", lease_seconds),
+        ("RUN_HEARTBEAT_SECONDS", heartbeat_seconds),
+    ):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number, got {value!r}.")
     if lease_seconds <= pause_timeout_seconds:
         raise ValueError(
             f"RUN_LEASE_SECONDS ({lease_seconds}) must be strictly greater than "

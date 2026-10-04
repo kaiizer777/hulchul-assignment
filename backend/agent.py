@@ -482,7 +482,16 @@ class ReActAgent:
 
         A fenced-out write emits no ``status_change``: announcing a status that never
         reached the database would be a lie the SSE stream would then broadcast.
+
+        The lease is released only when the write actually landed. Releasing on the
+        failure path would clear ``owner_id`` / ``lease_expires_at`` while
+        ``agent_runs.status`` is still ``running``, which is exactly the orphan
+        predicate: the row becomes claimable by a duplicate request and by the next
+        startup sweep while this execution is still running, and nothing renews or
+        fences it any more. Leaving the lease in place is the safe direction -- it
+        lapses on its own and the run stays owned until it does.
         """
+        landed = False
         try:
             pool = await self.get_db()
             async with pool.acquire() as conn:
@@ -503,6 +512,7 @@ class ReActAgent:
                     "another execution."
                 )
                 return
+            landed = True
             await self.emit_event("status_change", {"status": status})
         except Exception as e:
             logger.error(f"Failed to update agent_runs status for {self.run_id}: {e}")
@@ -511,7 +521,7 @@ class ReActAgent:
             # is the one place guaranteed to run on each exit path. Non-terminal
             # transitions (running, paused, awaiting_approval) keep the lease: the run
             # is still the caller's to renew.
-            if status in TERMINAL_RUN_STATUSES:
+            if status in TERMINAL_RUN_STATUSES and landed:
                 await self.stop_run_lease()
 
     async def persist_step(
@@ -827,6 +837,18 @@ class ReActAgent:
             except Exception as poll_err:
                 logger.warning(f"Agent {self.run_id}: Error polling approval decision from Redis: {poll_err}")
                 continue
+
+            # Re-checked after the read, not only before it: the read is an await, so
+            # ownership can be reported lost while it is in flight. Consuming the
+            # decision anyway would clear the approval keys and, on the rejection
+            # path, mark the invoice skipped in Neon for a run this execution no
+            # longer owns.
+            if self._lease_ownership_lost:
+                logger.error(
+                    f"Agent {self.run_id}: run lease lost while reading the approval "
+                    "decision; abandoning the gate without applying it."
+                )
+                return "lease_lost"
 
             if dec_record:
                 dec_nonce = dec_record.get("nonce")
@@ -1712,6 +1734,13 @@ class ReActAgent:
                     "arguments": tool_args,
                 },
             )
+
+            # Re-checked after step_start, which awaits the on_event callback and the
+            # hub publish. A single check cannot cover a window it does not span: the
+            # heartbeat reports ownership loss on its own schedule, and the action
+            # itself must not begin on a lease this execution has already lost.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
 
             screenshot_on_fail: Optional[str] = None
             try:

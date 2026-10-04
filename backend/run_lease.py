@@ -63,8 +63,11 @@ assert not (ACTIVE_RUN_STATUSES & TERMINAL_RUN_STATUSES), (
 
 # Upper bound on how many orphans a single startup sweep will reclaim, so a database
 # that has been unreachable for a while cannot turn cold start into a long write
-# burst on the first warm invocation.
+# burst on the first warm invocation. Reclaiming continues for up to
+# DEFAULT_RECONCILE_MAX_BATCHES full batches so a backlog larger than one batch is not
+# deferred to the next cold start.
 DEFAULT_RECONCILE_LIMIT = 50
+DEFAULT_RECONCILE_MAX_BATCHES = 10
 
 # The status an orphan is moved to. Reusing an existing terminal value keeps the
 # frontend's terminal set intact; the specific cause is recorded as an 'orphaned'
@@ -119,11 +122,20 @@ async def claim_run_lease(
     the same run_id. A claim is granted only when all of the following hold, decided
     by the database in one statement:
 
-    * the row is locked (``FOR UPDATE SKIP LOCKED``), so two concurrent claimants
-      cannot both read a free lease;
     * the row is in ``status = 'running'``;
     * no owner currently holds a live lease (``lease_expires_at IS NULL`` or already
       past ``now()``).
+
+    Concurrency is handled by that conditional ``UPDATE`` alone, not by a preceding
+    ``SELECT ... FOR UPDATE SKIP LOCKED``. ``pool.acquire()`` is not a transaction, so
+    such a ``SELECT`` autocommits and drops its row lock before the ``UPDATE`` runs and
+    makes the two statements non-atomic -- the lock is released before it can exclude
+    anyone. What actually serialises concurrent claimants is that a second ``UPDATE``
+    blocks on the row lock the first one holds and then re-evaluates its ``WHERE``
+    against the committed row, finding a live lease and matching zero rows. Issuing an
+    extra statement to hold a lock that is already released would only cost a round
+    trip, so it is not issued; an earlier draft's probe was inert and its docstring
+    overstated what it did.
 
     On success ``attempt`` is incremented so a run that keeps getting reclaimed leaves
     a durable trail of how many owners it has had.
@@ -145,18 +157,6 @@ async def claim_run_lease(
     """
 
     async with pool.acquire() as conn:
-        # Lock the candidate row first. SKIP LOCKED means a concurrent claimant
-        # proceeds to its conditional UPDATE and finds nothing to take, rather than
-        # blocking behind this transaction.
-        await conn.fetchrow(
-            """
-            SELECT run_id, status, owner_id, lease_expires_at
-            FROM agent_runs
-            WHERE run_id = $1
-            FOR UPDATE SKIP LOCKED
-            """,
-            run_uuid,
-        )
         row = await conn.fetchrow(query, run_uuid, owner_id, float(lease_seconds))
 
     if row is None:
@@ -364,16 +364,66 @@ async def reconcile_orphaned_agent_runs(
     pool: asyncpg.Pool,
     limit: int = DEFAULT_RECONCILE_LIMIT,
     reason: str = "execution environment was replaced before the run reached a terminal state",
+    max_batches: int = DEFAULT_RECONCILE_MAX_BATCHES,
 ) -> List[str]:
     """Fail every run that no live owner is executing. Returns the reclaimed run ids.
 
-    A candidate is a row in ``status = 'running'`` whose lease is NULL or expired.
-    Rows in ``paused`` or ``awaiting_approval`` are never candidates: they are parked
-    on a human, and failing them here would kill a run that is still in progress from
-    the operator's point of view.
+    Sweeps in bounded batches until one comes back short, so a backlog larger than a
+    single ``limit`` is drained on the same cold start instead of waiting for the next
+    instance to boot. The batch count is itself capped, which keeps the guarantee that
+    a database that was unreachable for a long time cannot turn a cold start into an
+    unbounded write burst. A final full batch means the backlog may not be exhausted;
+    that is logged rather than looped on.
 
-    Each candidate is moved to a terminal status with a conditional UPDATE, so a run
-    that was legitimately reclaimed between the SELECT and the UPDATE is left alone.
+    See :func:`_reconcile_batch` for what counts as a candidate and how ownership
+    transfer is decided.
+    """
+    reclaimed: List[str] = []
+
+    for batch_number in range(1, max_batches + 1):
+        found = await _reconcile_batch(pool, limit, reason)
+        reclaimed.extend(found)
+        if len(found) < limit:
+            return reclaimed
+        logger.warning(
+            f"Orphan sweep batch {batch_number} reclaimed a full {limit} run(s); "
+            "continuing to the next batch."
+        )
+
+    logger.error(
+        f"Orphan sweep stopped after {max_batches} batch(es) of {limit}; any runs "
+        "beyond that are still 'running' and will be retried on the next cold start."
+    )
+    return reclaimed
+
+
+async def _reconcile_batch(
+    pool: asyncpg.Pool,
+    limit: int,
+    reason: str,
+) -> List[str]:
+    """Reclaim up to ``limit`` orphaned runs. Returns the ids this batch reclaimed.
+
+    A candidate is a row in ``status = 'running'`` whose lease is NULL or expired.
+    Two things are never candidates:
+
+    * Rows in ``paused`` or ``awaiting_approval``. They are parked on a human, and
+      failing them would kill a run that is still in progress from the operator's point
+      of view.
+    * Rows with ``attempt = 0``, i.e. anything this lease scheme has never owned. A
+      row only reaches ``attempt >= 1`` by being claimed through ``ensure_run_record``,
+      so ``attempt = 0`` is exactly "no lease-aware execution has ever owned this".
+      During a rollout that matters: an execution started by the pre-lease code is
+      still driving a browser while writing no ``owner_id`` and no
+      ``lease_expires_at``, so a sweep running in a freshly deployed environment sees a
+      NULL lease on a *live* run and would fail it out from under itself. Such a row is
+      indistinguishable from a stranded legacy run, and guessing wrong means an
+      execution keeps clicking in an ERP after its run has been declared failed, so
+      the sweep declines it. It is picked up once a lease-aware execution claims it.
+
+    Each candidate is moved to a terminal status with a conditional UPDATE carrying the
+    same guards, so a run that was legitimately claimed between the SELECT and the
+    UPDATE is left alone.
     The database write, the Redis mirror, the hub publish and the ``orphaned`` step
     row are each isolated: a Redis or hub outage must never stop the terminal status
     from reaching the database, or the run is stranded again -- the exact failure this
@@ -388,6 +438,7 @@ async def reconcile_orphaned_agent_runs(
                 SELECT run_id
                 FROM agent_runs
                 WHERE status = 'running'
+                  AND attempt > 0
                   AND (lease_expires_at IS NULL OR lease_expires_at < now())
                 ORDER BY created_at ASC
                 LIMIT $1
@@ -424,6 +475,7 @@ async def reconcile_orphaned_agent_runs(
                         lease_expires_at = NULL
                     WHERE run_id = $1
                       AND status = 'running'
+                      AND attempt > 0
                       AND (lease_expires_at IS NULL OR lease_expires_at < now())
                     """,
                     run_uuid,
@@ -461,7 +513,22 @@ async def reconcile_orphaned_agent_runs(
         except Exception as e:
             logger.error(f"Failed to record orphaned step for agent run {candidate_id}: {e}")
 
-        # 3. Mirror into Redis so the session snapshot stops advertising a running run.
+        # 3. Re-read ownership before touching the read models below. The database is
+        # already correct and authoritative; Redis and the hub are not. A resume or a
+        # duplicate request can claim this run in the window between the UPDATE above
+        # and these writes -- its upsert legitimately takes over a terminal row with a
+        # NULL lease -- and `set_session_state` replaces the whole hash, so writing
+        # here would overwrite the new owner's `running` snapshot with a terminal one
+        # and broadcast a status_change for a run that is being executed right now.
+        mirrors_suppressed = await _run_has_live_owner(pool, run_uuid)
+        if mirrors_suppressed:
+            logger.warning(
+                f"Orphaned agent run {candidate_id} was reclaimed by a new owner before "
+                "its Redis and SSE mirrors were written; leaving them to that owner."
+            )
+            continue
+
+        # 4. Mirror into Redis so the session snapshot stops advertising a running run.
         try:
             redis = get_redis_client()
             await redis.set_session_state(
@@ -476,7 +543,7 @@ async def reconcile_orphaned_agent_runs(
         except Exception as e:
             logger.error(f"Failed to mirror orphaned status to Redis for {candidate_id}: {e}")
 
-        # 4. Tell any live SSE subscriber in this process.
+        # 5. Tell any live SSE subscriber in this process.
         try:
             from backend.main import run_event_hub
 
@@ -495,3 +562,25 @@ async def reconcile_orphaned_agent_runs(
             logger.error(f"Failed to publish orphaned status for {candidate_id}: {e}")
 
     return reclaimed
+
+
+async def _run_has_live_owner(pool: asyncpg.Pool, run_uuid: Any) -> bool:
+    """True when ``run_uuid`` has been claimed by an execution since the sweep wrote it.
+
+    Fails closed towards *writing* the mirrors: a read that cannot be completed is
+    reported as "no live owner" so the reconciliation still repairs the Redis snapshot
+    and tells subscribers, which is the behaviour that existed before this check and the
+    one that leaves the run visible as failed everywhere. Getting this wrong in that
+    direction leaves a stale `running` read model; getting it wrong the other way
+    silently skips the notification for a genuinely dead run.
+    """
+    try:
+        async with pool.acquire() as conn:
+            owner_id = await conn.fetchval(
+                "SELECT owner_id FROM agent_runs WHERE run_id = $1;",
+                run_uuid,
+            )
+        return owner_id is not None
+    except Exception as e:
+        logger.warning(f"Could not re-check ownership of agent run {run_uuid}: {e}")
+        return False
