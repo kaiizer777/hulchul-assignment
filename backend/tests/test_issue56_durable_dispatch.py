@@ -13,6 +13,7 @@ rather than asserting on mock call counts alone.
 """
 
 import asyncio
+import ast
 import contextlib
 import json
 import os
@@ -876,11 +877,29 @@ class TestEnsureRunRecordLease(unittest.IsolatedAsyncioTestCase):
             source = f.read()
 
         used = set()
-        for line in source.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("await self.update_run_status("):
-                first_arg = stripped[len("await self.update_run_status("):].split(")")[0].split(",")[0]
-                used.add(first_arg.strip().strip('"\''))
+        for node in ast.walk(ast.parse(source)):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+                and node.func.attr == "update_run_status"
+            ):
+                continue
+            self.assertTrue(
+                node.args, "update_run_status calls must pass a positional status"
+            )
+            self.assertIsInstance(
+                node.args[0],
+                ast.Constant,
+                "update_run_status status arguments must be string literals",
+            )
+            self.assertIsInstance(
+                node.args[0].value,
+                str,
+                "update_run_status status arguments must be string literals",
+            )
+            used.add(node.args[0].value)
 
         self.assertTrue(used, "no update_run_status call sites were found")
         for status in used:
