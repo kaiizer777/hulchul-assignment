@@ -721,11 +721,20 @@ function NewInvoiceForm() {
 
             {!uploadedFile ? (
               <div
+                role="button"
+                tabIndex={0}
+                aria-label="Attach an invoice document: click, press Enter or Space, or drop a file"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
-                className={`flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-8 text-center transition-all cursor-pointer ${
+                className={`flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-8 text-center transition-all cursor-pointer focus:outline-none focus-visible:border-zinc-800 focus-visible:ring-2 focus-visible:ring-zinc-900/30 focus-visible:ring-offset-2 ${
                   isDragging
                     ? 'border-zinc-800 bg-zinc-100/90 shadow-inner scale-[0.99]'
                     : 'border-zinc-300/90 bg-zinc-50/50 hover:border-zinc-400 hover:bg-zinc-50/90'
