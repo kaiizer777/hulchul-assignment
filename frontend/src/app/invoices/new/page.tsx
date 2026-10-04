@@ -43,6 +43,11 @@ function formatCurrency(amount: number): string {
   }).format(amount);
 }
 
+// Kept in sync with the `accept` attribute on the file input below; the dropzone
+// copy states the same list and the same 10 MB ceiling.
+const ALLOWED_FILE_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg', '.csv'];
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+
 function formatFileSize(bytes: number): string {
   if (bytes === 0) return '0 Bytes';
   const k = 1024;
@@ -78,6 +83,7 @@ function NewInvoiceForm() {
   // File dropzone states
   const [isDragging, setIsDragging] = useState(false);
   const [uploadedFile, setUploadedFile] = useState<UploadedFilePreview | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
   const [ocrStatus, setOcrStatus] = useState<'idle' | 'processing' | 'success'>('idle');
   const [ocrMessage, setOcrMessage] = useState<string | null>(null);
 
@@ -224,6 +230,27 @@ function NewInvoiceForm() {
   };
 
   const processUploadedFile = (file: File) => {
+    // The picker's `accept` attribute is only a hint: it is not enforced for
+    // drag-and-drop, and browsers apply it inconsistently. Validate here so both
+    // entry paths enforce the rules the dropzone advertises, instead of marking
+    // an unsupported or oversized file as attached and later reporting an OCR
+    // success for it.
+    const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+    if (!ALLOWED_FILE_EXTENSIONS.includes(extension)) {
+      setFileError(
+        `"${file.name}" is not a supported document. Accepted formats: ${ALLOWED_FILE_EXTENSIONS.join(', ')}.`
+      );
+      return;
+    }
+
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      setFileError(
+        `"${file.name}" is ${formatFileSize(file.size)}, over the ${formatFileSize(MAX_FILE_SIZE_BYTES)} limit.`
+      );
+      return;
+    }
+
+    setFileError(null);
     setUploadedFile({
       name: file.name,
       size: file.size,
@@ -652,6 +679,15 @@ function NewInvoiceForm() {
               className="hidden"
               id="invoice-file-upload"
             />
+
+            {fileError && (
+              <p
+                role="alert"
+                className="mb-3 rounded-lg border border-rose-200 bg-rose-50/90 px-3 py-2 text-xs font-medium text-rose-800"
+              >
+                {fileError}
+              </p>
+            )}
 
             {!uploadedFile ? (
               <div
