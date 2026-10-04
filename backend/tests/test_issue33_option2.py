@@ -328,6 +328,67 @@ class TestIssue33Option2DurableTerminalStream(unittest.IsolatedAsyncioTestCase):
         finally:
             await frames.aclose()
 
+    async def test_buffered_stale_status_change_is_not_emitted_after_done(self) -> None:
+        """A stale status_change: running buffered before completion must not be emitted after done or regress status."""
+        run_id = uuid.uuid4()
+        run_id_str = str(run_id)
+        created_at = datetime.now(timezone.utc)
+        rows: List[Dict[str, Any]] = []
+
+        mock_pool = _make_mock_pool()
+        mock_pool._mock_conn.fetchrow.return_value = _fake_run_row(run_id, "completed", created_at)
+        mock_pool._mock_conn.fetchval.return_value = "completed"
+        mock_pool._mock_conn.fetch.side_effect = _fake_step_store(rows)
+
+        # Buffer a stale 'running' status event into the hub queue during history fetch
+        async def fake_fetchrow(*args: Any, **kwargs: Any) -> Any:
+            await run_event_hub.publish(
+                run_id_str,
+                {
+                    "type": "status_change",
+                    "run_id": run_id_str,
+                    "status": "running",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            return _fake_run_row(run_id, "completed", created_at)
+
+        mock_pool._mock_conn.fetchrow.side_effect = fake_fetchrow
+
+        frames = await _open_stream(self, mock_pool, run_id, poll_interval=0.05, ping_interval=0.05)
+        raw_frames: List[Dict[str, Any]] = []
+        payloads: List[Dict[str, Any]] = []
+
+        try:
+            # 1. Read initial status_change: completed
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            raw_frames.append(frame)
+            payloads.append(json.loads(frame["data"]))
+
+            # 2. Read synthesized done frame
+            frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
+            raw_frames.append(frame)
+            payloads.append(json.loads(frame["data"]))
+
+            # 3. Read subsequent frames to verify the stale 'running' status was discarded
+            deadline = asyncio.get_running_loop().time() + 0.25
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    frame = await asyncio.wait_for(frames.__anext__(), timeout=0.1)
+                    raw_frames.append(frame)
+                    payloads.append(json.loads(frame["data"]))
+                except asyncio.TimeoutError:
+                    break
+        finally:
+            await frames.aclose()
+
+        statuses = [p.get("status") for p in payloads if p.get("type") == "status_change"]
+        self.assertEqual(
+            statuses,
+            ["completed"],
+            f"Stale buffered 'running' status must be discarded, but got statuses: {statuses}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

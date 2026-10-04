@@ -1266,6 +1266,23 @@ async def stream_agent_run_endpoint(
                         next_step_index += 1
 
                     if run_row and run_row["status"] in ("completed", "done"):
+                        # Drain any events buffered during history fetch before emitting done
+                        while not queue.empty():
+                            try:
+                                buffered = queue.get_nowait()
+                                b_type = buffered.get("type", "message")
+                                b_step_id = buffered.get("step_id")
+                                if b_step_id and b_type in _SSE_PERSISTED_STEP_EVENT_TYPES:
+                                    b_step_id_str = str(b_step_id)
+                                    if b_step_id_str not in emitted_step_ids:
+                                        emitted_step_ids.add(b_step_id_str)
+                                        buffered = {**buffered, "step_index": next_step_index}
+                                        next_step_index += 1
+                                        yield {"event": b_type, "data": json.dumps(buffered)}
+                                elif b_type == "status_change" and buffered.get("status") in ("completed", "done"):
+                                    last_status = buffered["status"]
+                            except asyncio.QueueEmpty:
+                                break
                         yield _done_frame(run_id_str, last_status or "completed")
                         emitted_done = True
             except Exception as db_err:
@@ -1377,6 +1394,9 @@ async def stream_agent_run_endpoint(
                         event = {**event, "step_index": next_step_index}
                         next_step_index += 1
                     if event_type == "status_change" and event.get("status"):
+                        if emitted_done and event.get("status") not in ("completed", "done"):
+                            # Discard stale non-terminal status event buffered before terminal completion
+                            continue
                         last_status = event["status"]
                     if event_type == "done":
                         if emitted_done:
