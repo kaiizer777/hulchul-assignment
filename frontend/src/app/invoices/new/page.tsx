@@ -1000,8 +1000,9 @@ function NewInvoiceForm() {
               </div>
 
               <p className="text-[10px] leading-relaxed text-zinc-500">
-                Only the Form Amount below is sent to the ERP. Line-item descriptions, quantities,
-                unit prices and tax rates are not stored with the invoice.
+                Vendor, date and PO number are submitted along with the Form Amount above. This
+                grid's descriptions, quantities, unit prices and tax rates are not stored with the
+                invoice.
               </p>
 
               {/* Amount Sync / Override Toggle */}
