@@ -70,6 +70,14 @@ function NewInvoiceForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const ocrTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelPendingOcr = () => {
+    if (ocrTimeoutRef.current !== null) {
+      clearTimeout(ocrTimeoutRef.current);
+      ocrTimeoutRef.current = null;
+    }
+  };
 
   // Reference data
   const [vendors, setVendors] = useState<VendorDTO[]>([]);
@@ -150,6 +158,9 @@ function NewInvoiceForm() {
     }
     loadData();
   }, [paramPo, paramVendor]);
+
+  // Drop any in-flight OCR timer on unmount so it cannot set state afterwards.
+  useEffect(() => cancelPendingOcr, []);
 
   // Compute live line-item totals
   const totals = useMemo(() => {
@@ -273,24 +284,32 @@ function NewInvoiceForm() {
 
   const handleTriggerOcr = () => {
     if (!uploadedFile) return;
+
+    // A previous run may still be in flight; only the newest one may report.
+    cancelPendingOcr();
+
+    const fileName = uploadedFile.name;
     setOcrStatus('processing');
     setOcrMessage('Running optical character recognition & entity extraction...');
 
-    setTimeout(() => {
+    ocrTimeoutRef.current = setTimeout(() => {
+      ocrTimeoutRef.current = null;
       setOcrStatus('success');
-      setOcrMessage(`Successfully extracted metadata and line items from "${uploadedFile.name}"`);
+      setOcrMessage(`Successfully extracted metadata and line items from "${fileName}"`);
 
-      // Simulated auto-fill based on document context
-      if (vendors.length > 0 && !vendor) {
-        setVendor(vendors[0].name);
-      }
-      if (purchaseOrders.length > 0 && !poNumber) {
-        setPoNumber(purchaseOrders[0].po_number);
-      }
+      // Simulated auto-fill based on document context. Functional updates are
+      // required here: this callback closes over the render that scheduled it, so
+      // reading `vendor`/`poNumber` directly would let a choice the user made
+      // during the 900ms window be overwritten by the stale captured value.
+      setVendor((prev) => (prev ? prev : vendors[0]?.name ?? ''));
+      setPoNumber((prev) => (prev ? prev : purchaseOrders[0]?.po_number ?? ''));
     }, 900);
   };
 
   const handleRemoveFile = () => {
+    // Without this the in-flight callback still fires and auto-fills from a
+    // document the user has already detached.
+    cancelPendingOcr();
     setUploadedFile(null);
     setOcrStatus('idle');
     setOcrMessage(null);
