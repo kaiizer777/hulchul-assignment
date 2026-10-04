@@ -1081,12 +1081,12 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
         try:
             frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
             payloads.append(json.loads(frame["data"]))
-            status["value"] = "completed"
+            status["value"] = "paused"
             while True:
                 frame = await asyncio.wait_for(frames.__anext__(), timeout=5.0)
                 payload = json.loads(frame["data"])
                 payloads.append(payload)
-                if payload.get("type") == "status_change" and payload.get("status") == "completed":
+                if payload.get("type") == "status_change" and payload.get("status") == "paused":
                     break
             # ~8 further poll cycles on an unchanged status.
             with self.assertRaises(asyncio.TimeoutError):
@@ -1095,7 +1095,7 @@ class TestIssue29NonblockingRun(unittest.IsolatedAsyncioTestCase):
             await frames.aclose()
 
         statuses = [p["status"] for p in payloads if p.get("type") == "status_change"]
-        self.assertEqual(statuses, ["running", "completed"])
+        self.assertEqual(statuses, ["running", "paused"])
 
     async def test_sse_live_event_for_polled_step_is_not_delivered_twice(self) -> None:
         """A live event for a step the poll already emitted must not be re-emitted.
