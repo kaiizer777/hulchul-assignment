@@ -193,6 +193,20 @@ describe('New invoice form', () => {
       });
       expect(clickSpy).toHaveBeenCalledTimes(2);
     });
+
+    it('keeps focus on the attachment panel once the dropzone is replaced', async () => {
+      await act(async () => {
+        renderPage();
+      });
+      await waitForVendors();
+
+      await act(async () => {
+        fireEvent.drop(getDropzone(), { dataTransfer: { files: [makePdf('receipt.pdf', 1024)] } });
+      });
+
+      const panel = screen.getByLabelText('Attached invoice document');
+      expect(document.activeElement).toBe(panel);
+    });
   });
 
   describe('OCR auto-fill', () => {
@@ -291,7 +305,18 @@ describe('New invoice form', () => {
 
       expect(screen.getByText('Estimate — not stored')).toBeDefined();
       expect(
-        screen.getByText(/are not stored with the invoice/i)
+        screen.getByText(/are not\s+stored with the\s+invoice/i)
+      ).toBeDefined();
+    });
+
+    it('names every field that is submitted alongside the amount', async () => {
+      await act(async () => {
+        renderPage();
+      });
+      await waitForVendors();
+
+      expect(
+        screen.getByText(/Vendor, date and PO number are submitted/i)
       ).toBeDefined();
     });
   });
