@@ -1,10 +1,11 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 from fastapi import FastAPI, Depends, Request, Response, status, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict
@@ -70,6 +71,223 @@ class RunEventHub:
 
 
 run_event_hub = RunEventHub()
+
+
+# In-memory registry of background agent executions keyed by run_id.
+# asyncio.create_task is used (not Starlette BackgroundTasks) so POST /agent/run
+# can return 202 immediately: BackgroundTasks are awaited before the ASGI app
+# returns, which would keep the client waiting.
+#
+# Accepted tradeoff: this task has no durable owner. Lambda freeze/thaw can
+# suspend a warm-container task, the 15-min Lambda ceiling applies, and
+# container replacement loses the run with no startup path reclaiming it, so an
+# accepted run can stay 'running' without progressing. Durable dispatch needs a
+# worker plus queue, IAM and deploy plumbing and is tracked in #56; cross-instance
+# event-hub loss is tracked in #33. In-PR mitigations only narrow the window: a
+# cancelled task records a terminal status in the database and Redis
+# (_mark_agent_run_terminal), the SSE stream subscribes before reading
+# history so no live event is lost across the handoff, and an open stream also
+# reconciles against the durable store on an interval so a lost in-process
+# subscription cannot strand it on stale state.
+_active_agent_tasks: Dict[str, asyncio.Task] = {}
+# Synchronous reservation guard closing the check-then-act race between the
+# existing-task check in run_agent_endpoint and asyncio.create_task: the first
+# await (get_db_pool) would otherwise let a second POST with the same run_id
+# pass the check and start a duplicate side-effecting loop. Reserved
+# synchronously before the first await; released on setup failure or when the
+# background task finishes.
+_reserved_agent_runs: Set[str] = set()
+
+
+# Ceiling for each database write that reports a terminal run status. The
+# cancellation handler shields this coroutine so a second cancellation cannot
+# abort it, and the asyncpg pool is configured without a command or acquire
+# timeout (backend/db.py), so a database that accepts the connection and then
+# never answers would hold that shielded await -- and anything draining it --
+# with no ceiling. Bounding the individual writes rather than the coroutine
+# keeps the shield honest: no orphaned follow-up task is created, the terminal
+# status is still recorded whenever the database responds, and the wait always
+# terminates. Redis needs no equivalent bound; its client is already built with
+# httpx.AsyncClient(timeout=10.0).
+TERMINAL_WRITE_IO_TIMEOUT_SECONDS: float = 5.0
+
+
+async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
+    """Record a terminal run status in the database, Redis, and the event hub.
+
+    Each target is written in its own try/except so a failure in one cannot
+    prevent the others from recording the terminal status.
+
+    The hub publication is gated on the database write succeeding. The stream
+    reconciles `agent_runs.status` on every poll, so announcing a status the
+    durable store never accepted would make the next poll re-emit the older one
+    as a fresh transition and walk the client backwards from `failed` to
+    `running`. Redis is a separate read model and is still written
+    best-effort.
+    """
+    db_updated = False
+    try:
+        pool = await asyncio.wait_for(get_db_pool(), TERMINAL_WRITE_IO_TIMEOUT_SECONDS)
+        async with pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS) as conn:
+            await asyncio.wait_for(
+                conn.execute(
+                    "UPDATE agent_runs SET status = $1 WHERE run_id = $2;",
+                    status,
+                    uuid.UUID(run_id_str),
+                ),
+                TERMINAL_WRITE_IO_TIMEOUT_SECONDS,
+            )
+        db_updated = True
+    except Exception as db_err:
+        logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
+
+    try:
+        from backend.redis_client import get_redis_client
+        redis = get_redis_client()
+        state = await redis.get_session_state(run_id_str)
+        if state is not None:
+            state["status"] = status
+            await redis.set_session_state(run_id_str, state)
+    except Exception as redis_err:
+        logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
+
+    if not db_updated:
+        return
+
+    try:
+        await run_event_hub.publish(
+            run_id_str,
+            {
+                "type": "status_change",
+                "run_id": run_id_str,
+                "status": status,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as hub_err:
+        logger.warning(f"Could not publish terminal status for run {run_id_str}: {hub_err}")
+
+
+def _log_terminal_write_outcome(terminal_write: "asyncio.Future[None]") -> None:
+    """Surface failures from a terminal-status write that outlived its handler.
+
+    Synchronous by necessity: asyncio invokes a done callback from the event
+    loop and never awaits its return value, so an `async def` here would build a
+    coroutine that nobody awaits -- the log would never fire and every cancelled
+    run would emit a "coroutine was never awaited" RuntimeWarning.
+    """
+    if terminal_write.cancelled():
+        return
+    write_err = terminal_write.exception()
+    if write_err is not None:
+        logger.warning(f"Terminal status write did not complete cleanly: {write_err}")
+
+
+async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
+    """Run the full ReAct loop off-request; publish live events via run_event_hub."""
+    from backend.browser import get_browser_session, run_cancellation_safe, MAX_CDP_REATTACH_ATTEMPTS
+    from backend.tools import PlaywrightTools
+    from backend.agent import ReActAgent
+
+    session_stack: list = []
+    # ReActAgent.run records the run's own terminal status (and the matching
+    # Redis state) before it returns. A cancellation that lands during the
+    # teardown below therefore arrives *after* the run already committed
+    # 'completed', and writing 'failed' over it would contradict the durable
+    # record the SSE poll reads on every pass.
+    agent_finished = False
+
+    async def _enter_cdp_session():
+        """Enter a browser session context manager and track it for later release."""
+        cm = get_browser_session()
+        sess = await cm.__aenter__()
+        session_stack.append(cm)
+        return sess
+
+    try:
+        try:
+            session = await _enter_cdp_session()
+            tools = PlaywrightTools(page=session.page, run_id=run_id_str)
+
+            async def _reattach_page():
+                """Release the current browser session and return a freshly acquired page."""
+                if session_stack:
+                    old_cm = session_stack.pop()
+                    try:
+                        await old_cm.__aexit__(None, None, None)
+                    except Exception as release_err:
+                        logger.warning(f"Failed to release previous browser session during reattach: {release_err}")
+                new_session = await _enter_cdp_session()
+                return new_session.page
+
+            # No on_event forwarding here: ReActAgent.emit_event already publishes
+            # every event to run_event_hub itself, so a hub-publishing callback
+            # delivered each event to SSE subscribers twice.
+            agent = ReActAgent(
+                run_id=run_id_str,
+                tools=tools,
+                reconnect=_reattach_page,
+                max_reattaches=MAX_CDP_REATTACH_ATTEMPTS,
+            )
+            await agent.run(goal=goal)
+            agent_finished = True
+        finally:
+            # Teardown is reached either by a finished run or by a cancellation
+            # landing in the run above, and the second cancellation that follows
+            # it must not abort a close midway: a session left open holds a
+            # remote browser for its whole timeout. Each close is therefore run
+            # cancellation-safe, and a cancellation seen here is re-raised only
+            # after every remaining session has been released.
+            pending_cancel: Optional[asyncio.CancelledError] = None
+            for cm in reversed(session_stack):
+                try:
+                    await run_cancellation_safe(cm.__aexit__(None, None, None))
+                except asyncio.CancelledError as cancel_err:
+                    pending_cancel = cancel_err
+                except Exception:
+                    pass
+            if pending_cancel is not None:
+                raise pending_cancel
+    except asyncio.CancelledError:
+        # CancelledError is a BaseException since 3.8, so the `except Exception`
+        # arm below never sees a cancelled run. Without this branch the task
+        # unwinds without recording a terminal status and the run stays
+        # 'running' in the database and Redis forever.
+        if agent_finished:
+            # The run already recorded its own terminal status. Overwriting it
+            # here would report a completed run as failed purely because its
+            # browser sessions were slow to close.
+            logger.warning(
+                f"Background agent run {run_id_str} was cancelled during teardown "
+                "after the agent finished; keeping the terminal status it recorded"
+            )
+            raise
+        logger.warning(f"Background agent run {run_id_str} was cancelled")
+        # Awaiting the terminal writes directly leaves them interruptible: a
+        # second cancellation (a repeated cancel, or an enclosing wait_for
+        # timeout) would abort them mid-flight and strand the run as 'running'.
+        # shield() lets the writes run to completion across further
+        # cancellations of this handler, and every write inside is individually
+        # bounded (TERMINAL_WRITE_IO_TIMEOUT_SECONDS), so the shield is never
+        # waiting on an unbounded database await. Lifespan never awaits these
+        # tasks, so there is no drain to stall either way.
+        terminal_write = asyncio.ensure_future(_mark_agent_run_terminal(run_id_str, "failed"))
+        # Registered before the shield, not only on the cancellation path below,
+        # so the fallback log also covers a cancellation landing between creating
+        # the task and awaiting it.
+        terminal_write.add_done_callback(_log_terminal_write_outcome)
+        # A cancellation raised out of this await propagates: the handler is
+        # already unwinding from a CancelledError, which is never swallowed.
+        await asyncio.shield(terminal_write)
+        raise
+    except Exception as e:
+        logger.exception(f"Background agent run {run_id_str} failed: {e}")
+        await _mark_agent_run_terminal(run_id_str, "failed")
+    finally:
+        current = asyncio.current_task()
+        if current is not None and _active_agent_tasks.get(run_id_str) is current:
+            _active_agent_tasks.pop(run_id_str, None)
+        _reserved_agent_runs.discard(run_id_str)
 
 
 logging.basicConfig(
@@ -423,69 +641,79 @@ class AgentSessionStateResponse(BaseModel):
     state: Optional[Dict[str, Any]] = None
 
 
-@app.post("/agent/run", response_model=AgentRunResponse)
+@app.post("/agent/run", response_model=AgentRunResponse, status_code=202)
 async def run_agent_endpoint(
     payload: AgentRunRequest,
     _session: Session = Depends(require_session),
 ) -> AgentRunResponse:
-    """Execute the ReAct agent loop for a given goal with real-time event broadcasting."""
-    from backend.browser import get_browser_session
-    from backend.tools import PlaywrightTools
-    from backend.agent import ReActAgent
+    """Accept an agent goal, persist the run record, and continue the ReAct loop in background."""
+    from backend.agent import extract_approval_threshold
 
-    from backend.browser import MAX_CDP_REATTACH_ATTEMPTS
+    run_id_str = str(payload.run_id) if payload.run_id else str(uuid.uuid4())
+    goal = payload.goal
+    threshold = extract_approval_threshold(goal, default=settings.DEFAULT_APPROVAL_THRESHOLD)
 
-    run_id_str = str(payload.run_id) if payload.run_id else None
-    session_stack: list = []
-
-    async def _enter_cdp_session():
-        """Enter a browser session context manager and track it for later release."""
-        cm = get_browser_session()
-        sess = await cm.__aenter__()
-        session_stack.append(cm)
-        return sess
-
-    session = await _enter_cdp_session()
-    try:
-        tools = PlaywrightTools(page=session.page, run_id=run_id_str)
-
-        async def _reattach_page():
-            """Release the current browser session and return a freshly acquired page."""
-            if session_stack:
-                old_cm = session_stack.pop()
-                try:
-                    await old_cm.__aexit__(None, None, None)
-                except Exception as release_err:
-                    logger.warning(f"Failed to release previous browser session during reattach: {release_err}")
-            new_session = await _enter_cdp_session()
-            return new_session.page
-
-        async def handle_agent_event(event: Dict[str, Any]) -> None:
-            """Forward agent events to the global run event hub for SSE broadcasting."""
-            await run_event_hub.publish(agent.run_id, event)
-
-        agent = ReActAgent(
+    existing = _active_agent_tasks.get(run_id_str)
+    if existing is not None and not existing.done():
+        return AgentRunResponse(
             run_id=run_id_str,
-            tools=tools,
-            on_event=handle_agent_event,
-            reconnect=_reattach_page,
-            max_reattaches=MAX_CDP_REATTACH_ATTEMPTS,
+            status="running",
+            iterations=0,
+            goal=goal,
+            threshold=threshold,
+            summary=None,
         )
-        result = await agent.run(goal=payload.goal)
-    finally:
-        for cm in reversed(session_stack):
-            try:
-                await cm.__aexit__(None, None, None)
-            except Exception:
-                pass
+    if run_id_str in _reserved_agent_runs:
+        return AgentRunResponse(
+            run_id=run_id_str,
+            status="running",
+            iterations=0,
+            goal=goal,
+            threshold=threshold,
+            summary=None,
+        )
+    _reserved_agent_runs.add(run_id_str)
+    try:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO agent_runs (run_id, goal, status, created_at)
+                VALUES ($1, $2, 'running', now())
+                ON CONFLICT (run_id) DO UPDATE SET status = 'running';
+                """,
+                uuid.UUID(run_id_str),
+                goal,
+            )
 
+        try:
+            from backend.redis_client import get_redis_client
+            redis = get_redis_client()
+            await redis.set_session_state(
+                run_id_str,
+                {
+                    "run_id": run_id_str,
+                    "goal": goal,
+                    "threshold": threshold,
+                    "current_step": 0,
+                    "status": "running",
+                },
+            )
+        except Exception as redis_err:
+            logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
+
+        task = asyncio.create_task(_execute_agent_run_background(run_id_str, goal))
+        _active_agent_tasks[run_id_str] = task
+    except BaseException:
+        _reserved_agent_runs.discard(run_id_str)
+        raise
     return AgentRunResponse(
-        run_id=result["run_id"],
-        status=result["status"],
-        iterations=result["iterations"],
-        goal=result["goal"],
-        threshold=result["threshold"],
-        summary=result["summary"],
+        run_id=run_id_str,
+        status="running",
+        iterations=0,
+        goal=goal,
+        threshold=threshold,
+        summary=None,
     )
 
 
@@ -738,6 +966,101 @@ async def get_agent_state(
     )
 
 
+# Cadence for reconciling an open SSE stream against the durable store. Short
+# enough that a step the in-process hub never saw still lands promptly, long
+# enough that one indexed SELECT per run per interval is not a cost worth tuning
+# further in-process.
+SSE_DURABLE_POLL_INTERVAL_SECONDS: float = 3.0
+# Keep-alive cadence so proxies and Lambda do not reap an idle stream. Longer
+# than the poll interval, so a live stream still reconciles several times per
+# ping.
+SSE_PING_INTERVAL_SECONDS: float = 15.0
+
+# Whole step list for a run, ordered by the same (timestamp, step_id) key the
+# incremental poll uses so the two orderings cannot disagree.
+_SSE_STEPS_ALL_SQL = """
+    SELECT step_id, action, result, screenshot_b64, timestamp
+    FROM agent_steps
+    WHERE run_id = $1
+    ORDER BY timestamp ASC, step_id ASC;
+"""
+
+# Steps committed after the last one this stream delivered. The row comparison
+# advances the cursor past every row it has already seen, so a batch of steps
+# sharing one timestamp is neither skipped nor replayed.
+# idx_agent_steps_run_timestamp (run_id, timestamp) covers the predicate.
+_SSE_STEPS_AFTER_CURSOR_SQL = """
+    SELECT step_id, action, result, screenshot_b64, timestamp
+    FROM agent_steps
+    WHERE run_id = $1 AND (timestamp, step_id) > ($2, $3)
+    ORDER BY timestamp ASC, step_id ASC;
+"""
+
+
+# The event types this stream treats as a persisted agent_steps row: the same
+# classifications _step_row_to_frame derives, so a live event and a replayed row
+# for one step are the same kind of frame. step_start is deliberately excluded --
+# it carries the same step_id as the terminal event that follows it, so
+# registering it here would suppress that step's own completion.
+_SSE_PERSISTED_STEP_EVENT_TYPES = frozenset(
+    {"step_complete", "step_failed", "step_unknown", "session_lost"}
+)
+
+
+def _status_change_frame(run_id_str: str, status: str, timestamp: str) -> Dict[str, Any]:
+    """Build the SSE frame carrying a run status transition."""
+    return {
+        "event": "status_change",
+        "data": json.dumps({
+            "type": "status_change",
+            "run_id": run_id_str,
+            "status": status,
+            "timestamp": timestamp,
+        }),
+    }
+
+
+def _step_row_to_frame(run_id_str: str, row: Any, step_index: int) -> Dict[str, Any]:
+    """Map a persisted agent_steps row to its SSE frame.
+
+    One mapping for both the connect-time replay and the durable poll so the
+    persisted-step classification cannot drift between them: terminal
+    session_lost only for a session_lost action, an `outcome unknown` result as
+    step_unknown, and any other failed/aborted result as step_failed.
+    """
+    res_str = row["result"] or ""
+    lowered = res_str.lower()
+    persisted_action = row["action"] or ""
+    is_terminal_session_lost = persisted_action == "session_lost"
+    is_unknown = lowered.startswith("outcome unknown")
+    is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
+    if is_terminal_session_lost:
+        event_type = "session_lost"
+    elif is_unknown:
+        event_type = "step_unknown"
+    else:
+        event_type = "step_failed" if is_fail else "step_complete"
+    event_data = {
+        "type": event_type,
+        "run_id": run_id_str,
+        "step_id": str(row["step_id"]),
+        "step_index": step_index,
+        "action": row["action"],
+        "result": res_str,
+        "timestamp": row["timestamp"].isoformat(),
+        "has_screenshot": bool(row["screenshot_b64"]),
+    }
+    if is_terminal_session_lost:
+        event_data["terminal"] = True
+        event_data["reattached"] = False
+    if is_fail or is_unknown:
+        event_data["error"] = res_str
+    return {
+        "event": event_type,
+        "data": json.dumps(event_data),
+    }
+
+
 @app.get("/agent/runs/{run_id}/stream", response_class=EventSourceResponse)
 async def stream_agent_run_endpoint(
     run_id: uuid.UUID,
@@ -750,82 +1073,155 @@ async def stream_agent_run_endpoint(
     run_id_str = str(run_id)
 
     async def event_generator():
-        """Asynchronous generator yielding historical and live SSE events."""
-        # 1. History playback from Neon database
-        try:
-            pool = await get_db_pool()
-            async with pool.acquire() as conn:
-                run_row = await conn.fetchrow(
-                    "SELECT run_id, goal, status, created_at FROM agent_runs WHERE run_id = $1;",
-                    run_id,
-                )
-                if run_row:
-                    yield {
-                        "event": "status_change",
-                        "data": json.dumps({
-                            "type": "status_change",
-                            "run_id": run_id_str,
-                            "status": run_row["status"],
-                            "timestamp": run_row["created_at"].isoformat(),
-                        })
-                    }
-
-                step_rows = await conn.fetch(
-                    """
-                    SELECT step_id, action, result, screenshot_b64, timestamp
-                    FROM agent_steps
-                    WHERE run_id = $1
-                    ORDER BY timestamp ASC;
-                    """,
-                    run_id,
-                )
-                for idx, r in enumerate(step_rows, start=1):
-                    res_str = r["result"] or ""
-                    lowered = res_str.lower()
-                    persisted_action = r["action"] or ""
-                    is_terminal_session_lost = persisted_action == "session_lost"
-                    is_unknown = lowered.startswith("outcome unknown")
-                    is_fail = ("failed" in lowered or "aborted" in lowered) and not is_unknown
-                    if is_terminal_session_lost:
-                        event_type = "session_lost"
-                    elif is_unknown:
-                        event_type = "step_unknown"
-                    else:
-                        event_type = "step_failed" if is_fail else "step_complete"
-                    event_data = {
-                        "type": event_type,
-                        "run_id": run_id_str,
-                        "step_id": str(r["step_id"]),
-                        "step_index": idx,
-                        "action": r["action"],
-                        "result": res_str,
-                        "timestamp": r["timestamp"].isoformat(),
-                        "has_screenshot": bool(r["screenshot_b64"]),
-                    }
-                    if is_terminal_session_lost:
-                        event_data["terminal"] = True
-                        event_data["reattached"] = False
-                    if is_fail or is_unknown:
-                        event_data["error"] = res_str
-                    yield {
-                        "event": event_type,
-                        "data": json.dumps(event_data)
-                    }
-        except Exception as db_err:
-            logger.warning(f"Error fetching historical steps for SSE stream {run_id_str}: {db_err}")
-
-        # 2. Live event queue subscription
+        """Yield history playback, live hub events, and durable-state reconciliation."""
+        # Subscribe before reading history. An event published between the history
+        # SELECT and the subscription would land in neither delivery path and be
+        # lost from a still-open stream, so the queue buffers anything that arrives
+        # during the replay below.
         queue = run_event_hub.subscribe(run_id_str)
+        # step_ids already delivered on this stream. The agent persists a step
+        # before publishing its live event, so the live path and the durable poll
+        # can both offer the same step, in either order; both paths check this
+        # set before yielding, which keeps the second delivery out instead of
+        # depending on the frontend's dedupe. Bounded by the run's own step
+        # count, which the agent's iteration cap bounds.
+        emitted_step_ids: Set[str] = set()
+        # (timestamp, step_id) of the newest step delivered so far. Seeded by the
+        # replay so the poll resumes strictly after it; the row comparison in
+        # _SSE_STEPS_AFTER_CURSOR_SQL keeps rows sharing a timestamp from being
+        # skipped or replayed.
+        step_cursor: Optional[Tuple[Any, Any]] = None
+        # Last status delivered, whatever path delivered it. status_change has no
+        # idempotency key the way step_id is, so it is emitted on change only.
+        last_status: Optional[str] = None
+        next_step_index = 1
         try:
+            # 1. History playback from Neon database
+            try:
+                pool = await get_db_pool()
+                async with pool.acquire() as conn:
+                    run_row = await conn.fetchrow(
+                        "SELECT run_id, goal, status, created_at FROM agent_runs WHERE run_id = $1;",
+                        run_id,
+                    )
+                    if run_row:
+                        last_status = run_row["status"]
+                        yield _status_change_frame(
+                            run_id_str, last_status, run_row["created_at"].isoformat()
+                        )
+
+                    step_rows = await conn.fetch(_SSE_STEPS_ALL_SQL, run_id)
+                    for r in step_rows:
+                        emitted_step_ids.add(str(r["step_id"]))
+                        step_cursor = (r["timestamp"], r["step_id"])
+                        yield _step_row_to_frame(run_id_str, r, next_step_index)
+                        next_step_index += 1
+            except Exception as db_err:
+                # Falling through to the live loop keeps buffered events flowing
+                # instead of leaving them stranded in the queue.
+                logger.warning(f"Error fetching historical steps for SSE stream {run_id_str}: {db_err}")
+
+            async def _reconcile_durable_state() -> List[Dict[str, Any]]:
+                """Return frames for durable steps and status newer than what was delivered.
+
+                Reads through the same cursor the replay and the live path advance,
+                so neither of them can produce a duplicate delivery.
+                """
+                nonlocal step_cursor, last_status, next_step_index
+                frames: List[Dict[str, Any]] = []
+                pool = await get_db_pool()
+                async with pool.acquire() as conn:
+                    status = await conn.fetchval(
+                        "SELECT status FROM agent_runs WHERE run_id = $1;",
+                        run_id,
+                    )
+                    if status is not None and status != last_status:
+                        last_status = status
+                        frames.append(
+                            _status_change_frame(
+                                run_id_str, status, datetime.now(timezone.utc).isoformat()
+                            )
+                        )
+                    if step_cursor is None:
+                        # Nothing has been replayed (no steps yet, or the replay
+                        # above failed), so the whole list is still unread.
+                        rows = await conn.fetch(_SSE_STEPS_ALL_SQL, run_id)
+                    else:
+                        rows = await conn.fetch(
+                            _SSE_STEPS_AFTER_CURSOR_SQL,
+                            run_id,
+                            step_cursor[0],
+                            step_cursor[1],
+                        )
+                for r in rows:
+                    step_cursor = (r["timestamp"], r["step_id"])
+                    step_id = str(r["step_id"])
+                    if step_id in emitted_step_ids:
+                        continue
+                    emitted_step_ids.add(step_id)
+                    frames.append(_step_row_to_frame(run_id_str, r, next_step_index))
+                    next_step_index += 1
+                return frames
+
+            # 2. Live hub delivery plus durable-state reconciliation. The hub is
+            # process-local, so a stream opened in a different container from the
+            # one executing the run has an empty subscriber set: without the poll
+            # it would receive nothing but pings, never error, never reconnect,
+            # and sit on the run's last state indefinitely. The wait below ends
+            # at whichever deadline comes first so the queue and the poll each
+            # get their turn.
+            poll_deadline = time.monotonic() + SSE_DURABLE_POLL_INTERVAL_SECONDS
+            ping_deadline = time.monotonic() + SSE_PING_INTERVAL_SECONDS
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    event = await asyncio.wait_for(
+                        queue.get(),
+                        # 0.001 rather than 0: a non-positive timeout would abandon
+                        # an already-queued event instead of delivering it.
+                        timeout=max(min(poll_deadline, ping_deadline) - time.monotonic(), 0.001),
+                    )
                     event_type = event.get("type", "message")
+                    live_step_id = event.get("step_id")
+                    if live_step_id and event_type in _SSE_PERSISTED_STEP_EVENT_TYPES:
+                        live_step_id = str(live_step_id)
+                        if live_step_id in emitted_step_ids:
+                            # The agent persists a step before it publishes the
+                            # live event, so the cursor poll can read and emit
+                            # that row first and the hub copy lands afterwards.
+                            # The step is already on this stream, so this copy is
+                            # dropped here instead of being left to the
+                            # frontend's dedupe.
+                            continue
+                        emitted_step_ids.add(live_step_id)
+                        # Live events carry the agent's own loop counter while
+                        # the replay and the poll number the rows they deliver
+                        # from this stream's counter. Reassign so a single
+                        # stream never mixes the two schemes and the displayed
+                        # ordinals stay monotonic.
+                        event = {**event, "step_index": next_step_index}
+                        next_step_index += 1
+                    if event_type == "status_change" and event.get("status"):
+                        last_status = event["status"]
                     yield {
                         "event": event_type,
                         "data": json.dumps(event)
                     }
+                    continue
                 except asyncio.TimeoutError:
+                    pass
+
+                if time.monotonic() >= poll_deadline:
+                    try:
+                        for frame in await _reconcile_durable_state():
+                            yield frame
+                    except Exception as db_err:
+                        # A transient read must not close the stream. The cursor is
+                        # left untouched, so the next deadline re-reads the gap.
+                        logger.warning(
+                            f"Error reconciling durable state for SSE stream {run_id_str}: {db_err}"
+                        )
+                    poll_deadline = time.monotonic() + SSE_DURABLE_POLL_INTERVAL_SECONDS
+                if time.monotonic() >= ping_deadline:
                     # Keep-alive ping event / comment
                     yield {
                         "event": "ping",
@@ -835,6 +1231,7 @@ async def stream_agent_run_endpoint(
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         })
                     }
+                    ping_deadline = time.monotonic() + SSE_PING_INTERVAL_SECONDS
         finally:
             run_event_hub.unsubscribe(run_id_str, queue)
 

@@ -3,7 +3,7 @@ import json
 import unittest
 import uuid
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, get_db_pool
@@ -256,8 +256,14 @@ class TestPhase25Unit(unittest.IsolatedAsyncioTestCase):
 
         await agent.run(goal="Create invoice for PO-BRAND-NEW")
 
-        # Verify execute was called with fill and PO-BRAND-NEW
-        mock_tools.execute.assert_called_with("fill", {"selector": "PO Number", "value": "PO-BRAND-NEW"})
+        # Verify execute was called with fill and PO-BRAND-NEW. The dispatch also
+        # carries the step id the loop minted for this step, so a tool that
+        # persists its own row stores it under that id instead of a second one.
+        mock_tools.execute.assert_called_once_with(
+            "fill",
+            {"selector": "PO Number", "value": "PO-BRAND-NEW"},
+            step_id=ANY,
+        )
         self.assertEqual(agent._active_form_state.get("po_number"), "PO-BRAND-NEW")
 
     async def test_05_idempotency_aborts_submit_when_invoice_already_exists(self):
