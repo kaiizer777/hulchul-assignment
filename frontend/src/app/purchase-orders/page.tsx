@@ -714,28 +714,9 @@ export default function PurchaseOrdersPage() {
                 </span>
               </div>
 
-              <div className="flex justify-between items-center py-1 border-b border-zinc-200/60">
-                <span className="text-zinc-500">Ledger Verification:</span>
-                <span className="inline-flex items-center gap-1 font-semibold text-emerald-700">
-                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                  3-Way Match Enabled
-                </span>
-              </div>
-
               <div className="flex justify-between items-center py-1">
-                <span className="text-zinc-500">Autonomous Settlement:</span>
-                <span className="text-zinc-700 font-medium">Eligible for Auto-Approval</span>
-              </div>
-            </div>
-
-            {/* Workflow & Match Guide */}
-            <div className="rounded-xl border border-sky-200/80 bg-sky-50/60 p-3.5 text-xs text-sky-900 shadow-2xs flex items-start gap-2.5">
-              <svg className="h-4 w-4 text-sky-600 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              <div className="text-[11px] leading-relaxed text-sky-800">
-                When recording an invoice matching this PO, the system checks whether the billed total is strictly within the approved cap of{' '}
-                <span className="font-bold font-mono">{formatCurrency(selectedPO.approved_amount)}</span>. Invoices matching both vendor and PO are automatically cleared.
+                <span className="text-zinc-500">Status:</span>
+                <StatusBadge status={selectedPO.status || 'approved'} />
               </div>
             </div>
 

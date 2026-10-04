@@ -90,6 +90,9 @@ function NewInvoiceForm() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string[]>>({});
   const [generalError, setGeneralError] = useState<string | null>(null);
 
+  const paramPo = searchParams?.get('po_number');
+  const paramVendor = searchParams?.get('vendor');
+
   // Load vendors and purchase orders on mount
   useEffect(() => {
     async function loadData() {
@@ -98,9 +101,6 @@ function NewInvoiceForm() {
           fetch('/api/vendors').catch(() => null),
           fetch('/api/purchase-orders').catch(() => null),
         ]);
-
-        const paramPo = searchParams.get('po_number');
-        const paramVendor = searchParams.get('vendor');
 
         if (paramPo) {
           setPoNumber(paramPo);
@@ -137,7 +137,7 @@ function NewInvoiceForm() {
       }
     }
     loadData();
-  }, [searchParams]);
+  }, [paramPo, paramVendor]);
 
   // Compute live line-item totals
   const totals = useMemo(() => {
@@ -372,7 +372,7 @@ function NewInvoiceForm() {
 
           <div className="flex flex-wrap items-center gap-3">
             <h1 className="text-2xl font-bold tracking-tight text-zinc-900">
-              Create New Invoice
+              Create Invoice
             </h1>
             <StatusBadge status="pending" />
             <span className="rounded-md border border-zinc-200 bg-zinc-50 px-2 py-0.5 font-mono text-[11px] font-semibold text-zinc-600 shadow-2xs">
