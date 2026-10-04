@@ -21,6 +21,16 @@ interface UploadedFilePreview {
   lastModified: number;
 }
 
+// Preview-only display values. Neither is part of the create payload (see
+// CreateInvoiceSchema), so neither is editable.
+const PAYMENT_TERMS_LABELS: Record<string, string> = {
+  immediate: 'Due Immediately',
+  net15: 'Net 15 Days',
+  net30: 'Net 30 Days (Standard)',
+  net60: 'Net 60 Days',
+  net90: 'Net 90 Days',
+};
+
 // A fresh form must not arrive pre-loaded with invented invoice data: seeded
 // line items plus a derived amount let a user post a fabricated payable to the
 // first registered vendor without typing anything. The grid therefore opens on
@@ -73,8 +83,8 @@ function NewInvoiceForm() {
   const [amount, setAmount] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [poNumber, setPoNumber] = useState('');
-  const [invoiceReference, setInvoiceReference] = useState(() => `INV-${Math.floor(100000 + Math.random() * 900000)}`);
-  const [paymentTerms, setPaymentTerms] = useState('net30');
+  const [invoiceReference] = useState(() => `INV-${Math.floor(100000 + Math.random() * 900000)}`);
+  const [paymentTerms] = useState('net30');
 
   // Line Items calculation engine
   const [lineItems, setLineItems] = useState<LineItem[]>([BLANK_LINE_ITEM]);
@@ -604,40 +614,41 @@ function NewInvoiceForm() {
               )}
             </div>
 
-            {/* Invoice Reference / Number */}
+            {/* Invoice Reference / Number - preview only.
+                CreateInvoiceSchema is `.strict()` and the invoices table has no
+                reference column, so nothing typed here could ever be persisted.
+                Rendered as a read-only value rather than an input so no one edits
+                data the submit payload silently drops. */}
             <div>
-              <label htmlFor="ref-input" className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
+              <span className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
                 Invoice Reference #
-              </label>
-              <div className="mt-2">
-                <input
-                  id="ref-input"
-                  type="text"
-                  value={invoiceReference}
-                  onChange={(e) => setInvoiceReference(e.target.value)}
-                  className="block w-full rounded-xl border border-zinc-300/80 bg-zinc-50/60 p-3 text-sm font-mono text-zinc-900 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-colors focus:border-zinc-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900/10"
-                />
+                <span className="ml-1.5 font-sans text-[10px] font-medium normal-case tracking-normal text-zinc-400">
+                  (preview only — not saved)
+                </span>
+              </span>
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-xl border border-zinc-200 bg-zinc-100/80 p-3 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)]">
+                <span className="truncate font-mono text-sm text-zinc-700">{invoiceReference}</span>
+                <span className="shrink-0 rounded border border-zinc-300 bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase text-zinc-500">
+                  Not persisted
+                </span>
               </div>
             </div>
 
-            {/* Payment Terms */}
+            {/* Payment Terms - preview only. Same reason as the reference above:
+                the strict create schema and the invoices table carry no terms
+                field, so this select could only ever discard the user's choice. */}
             <div>
-              <label htmlFor="terms-select" className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
+              <span className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
                 Payment Terms
-              </label>
-              <div className="mt-2">
-                <select
-                  id="terms-select"
-                  value={paymentTerms}
-                  onChange={(e) => setPaymentTerms(e.target.value)}
-                  className="block w-full rounded-xl border border-zinc-300/80 bg-zinc-50/60 p-3 text-sm text-zinc-900 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-colors focus:border-zinc-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900/10 cursor-pointer"
-                >
-                  <option value="immediate">Due Immediately</option>
-                  <option value="net15">Net 15 Days</option>
-                  <option value="net30">Net 30 Days (Standard)</option>
-                  <option value="net60">Net 60 Days</option>
-                  <option value="net90">Net 90 Days</option>
-                </select>
+                <span className="ml-1.5 font-sans text-[10px] font-medium normal-case tracking-normal text-zinc-400">
+                  (preview only — not saved)
+                </span>
+              </span>
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-xl border border-zinc-200 bg-zinc-100/80 p-3 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)]">
+                <span className="truncate text-sm text-zinc-700">{PAYMENT_TERMS_LABELS[paymentTerms]}</span>
+                <span className="shrink-0 rounded border border-zinc-300 bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase text-zinc-500">
+                  Not persisted
+                </span>
               </div>
             </div>
           </div>
