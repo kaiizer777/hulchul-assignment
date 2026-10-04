@@ -443,6 +443,8 @@ def get_allowed_origins() -> list[str]:
     to be dead config that left `*` doing all the work.
     """
     candidates = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    candidates.append(settings.ERP_BASE_URL)
+    candidates.append(settings.FRONTEND_URL)
     candidates.append(settings.NEXT_PUBLIC_API_URL)
 
     origins: list[str] = []

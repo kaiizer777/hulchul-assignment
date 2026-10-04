@@ -2,12 +2,14 @@
 
 Production-grade, resilient autonomous AI agent executing browser-based ERP workflows, invoice reconciliation, and automated exception handling with human-in-the-loop approval gates.
 
+> 📄 **Submission Documentation**: Comprehensive architecture review, 5-pillar alignment, recovery protocols, and enterprise roadmap are documented in the [**Engineering Submission Note**](ENGINEERING_NOTE.md).
+
 ---
 
 ## Tech Stack
 
-- **Frontend & Mock ERP**: Next.js 16 App Router (Turbopack, TypeScript, Tailwind CSS v4), deployed on Cloudflare Workers (`@opennextjs/cloudflare`).
-- **Backend Orchestrator**: FastAPI (Python 3.12, Uvicorn, Pydantic v2), deployed on AWS Lambda via AWS Lambda Web Adapter.
+- **Frontend & Mock ERP**: Next.js 16 App Router (Turbopack, TypeScript, Tailwind CSS v4), deployed on **Cloudflare Workers** (`@opennextjs/cloudflare`).
+- **Backend Orchestrator**: FastAPI (Python 3.12, Uvicorn, Pydantic v2), deployed on **AWS Lambda** via AWS Lambda Web Adapter.
 - **Database**: Neon Serverless PostgreSQL (`asyncpg`), storing invoices, purchase orders, agent runs, and step audit trails with base64 screenshots.
 - **State & Coordination**: Upstash Redis (Serverless REST API) for active session state, pause/resume flags, and nonces for human-in-the-loop approval gates.
 - **AI / LLM**: Groq API running `openai/gpt-oss-120b` for ReAct (Reason + Act) loop orchestration.

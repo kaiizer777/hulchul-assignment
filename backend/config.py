@@ -22,8 +22,24 @@ class Settings:
     BROWSER_WS_ENDPOINT: str = os.getenv("BROWSER_WS_ENDPOINT", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
-    UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-    NEXT_PUBLIC_API_URL: str = os.getenv("NEXT_PUBLIC_API_URL", "http://localhost:3051")
+    ERP_BASE_URL: str = (
+        os.getenv("ERP_BASE_URL")
+        or os.getenv("FRONTEND_URL")
+        or os.getenv("NEXT_PUBLIC_API_URL")
+        or "http://localhost:3051"
+    )
+    FRONTEND_URL: str = (
+        os.getenv("FRONTEND_URL")
+        or os.getenv("ERP_BASE_URL")
+        or os.getenv("NEXT_PUBLIC_API_URL")
+        or "http://localhost:3051"
+    )
+    NEXT_PUBLIC_API_URL: str = (
+        os.getenv("NEXT_PUBLIC_API_URL")
+        or os.getenv("ERP_BASE_URL")
+        or os.getenv("FRONTEND_URL")
+        or "http://localhost:3051"
+    )
     PORT: int = int(os.getenv("PORT", "8051"))
     # Exact origins only. A bare "*" is invalid alongside allow_credentials and a
     # literal "https://*.pages.dev" is silently ignored by Starlette, so both used

@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
+import { LiveStepExecutionLog } from '../components/LiveStepExecutionLog';
 
 const AGENT_API_BASE = '/api/agent';
 
@@ -110,22 +111,8 @@ export default function AgentControlPage() {
   const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
   const [isFetchingScreenshot, setIsFetchingScreenshot] = useState(false);
 
-  // Auto-scroll log ref
-  const logContainerRef = useRef<HTMLDivElement>(null);
+  // Auto-scroll log state
   const [autoScroll, setAutoScroll] = useState(true);
-
-  const handleScroll = () => {
-    if (!logContainerRef.current) return;
-    const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
-    setAutoScroll(isAtBottom);
-  };
-
-  useEffect(() => {
-    if (autoScroll && logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-    }
-  }, [steps, autoScroll]);
 
   // Verification Report State
   const [verificationReport, setVerificationReport] = useState<VerificationReport | null>(null);
@@ -632,102 +619,15 @@ export default function AgentControlPage() {
       </div>
 
       {/* Real-Time Step Log via SSE */}
-      <div className="rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)]">
-        <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-zinc-200/80">
-          <div>
-            <h3 className="text-base font-bold text-zinc-900 flex items-center gap-2">
-              <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
-              Live Step Execution Log
-            </h3>
-            <p className="text-xs text-zinc-500 mt-0.5">
-              Real-time SSE events streaming agent observations, actions, and results.
-            </p>
-          </div>
-
-          <div className="flex items-center gap-2.5">
-            {!autoScroll && (
-              <button
-                onClick={() => setAutoScroll(true)}
-                className="rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)] active:translate-y-[0.5px]"
-              >
-                Resume Auto-scroll
-              </button>
-            )}
-            <span className="inline-flex items-center gap-1.5 font-mono text-xs text-zinc-600 rounded-lg border border-zinc-200/80 bg-zinc-50 px-2.5 py-1 shadow-2xs">
-              <span className={`h-2 w-2 rounded-full ${status === 'running' ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-400'}`} />
-              {steps.length} {steps.length === 1 ? 'step' : 'steps'} logged
-            </span>
-          </div>
-        </div>
-
-        <div
-          ref={logContainerRef}
-          onScroll={handleScroll}
-          className="mt-4 max-h-[460px] min-h-[220px] overflow-y-auto space-y-3 font-mono text-xs pr-1"
-        >
-          {steps.length === 0 ? (
-            <div className="flex h-48 flex-col items-center justify-center text-center text-zinc-400 border border-dashed border-zinc-200/90 rounded-xl bg-zinc-50/40 p-6">
-              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-200 bg-white mb-2.5 shadow-2xs">
-                <svg className="h-5 w-5 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.7">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                </svg>
-              </div>
-              <span className="font-semibold text-zinc-700">No execution steps recorded yet</span>
-              <span className="text-[11px] text-zinc-400 mt-0.5">Submit a goal above to start the autonomous browser execution.</span>
-            </div>
-          ) : (
-            steps.map((st, idx) => {
-              const isFail = st.type === 'step_failed' || (st.result && st.result.toLowerCase().includes('failed'));
-              const isSessionLost = st.type === 'session_lost' || st.type === 'session_reattached';
-              return (
-                <div
-                  key={st.step_id || idx}
-                  className={`rounded-xl border p-4 transition-all shadow-[0_1px_2px_rgba(0,0,0,0.02)] ${
-                    isSessionLost
-                      ? 'border-amber-300/80 bg-amber-50/60 text-amber-900 border-l-4 border-l-amber-500'
-                      : isFail
-                        ? 'border-rose-300/80 bg-rose-50/60 text-rose-900 border-l-4 border-l-rose-500'
-                        : 'border-zinc-200/90 bg-zinc-50/60 text-zinc-800 border-l-4 border-l-emerald-500'
-                  }`}
-                >
-                  <div className="flex items-center justify-between pb-2 border-b border-zinc-200/70 text-[11px]">
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-zinc-500">
-                        #{st.step_index || idx + 1}
-                      </span>
-                      <span className="font-semibold text-zinc-900">
-                        {st.action}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2.5">
-                      {st.has_screenshot && (
-                        <button
-                          onClick={() => handleViewScreenshot(st.step_id || st.step_index?.toString() || (idx + 1).toString())}
-                          disabled={isFetchingScreenshot}
-                          className="inline-flex items-center gap-1 rounded-md border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:bg-zinc-100 shadow-2xs active:translate-y-[0.5px]"
-                        >
-                          <svg className="h-3 w-3 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
-                          </svg>
-                          <span>Screenshot</span>
-                        </button>
-                      )}
-                      <span className="text-zinc-400">
-                        {new Date(st.timestamp).toLocaleTimeString()}
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="mt-2.5 rounded-lg bg-white p-3 font-mono text-xs leading-relaxed border border-zinc-200 text-zinc-800 whitespace-pre-wrap shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
-                    {st.result || st.error || 'Success'}
-                  </div>
-                </div>
-              );
-            })
-          )}
-        </div>
-      </div>
+      <LiveStepExecutionLog
+        steps={steps}
+        status={status}
+        autoScroll={autoScroll}
+        onToggleAutoScroll={() => setAutoScroll((prev) => !prev)}
+        onSetAutoScroll={setAutoScroll}
+        onViewScreenshot={handleViewScreenshot}
+        isFetchingScreenshot={isFetchingScreenshot}
+      />
 
       {/* Verification Report Section (Phase 4) */}
       {(verificationReport || isFetchingVerification || verificationError || (runId && (status === 'done' || status === 'failed' || status === 'session_lost'))) && (
