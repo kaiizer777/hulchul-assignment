@@ -70,6 +70,7 @@ function NewInvoiceForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentPanelRef = useRef<HTMLDivElement>(null);
   const ocrTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const cancelPendingOcr = () => {
@@ -161,6 +162,15 @@ function NewInvoiceForm() {
 
   // Drop any in-flight OCR timer on unmount so it cannot set state afterwards.
   useEffect(() => cancelPendingOcr, []);
+
+  // The dropzone unmounts as soon as a file is attached, which would strand a
+  // keyboard or screen-reader user on the document body. Move focus to the panel
+  // that replaced it so they stay on the attachment they just made.
+  useEffect(() => {
+    if (uploadedFile) {
+      attachmentPanelRef.current?.focus();
+    }
+  }, [uploadedFile]);
 
   // Compute live line-item totals
   const totals = useMemo(() => {
@@ -759,7 +769,12 @@ function NewInvoiceForm() {
               </div>
             ) : (
               <div className="space-y-4">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
+                <div
+                  ref={attachmentPanelRef}
+                  tabIndex={-1}
+                  aria-label="Attached invoice document"
+                  className="flex flex-col gap-3 rounded-xl border border-zinc-200 bg-zinc-50/60 p-4 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-900/30 sm:flex-row sm:items-center sm:justify-between"
+                >
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-700 shadow-2xs font-mono text-xs font-bold">
                       {uploadedFile.name.endsWith('.pdf') ? 'PDF' : uploadedFile.name.endsWith('.csv') ? 'CSV' : 'IMG'}
