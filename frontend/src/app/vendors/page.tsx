@@ -71,12 +71,18 @@ function formatCurrency(amount: number): string {
   }).format(amount);
 }
 
-function matchesVendor(recordVendor: string, vendorName: string): boolean {
-  return recordVendor.trim().toLowerCase() === vendorName.trim().toLowerCase();
+function normalizeVendorId(name: unknown): string {
+  if (typeof name !== 'string') return '';
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
 }
 
-function readArray<T>(payload: unknown): T[] {
-  return Array.isArray(payload) ? (payload as T[]) : [];
+function matchesVendor(recordVendor: unknown, vendorId: string): boolean {
+  if (typeof recordVendor !== 'string') return false;
+  return normalizeVendorId(recordVendor) === vendorId;
 }
 
 function buildProfile(
@@ -100,8 +106,8 @@ function buildProfile(
     };
   }
 
-  const vendorInvoices = invoices.filter((inv) => matchesVendor(inv.vendor, vendor.name));
-  const vendorPOs = purchaseOrders.filter((po) => matchesVendor(po.vendor, vendor.name));
+  const vendorInvoices = invoices.filter((inv) => matchesVendor(inv.vendor, vendor.id));
+  const vendorPOs = purchaseOrders.filter((po) => matchesVendor(po.vendor, vendor.id));
 
   const byStatus = new Map<InvoiceStatus, StatusSlice>();
   for (const inv of vendorInvoices) {
@@ -148,7 +154,7 @@ export default function VendorsPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [activityFilter, setActivityFilter] = useState<ActivityFilter>('all');
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [selectedVendor, setSelectedVendor] = useState<VendorProfile | null>(null);
+  const [selectedVendorId, setSelectedVendorId] = useState<string | null>(null);
 
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
@@ -171,7 +177,14 @@ export default function VendorsPage() {
       if (!Array.isArray(dataVendors)) {
         throw new Error('Vendor response was not a list of vendors.');
       }
-      setVendors(dataVendors as VendorDTO[]);
+      const validVendors = dataVendors.filter(
+        (entry): entry is VendorDTO =>
+          typeof entry === 'object' &&
+          entry !== null &&
+          typeof (entry as VendorDTO).id === 'string' &&
+          typeof (entry as VendorDTO).name === 'string'
+      );
+      setVendors(validVendors);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred');
       setInvoices(null);
@@ -191,8 +204,20 @@ export default function VendorsPage() {
 
     const failures: string[] = [];
     if (invoicesRes.status === 'fulfilled' && invoicesRes.value.ok) {
-      setInvoices(readArray<InvoiceDTO>(await invoicesRes.value.json().catch(() => null)));
+      let parsed: unknown = null;
+      try {
+        parsed = await invoicesRes.value.json();
+      } catch {
+        parsed = null;
+      }
+      if (Array.isArray(parsed)) {
+        setInvoices(parsed as InvoiceDTO[]);
+      } else {
+        setInvoices(null);
+        failures.push('invoice ledger returned invalid data');
+      }
     } else {
+      setInvoices(null);
       failures.push(
         invoicesRes.status === 'rejected'
           ? 'invoice ledger unreachable'
@@ -201,10 +226,20 @@ export default function VendorsPage() {
     }
 
     if (poRes.status === 'fulfilled' && poRes.value.ok) {
-      setPurchaseOrders(
-        readArray<PurchaseOrderDTO>(await poRes.value.json().catch(() => null))
-      );
+      let parsed: unknown = null;
+      try {
+        parsed = await poRes.value.json();
+      } catch {
+        parsed = null;
+      }
+      if (Array.isArray(parsed)) {
+        setPurchaseOrders(parsed as PurchaseOrderDTO[]);
+      } else {
+        setPurchaseOrders(null);
+        failures.push('purchase-order ledger returned invalid data');
+      }
     } else {
+      setPurchaseOrders(null);
       failures.push(
         poRes.status === 'rejected'
           ? 'purchase-order ledger unreachable'
@@ -223,32 +258,68 @@ export default function VendorsPage() {
 
   // Move focus into the details dialog and hand it back on close.
   useEffect(() => {
-    if (!selectedVendor) {
+    if (!selectedVendorId) {
       return;
     }
     restoreFocusRef.current = document.activeElement as HTMLElement | null;
     dialogRef.current?.focus();
     return () => restoreFocusRef.current?.focus();
-  }, [selectedVendor]);
+  }, [selectedVendorId]);
 
   useEffect(() => {
-    if (!selectedVendor) {
+    if (!selectedVendorId) {
       return;
     }
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setSelectedVendor(null);
+        setSelectedVendorId(null);
+        return;
+      }
+      if (e.key === 'Tab') {
+        const container = dialogRef.current;
+        if (!container) return;
+        const focusables = Array.from(
+          container.querySelectorAll<HTMLElement>(
+            'a[href], button:not([disabled]), textarea, input, select, [tabindex]:not([tabindex="-1"])'
+          )
+        );
+        if (focusables.length === 0) {
+          e.preventDefault();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (e.shiftKey) {
+          if (active === first || !container.contains(active)) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else {
+          if (active === last || !container.contains(active)) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedVendor]);
+  }, [selectedVendorId]);
 
   const ledgerAvailable = invoices !== null && purchaseOrders !== null;
 
   const profiles = useMemo(
     () => vendors.map((vendor) => buildProfile(vendor, invoices, purchaseOrders)),
     [vendors, invoices, purchaseOrders]
+  );
+
+  // Resolve the open dialog against live profiles so a refresh never leaves a
+  // stale snapshot on screen; a vendor that no longer exists closes the dialog.
+  const selectedVendor = useMemo(
+    () =>
+      selectedVendorId ? (profiles.find((p) => p.id === selectedVendorId) ?? null) : null,
+    [profiles, selectedVendorId]
   );
 
   const metrics = useMemo(() => {
@@ -317,7 +388,7 @@ export default function VendorsPage() {
   };
 
   const openProfile = (profile: VendorProfile) => {
-    setSelectedVendor(profile);
+    setSelectedVendorId(profile.id);
   };
 
   return (
@@ -814,7 +885,7 @@ export default function VendorsPage() {
       {selectedVendor && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/40 p-4"
-          onClick={() => setSelectedVendor(null)}
+          onClick={() => setSelectedVendorId(null)}
         >
           <div
             ref={dialogRef}
@@ -841,7 +912,7 @@ export default function VendorsPage() {
               </div>
               <button
                 type="button"
-                onClick={() => setSelectedVendor(null)}
+                onClick={() => setSelectedVendorId(null)}
                 aria-label="Close vendor details"
                 className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 text-zinc-400 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_2px_rgba(0,0,0,0.03)] transition-all hover:bg-zinc-100 hover:text-zinc-700 active:translate-y-[0.5px]"
               >
@@ -971,7 +1042,7 @@ export default function VendorsPage() {
             <div className="flex flex-col gap-2 border-t border-zinc-200/90 bg-zinc-50/70 px-6 py-3.5 sm:flex-row sm:items-center sm:justify-end">
               <button
                 type="button"
-                onClick={() => setSelectedVendor(null)}
+                onClick={() => setSelectedVendorId(null)}
                 className="inline-flex items-center justify-center rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 px-4 py-2 text-xs font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_2px_rgba(0,0,0,0.03)] hover:bg-zinc-100 active:translate-y-[0.5px]"
               >
                 Close
