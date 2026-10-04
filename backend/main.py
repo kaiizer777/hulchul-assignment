@@ -125,32 +125,74 @@ TERMINAL_WRITE_IO_TIMEOUT_SECONDS: float = 5.0
 STARTUP_RECONCILE_TIMEOUT_SECONDS: float = 15.0
 
 
-async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
+async def _mark_agent_run_terminal(
+    run_id_str: str,
+    status: str,
+    owner_id: Optional[str] = None,
+) -> None:
     """Record a terminal run status in the database, Redis, and the event hub.
 
     Each target is written in its own try/except so a failure in one cannot
     prevent the others from recording the terminal status.
 
+    ``owner_id`` fences the database write on the run lease (issue #56). This helper is
+    the fallback terminal write for an execution that never produced a result of its
+    own -- a cancellation, or an exception raised out of ``ReActAgent.run`` -- and an
+    expired lease does not stop its former holder. Without the fence a superseded
+    execution stamps ``failed`` over the run its replacement is executing, which is
+    the same overwrite the owner-scoped write in ``update_run_status`` exists to
+    prevent, and that fence is only load-bearing while every other terminal write
+    carries one too.
+
+    A NULL owner stays writable, so a cancellation landing before ``ensure_run_record``
+    claimed anything still records ``failed`` rather than stranding the run as
+    ``running`` until the next cold start. A *different* owner is not writable, and
+    neither is a live lease held by someone else: passing ``owner_id=None`` means no
+    agent was ever built for this run, so this request never claimed a lease and must
+    not touch a run somebody else holds.
+
+    A landed write also hands the lease back, in the same statement so the write stays
+    a single round trip. Leaving ``owner_id`` set on a ``failed`` row keeps the run
+    unclaimable for up to ``RUN_LEASE_SECONDS``, refusing a legitimate retry for the
+    whole window.
+
     The hub publication is gated on the database write succeeding. The stream
     reconciles `agent_runs.status` on every poll, so announcing a status the
     durable store never accepted would make the next poll re-emit the older one
     as a fresh transition and walk the client backwards from `failed` to
-    `running`. Redis is a separate read model and is still written
-    best-effort.
+    `running`. That gate now covers a fenced-out write as well: zero affected rows
+    means this execution does not own the run, so it has no status to announce.
+    Redis is a separate read model and is still written best-effort.
     """
     db_updated = False
     try:
         pool = await asyncio.wait_for(get_db_pool(), TERMINAL_WRITE_IO_TIMEOUT_SECONDS)
         async with pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS) as conn:
-            await asyncio.wait_for(
-                conn.execute(
-                    "UPDATE agent_runs SET status = $1 WHERE run_id = $2;",
-                    status,
-                    uuid.UUID(run_id_str),
-                ),
+            if owner_id is None:
+                statement = (
+                    "UPDATE agent_runs SET status = $1 WHERE run_id = $2 "
+                    "AND (agent_runs.owner_id IS NULL "
+                    "OR agent_runs.lease_expires_at <= now());"
+                )
+                params: Tuple[Any, ...] = (status, uuid.UUID(run_id_str))
+            else:
+                statement = (
+                    "UPDATE agent_runs "
+                    "SET status = $1, owner_id = NULL, lease_expires_at = NULL "
+                    "WHERE run_id = $2 "
+                    "AND (agent_runs.owner_id IS NULL OR agent_runs.owner_id = $3);"
+                )
+                params = (status, uuid.UUID(run_id_str), owner_id)
+            command_tag = await asyncio.wait_for(
+                conn.execute(statement, *params),
                 TERMINAL_WRITE_IO_TIMEOUT_SECONDS,
             )
-        db_updated = True
+        db_updated = affected_rows(command_tag) > 0
+        if not db_updated:
+            logger.warning(
+                f"Did not mark run {run_id_str} as {status}: this execution no longer "
+                "owns the run lease, so the newer owner's state stands."
+            )
     except Exception as db_err:
         logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
 
@@ -209,6 +251,13 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     # 'completed', and writing 'failed' over it would contradict the durable
     # record the SSE poll reads on every pass.
     agent_finished = False
+
+    # Retained past the block that builds it so the two terminal-status arms below can
+    # fence on the run lease (issue #56). Without a reference to the agent those arms
+    # have only _mark_agent_run_terminal to fall back on, which is why it now needs an
+    # owner id. None means no agent was ever constructed -- the CDP session or the
+    # ReActAgent constructor failed first -- so this request never claimed a lease.
+    agent: Optional["ReActAgent"] = None
 
     async def _enter_cdp_session():
         """Enter a browser session context manager and track it for later release."""
@@ -284,7 +333,11 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         # bounded (TERMINAL_WRITE_IO_TIMEOUT_SECONDS), so the shield is never
         # waiting on an unbounded database await. Lifespan never awaits these
         # tasks, so there is no drain to stall either way.
-        terminal_write = asyncio.ensure_future(_mark_agent_run_terminal(run_id_str, "failed"))
+        terminal_write = asyncio.ensure_future(
+            _mark_agent_run_terminal(
+                run_id_str, "failed", agent.run_owner_id if agent is not None else None
+            )
+        )
         # Registered before the shield, not only on the cancellation path below,
         # so the fallback log also covers a cancellation landing between creating
         # the task and awaiting it.
@@ -295,7 +348,12 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         raise
     except Exception as e:
         logger.exception(f"Background agent run {run_id_str} failed: {e}")
-        await _mark_agent_run_terminal(run_id_str, "failed")
+        # Fenced on the lease owner for the same reason as the cancellation arm: a
+        # run() that raised because it lost the lease must not stamp 'failed' over
+        # the run its replacement is executing.
+        await _mark_agent_run_terminal(
+            run_id_str, "failed", agent.run_owner_id if agent is not None else None
+        )
     finally:
         current = asyncio.current_task()
         if current is not None and _active_agent_tasks.get(run_id_str) is current:

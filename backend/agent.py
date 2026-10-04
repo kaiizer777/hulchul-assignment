@@ -406,6 +406,19 @@ class ReActAgent:
             self._start_run_lease_heartbeat(pool)
         return True
 
+    @property
+    def run_owner_id(self) -> str:
+        """Lease identity this execution holds its run under.
+
+        Read by ``backend/main.py`` so the background task's fallback terminal-status
+        write can be fenced on ownership the same way ``update_run_status`` is
+        (issue #56). That write is reached when this execution produced no result of
+        its own -- a cancellation, or an exception out of ``run()`` -- and an expired
+        lease does not stop its former holder, so without the fence it stamps a
+        terminal status over the run its replacement is executing.
+        """
+        return self._run_owner_id
+
     def _mark_run_lease_lost(self) -> None:
         """Record that the heartbeat lost this run's lease.
 

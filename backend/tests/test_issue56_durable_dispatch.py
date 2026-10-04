@@ -57,6 +57,12 @@ UPSERT_SAME_OWNER_GUARD = "agent_runs.owner_id = EXCLUDED.owner_id"
 # The sweep's rollout guard: a row this lease scheme has never owned is not a candidate.
 ATTEMPTED_GUARD = "AND attempt > 0"
 OWNER_RECHECK_QUERY = "SELECT owner_id FROM agent_runs"
+# The fallback terminal write in backend/main.py. Qualified with the table name so it
+# cannot be confused with the unqualified owner fences above.
+TERMINAL_OWNER_FENCE = "agent_runs.owner_id = $3"
+TERMINAL_UNCLAIMED_FENCE = (
+    "agent_runs.owner_id IS NULL OR agent_runs.lease_expires_at <= now()"
+)
 
 
 def _now() -> datetime:
@@ -239,7 +245,9 @@ class _FakePool:
         self.fail_on: List[str] = fail_on or []
         self.default_lease = default_lease
 
-    def acquire(self) -> _FakeAcquire:
+    def acquire(self, timeout: Optional[float] = None) -> _FakeAcquire:
+        # timeout is accepted because the real call site passes one:
+        # pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS).
         return _FakeAcquire(self)
 
     def record(self, query: str, args: Tuple[Any, ...]) -> None:
@@ -270,6 +278,18 @@ class _FakePool:
                 return False
         if ATTEMPTED_GUARD in query and int(row.get("attempt") or 0) < 1:
             return False
+        # Fallback terminal write, owner supplied: writable when the row is unowned
+        # (nobody claimed it, so a cancellation before the claim still records
+        # failed) or already ours. A different owner is refused.
+        if TERMINAL_OWNER_FENCE in query and len(args) > 2:
+            if row.get("owner_id") is not None and row.get("owner_id") != args[2]:
+                return False
+        # Fallback terminal write, no owner supplied: this request never claimed a
+        # lease, so a row held under a live lease by anyone is refused.
+        if TERMINAL_UNCLAIMED_FENCE in query:
+            lease = row.get("lease_expires_at")
+            if row.get("owner_id") is not None and lease is not None and lease >= _now():
+                return False
         return True
 
     def upsert_guards_pass(self, row: Dict[str, Any], query: str, owner_id: Any) -> bool:
@@ -1789,6 +1809,242 @@ class TestOwnershipLossStopsTheRun(unittest.IsolatedAsyncioTestCase):
             redis.clear_approval.assert_not_awaited()
             self.assertEqual(agent.update_run_status.await_count, 1)
             self.assertEqual(agent.persist_step.await_count, 1)
+
+class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
+    """backend/main.py: the fallback terminal write must respect the run lease.
+
+    ``_mark_agent_run_terminal`` is reached only when the execution produced no result
+    of its own -- a cancellation, or an exception out of ``agent.run`` -- and an expired
+    lease does not stop its former holder. Without a fence on that write, the owner
+    fence in ``ReActAgent.update_run_status`` is bypassed by the very path a
+    superseded execution is most likely to take.
+    """
+
+    async def _mark(
+        self,
+        row: Dict[str, Any],
+        owner_id: Optional[str],
+    ) -> Tuple[Dict[str, Any], _FakeHub, List[Dict[str, Any]]]:
+        from backend import main as main_module
+
+        pool = _FakePool([row])
+        hub = _FakeHub()
+
+        async def _get_pool() -> Any:
+            return pool
+
+        redis = MagicMock()
+        redis.is_configured = False
+        redis.get_session_state = AsyncMock(return_value={"run_id": row["run_id"]})
+        redis.set_session_state = AsyncMock(return_value=True)
+
+        with patch.object(main_module, "get_db_pool", new=_get_pool), patch(
+            "backend.redis_client.get_redis_client", return_value=redis
+        ), patch.object(main_module, "run_event_hub", hub):
+            await asyncio.wait_for(
+                main_module._mark_agent_run_terminal(
+                    str(row["run_id"]), "failed", owner_id
+                ),
+                timeout=5.0,
+            )
+        return row, hub, redis.set_session_state.await_args_list
+
+    async def test_01_a_newer_owner_is_not_overwritten(self) -> None:
+        """The whole point: a superseded execution must not stamp 'failed'."""
+        row, hub, _ = await self._mark(
+            _row(
+                status="running",
+                owner_id="owner-new",
+                lease_expires_at=_live(),
+                attempt=1,
+            ),
+            owner_id="owner-old",
+        )
+
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["owner_id"], "owner-new")
+        self.assertEqual(hub.published, [], "a fenced-out write has no status to announce")
+
+    async def test_02_a_landed_write_hands_the_lease_back(self) -> None:
+        """A 'failed' row that still holds its lease refuses a retry for the full window."""
+        row, hub, _ = await self._mark(
+            _row(status="running", owner_id="owner-me", lease_expires_at=_live(), attempt=1),
+            owner_id="owner-me",
+        )
+
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["owner_id"])
+        self.assertIsNone(row["lease_expires_at"])
+        self.assertEqual([e[1]["status"] for e in hub.published], ["failed"])
+
+    async def test_03_cancelled_before_the_claim_still_records_failed(self) -> None:
+        """A NULL owner is writable, or a cancellation racing the claim strands the run."""
+        row, _, _ = await self._mark(
+            _row(status="running", owner_id=None, lease_expires_at=None, attempt=0),
+            owner_id="owner-me",
+        )
+
+        self.assertEqual(row["status"], "failed")
+
+    async def test_04_no_agent_never_touches_a_live_lease(self) -> None:
+        """No agent means no claim, so this request has no standing on the row at all."""
+        row, hub, _ = await self._mark(
+            _row(
+                status="running",
+                owner_id="owner-somebody-else",
+                lease_expires_at=_live(),
+                attempt=1,
+            ),
+            owner_id=None,
+        )
+
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(hub.published, [])
+
+    async def test_05_no_agent_may_stamp_an_unowned_row(self) -> None:
+        """Pre-existing behaviour, pinned: an unowned row is still ours to fail."""
+        row, _, _ = await self._mark(
+            _row(status="running", owner_id=None, lease_expires_at=None, attempt=0),
+            owner_id=None,
+        )
+
+        self.assertEqual(row["status"], "failed")
+
+    # --- through _execute_agent_run_background, where the owner id has to be passed ---
+
+    def _browser(self) -> Any:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _session(*args: Any, **kwargs: Any) -> Any:
+            yield MagicMock(page=MagicMock())
+
+        return _session
+
+    async def _drive_exception_path(
+        self, row_owner: str, agent_owner: str
+    ) -> Tuple[Dict[str, Any], _FakeHub]:
+        """Make agent.run raise, with the agent's real lease identity wired through."""
+        from backend import main as main_module
+
+        run_id = str(uuid.uuid4())
+        row = _row(
+            status="running",
+            owner_id=row_owner,
+            lease_expires_at=_live(),
+            attempt=1,
+            run_id=run_id,
+        )
+        pool = _FakePool([row])
+        hub = _FakeHub()
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = agent_owner
+
+        async def _boom(goal: str) -> Dict[str, Any]:
+            raise RuntimeError("persisted step write failed")
+
+        agent.run = _boom
+
+        async def _get_pool() -> Any:
+            return pool
+
+        redis = MagicMock()
+        redis.is_configured = False
+        redis.get_session_state = AsyncMock(return_value={"run_id": run_id})
+        redis.set_session_state = AsyncMock(return_value=True)
+
+        with patch.object(main_module, "get_db_pool", new=_get_pool), patch(
+            "backend.redis_client.get_redis_client", return_value=redis
+        ), patch.object(
+            main_module, "run_event_hub", hub
+        ), patch(
+            "backend.browser.get_browser_session", new=self._browser()
+        ), patch(
+            "backend.agent.ReActAgent", new=lambda **kwargs: agent
+        ), patch.object(
+            main_module, "TERMINAL_WRITE_IO_TIMEOUT_SECONDS", 5.0
+        ):
+            with self.assertLogs("hulchul.backend", level="ERROR"):
+                await asyncio.wait_for(
+                    main_module._execute_agent_run_background(run_id, "Process invoices"),
+                    timeout=10.0,
+                )
+        return row, hub
+
+    async def test_06_an_exception_does_not_stomp_the_new_owner(self) -> None:
+        row, hub = await self._drive_exception_path("owner-new", "owner-old")
+
+        self.assertEqual(
+            row["status"],
+            "running",
+            "the replacement owner's run must survive the superseded execution's exception",
+        )
+        self.assertEqual(row["owner_id"], "owner-new")
+        self.assertEqual(hub.published, [])
+
+    async def test_07_an_exception_under_our_own_lease_still_fails_the_run(self) -> None:
+        """The fence must not swallow the write it exists to allow."""
+        row, hub = await self._drive_exception_path("owner-me", "owner-me")
+
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["owner_id"], "a terminal row must not keep a live lease")
+        self.assertEqual([e[1]["status"] for e in hub.published], ["failed"])
+
+    async def test_08_both_terminal_arms_forward_the_lease_owner(self) -> None:
+        """Pins the call sites, not just the helper: `None` is a silent unfenced write."""
+        from backend import main as main_module
+
+        seen: List[Tuple[str, Optional[str]]] = []
+
+        async def _capture(run_id_str: str, status: str, owner_id: Optional[str] = None) -> None:
+            seen.append((status, owner_id))
+
+        run_id = str(uuid.uuid4())
+        pool = _FakePool([])
+        agent = _agent(pool, run_id)
+        agent._run_owner_id = "owner-me"
+
+        async def _boom(goal: str) -> Dict[str, Any]:
+            raise RuntimeError("boom")
+
+        async def _get_pool() -> Any:
+            return pool
+
+        started = asyncio.Event()
+
+        async def _hang(goal: str) -> Dict[str, Any]:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        with patch.object(main_module, "get_db_pool", new=_get_pool), patch(
+            "backend.redis_client.get_redis_client", return_value=MagicMock(
+                is_configured=False, get_session_state=AsyncMock(return_value=None)
+            )
+        ), patch("backend.browser.get_browser_session", new=self._browser()), patch(
+            "backend.agent.ReActAgent", new=lambda **kwargs: agent
+        ), patch.object(
+            main_module, "_mark_agent_run_terminal", new=_capture
+        ):
+            # Exception arm.
+            agent.run = _boom
+            await asyncio.wait_for(
+                main_module._execute_agent_run_background(run_id, "Process invoices"),
+                timeout=10.0,
+            )
+
+            # Cancellation arm.
+            agent.run = _hang
+            task = asyncio.create_task(
+                main_module._execute_agent_run_background(run_id, "Process invoices")
+            )
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=10.0)
+
+        self.assertEqual(seen, [("failed", "owner-me"), ("failed", "owner-me")])
+
 
 class TestStartupReconciliationHook(unittest.IsolatedAsyncioTestCase):
     """backend/main.py: reconciliation must run after pool init and never block boot."""
