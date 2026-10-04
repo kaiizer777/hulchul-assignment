@@ -243,25 +243,25 @@ export default function PurchaseOrdersPage() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {/* Total POs */}
-          <div className="relative overflow-hidden rounded-2xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50/80 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.02)] transition-all">
+          <div className="relative overflow-hidden rounded-2xl border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-gradient-to-b from-amber-50/60 to-amber-100/30 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] transition-all">
             <div className="flex items-center justify-between">
-              <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-500">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-amber-800">
                 Total Purchase Orders
               </span>
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-zinc-200/80 bg-zinc-50 text-zinc-700 shadow-2xs">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-amber-200/90 bg-amber-100/80 text-amber-700 shadow-2xs">
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
               </div>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-zinc-900 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-amber-800 tabular-nums">
                 {metrics.totalCount}
               </span>
-              <span className="text-xs text-zinc-500 font-medium">orders</span>
+              <span className="text-xs text-amber-700 font-medium">orders</span>
             </div>
-            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-zinc-400 font-medium">
-              <span className="inline-block h-1.5 w-1.5 rounded-full bg-zinc-400" />
+            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-amber-700 font-medium">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
               <span>Master catalog registry</span>
             </div>
           </div>
@@ -317,24 +317,24 @@ export default function PurchaseOrdersPage() {
           </div>
 
           {/* Total Approved Spend Commitment */}
-          <div className="relative overflow-hidden rounded-2xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50/80 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.02)] transition-all">
+          <div className="relative overflow-hidden rounded-2xl border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-gradient-to-b from-amber-50/60 to-amber-100/30 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] transition-all">
             <div className="flex items-center justify-between">
-              <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-500">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-amber-800">
                 Total Authorized Spend
               </span>
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-zinc-200/80 bg-zinc-50 text-zinc-700 shadow-2xs">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-amber-200/90 bg-amber-100/80 text-amber-700 shadow-2xs">
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </div>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-zinc-900 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-amber-800 tabular-nums">
                 {formatCurrency(metrics.totalSpend)}
               </span>
             </div>
-            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-zinc-400 font-medium">
-              <span className="inline-block h-1.5 w-1.5 rounded-full bg-zinc-400" />
+            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-amber-700 font-medium">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
               <span>Avg {formatCurrency(metrics.avgAmount)} / PO</span>
             </div>
           </div>
