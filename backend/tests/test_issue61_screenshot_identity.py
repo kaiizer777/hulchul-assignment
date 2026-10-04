@@ -123,13 +123,29 @@ class _FakeConn:
         return step_id
 
     async def execute(self, query: str, *args: Any) -> str:
-        """Serve the run upserts and the screenshot attachment update."""
+        """Serve the run-status writes and the screenshot attachment update."""
         flat = " ".join(query.split())
-        if "INSERT INTO agent_runs" in flat:
+        if flat.startswith("INSERT INTO agent_runs"):
+            # tools.take_screenshot's foreign-key recovery, which only needs the run
+            # row to exist. The lease claim is a different statement and arrives on
+            # fetchrow, because it carries the RETURNING clause.
             self._pool.runs.setdefault(args[0], "running")
             return "INSERT 1"
-        if flat.startswith("UPDATE agent_runs"):
-            self._pool.runs[args[1]] = args[0]
+        if flat.startswith("UPDATE agent_runs SET status"):
+            # Owner-scoped since #56: a status write from an execution that lost the
+            # lease must not land, which is what the WHERE clause models.
+            run_uuid, owner_id = args[1], args[2]
+            if self._pool.owners.get(run_uuid) != owner_id:
+                return "UPDATE 0"
+            self._pool.runs[run_uuid] = args[0]
+            return "UPDATE 1"
+        if flat.startswith("UPDATE agent_runs SET lease_expires_at"):
+            run_uuid, owner_id = args[0], args[1]
+            return "UPDATE 1" if self._pool.owners.get(run_uuid) == owner_id else "UPDATE 0"
+        if flat.startswith("UPDATE agent_runs SET owner_id = NULL"):
+            run_uuid, owner_id = args[0], args[1]
+            if self._pool.owners.get(run_uuid) == owner_id:
+                self._pool.owners[run_uuid] = None
             return "UPDATE 1"
         if flat.startswith("UPDATE agent_steps SET screenshot_b64"):
             # Both writers put the screenshot first and match on step_id last,
@@ -143,8 +159,23 @@ class _FakeConn:
         raise AssertionError(f"unexpected execute query: {flat}")
 
     async def fetchrow(self, query: str, *args: Any) -> Any:
-        """Serve the agent_runs read behind the stream's status_change replay."""
+        """Serve the run-lease claim and the agent_runs read behind status_change."""
         flat = " ".join(query.split())
+        if flat.startswith("INSERT INTO agent_runs"):
+            # ensure_run_record claims the lease with a single upsert carrying a
+            # RETURNING clause (issue #56); the atomicity of "take it only if nobody
+            # holds it" is the point, so it is not modelled as a bare INSERT. This
+            # connection is the first and only owner, so the claim is granted.
+            run_uuid, owner_id = args[0], args[2]
+            self._pool.owners[run_uuid] = owner_id
+            self._pool.runs[run_uuid] = "running"
+            return {
+                "run_id": run_uuid,
+                "status": "running",
+                "owner_id": owner_id,
+                "attempt": 1,
+                "lease_expires_at": self._pool.created_at,
+            }
         if flat.startswith("SELECT run_id, goal, status, created_at FROM agent_runs"):
             run_id = args[0]
             if run_id not in self._pool.runs:
@@ -183,6 +214,8 @@ class _FakeStepPool:
     def __init__(self) -> None:
         self.rows: Dict[uuid.UUID, Dict[str, Any]] = {}
         self.runs: Dict[uuid.UUID, str] = {}
+        # run_id -> owner_id currently holding that run's lease (issue #56).
+        self.owners: Dict[uuid.UUID, Any] = {}
         # agent.persist_step inserts, keyed by action: the loop's own rows.
         self.insert_counts: Dict[str, int] = {}
         # Every write of an agent_steps row, whoever made it.
