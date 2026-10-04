@@ -344,10 +344,24 @@ class ReActAgent:
         that is what stops a duplicate request or a retry from driving the same
         run_id twice.
 
-        The lease is established by this statement rather than by a follow-up
-        ``claim_run_lease`` call because a fresh run has no row to claim yet, and
-        splitting the accept into "upsert" then "claim" would leave a window where a
-        second request could upsert the row between the two.
+        The lease is established by this statement rather than by a follow-up claim
+        call because a fresh run has no row to claim yet, and splitting the accept into
+        "upsert" then "claim" would leave a window where a second request could upsert
+        the row between the two.
+
+        This is the only claim decision in the codebase. An earlier draft also carried a
+        standalone ``claim_run_lease`` helper, which nothing called: it was a second
+        implementation of the same decision and it had already drifted, since it refused
+        a terminal row outright where this statement deliberately resurrects one.
+
+        Concurrency is handled by the conditional ``ON CONFLICT DO UPDATE`` alone, not
+        by a preceding ``SELECT ... FOR UPDATE SKIP LOCKED``. ``pool.acquire()`` is not a
+        transaction, so such a ``SELECT`` autocommits and drops its row lock before the
+        upsert runs, which makes the two statements non-atomic -- the lock is released
+        before it can exclude anyone. What actually serialises concurrent claimants is
+        that the second statement blocks on the row lock the first one holds and then
+        re-evaluates its ``WHERE`` against the committed row, finding a live lease and
+        taking no branch.
 
         Resurrection of a terminal run (no live lease) is preserved deliberately: that
         is the resume/recovery path for a run that previously stalled or failed, and
@@ -1740,6 +1754,26 @@ class ReActAgent:
             # heartbeat reports ownership loss on its own schedule, and the action
             # itself must not begin on a lease this execution has already lost.
             if self._lease_ownership_lost:
+                # step_start is already published for this step_id, so returning here
+                # would leave it dangling: the frontend opens a step row on step_start
+                # and only resolves it on step_complete / step_failed / step_unknown,
+                # so the row would spin for the life of the stream. Close it under the
+                # same step_id.
+                #
+                # Emitted live only, with no persist_step. Persisting here would mean a
+                # superseded execution writing a durable row after losing ownership,
+                # which is the rule every other lease-loss return here observes. Nothing
+                # is lost by not persisting: the action never ran, so there is no step
+                # to replay, and the run's terminal status belongs to the new owner.
+                await self.emit_event(
+                    "step_failed",
+                    {
+                        "step_id": step_id,
+                        "step_index": iteration,
+                        "action": tool_name,
+                        "error": "aborted: run lease was lost before this action executed",
+                    },
+                )
                 return self._lease_lost_result(iteration, clean_goal, threshold)
 
             screenshot_on_fail: Optional[str] = None

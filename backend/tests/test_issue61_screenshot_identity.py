@@ -144,8 +144,11 @@ class _FakeConn:
             return "UPDATE 1" if self._pool.owners.get(run_uuid) == owner_id else "UPDATE 0"
         if flat.startswith("UPDATE agent_runs SET owner_id = NULL"):
             run_uuid, owner_id = args[0], args[1]
-            if self._pool.owners.get(run_uuid) == owner_id:
-                self._pool.owners[run_uuid] = None
+            if self._pool.owners.get(run_uuid) != owner_id:
+                # A stale owner's release matches no row in Postgres; reporting
+                # UPDATE 1 would let a test read a rejected release as successful.
+                return "UPDATE 0"
+            self._pool.owners[run_uuid] = None
             return "UPDATE 1"
         if flat.startswith("UPDATE agent_steps SET screenshot_b64"):
             # Both writers put the screenshot first and match on step_id last,

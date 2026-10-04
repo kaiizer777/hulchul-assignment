@@ -25,7 +25,6 @@ Design notes:
 import asyncio
 import logging
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, List, Optional
 
@@ -96,79 +95,6 @@ def _lease_interval_expr() -> str:
     # valid interval literal in Postgres ('900'::interval raises), so the cast form
     # in the design notes does not actually parse.
     return "make_interval(secs => $3::double precision)"
-
-
-@dataclass(frozen=True)
-class ClaimResult:
-    """Outcome of a successful run-lease claim."""
-
-    run_id: str
-    status: str
-    owner_id: Optional[str]
-    attempt: Optional[int]
-    lease_expires_at: Optional[datetime]
-
-
-async def claim_run_lease(
-    pool: asyncpg.Pool,
-    run_id: str,
-    owner_id: str,
-    lease_seconds: float,
-) -> Optional[ClaimResult]:
-    """Atomically take ownership of a run that is already recorded as running.
-
-    Returns ``None`` when the claim is refused, which is the normal outcome for a
-    retry or a duplicate request: refusing is what stops two executions from driving
-    the same run_id. A claim is granted only when all of the following hold, decided
-    by the database in one statement:
-
-    * the row is in ``status = 'running'``;
-    * no owner currently holds a live lease (``lease_expires_at IS NULL`` or already
-      past ``now()``).
-
-    Concurrency is handled by that conditional ``UPDATE`` alone, not by a preceding
-    ``SELECT ... FOR UPDATE SKIP LOCKED``. ``pool.acquire()`` is not a transaction, so
-    such a ``SELECT`` autocommits and drops its row lock before the ``UPDATE`` runs and
-    makes the two statements non-atomic -- the lock is released before it can exclude
-    anyone. What actually serialises concurrent claimants is that a second ``UPDATE``
-    blocks on the row lock the first one holds and then re-evaluates its ``WHERE``
-    against the committed row, finding a live lease and matching zero rows. Issuing an
-    extra statement to hold a lock that is already released would only cost a round
-    trip, so it is not issued; an earlier draft's probe was inert and its docstring
-    overstated what it did.
-
-    On success ``attempt`` is incremented so a run that keeps getting reclaimed leaves
-    a durable trail of how many owners it has had.
-    """
-    run_uuid = _coerce_run_uuid(run_id)
-    if run_uuid is _UUID_MISSING:
-        logger.error(f"Refusing run lease claim for malformed run_id: {run_id!r}")
-        return None
-
-    query = f"""
-        UPDATE agent_runs
-        SET owner_id = $2,
-            lease_expires_at = now() + {_lease_interval_expr()},
-            attempt = agent_runs.attempt + 1
-        WHERE run_id = $1
-          AND status = 'running'
-          AND (lease_expires_at IS NULL OR lease_expires_at < now())
-        RETURNING run_id, status, owner_id, attempt, lease_expires_at
-    """
-
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(query, run_uuid, owner_id, float(lease_seconds))
-
-    if row is None:
-        return None
-
-    return ClaimResult(
-        run_id=str(row["run_id"]),
-        status=row["status"],
-        owner_id=row["owner_id"],
-        attempt=row["attempt"],
-        lease_expires_at=row["lease_expires_at"],
-    )
 
 
 async def renew_run_lease(

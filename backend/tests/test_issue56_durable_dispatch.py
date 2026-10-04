@@ -29,7 +29,6 @@ from backend.run_lease import (
     ORPHANED_RUN_STATUS,
     ORPHANED_STEP_ACTION,
     TERMINAL_RUN_STATUSES,
-    claim_run_lease,
     reconcile_orphaned_agent_runs,
     release_run_lease,
     renew_run_lease,
@@ -42,9 +41,8 @@ from backend.tools import PlaywrightTools
 # touched even if a caller offered it as a candidate.
 STATUS_GUARD = "status = 'running'"
 LEASE_FREE_GUARD = "lease_expires_at IS NULL OR lease_expires_at < now()"
-# Anchored on AND so it only ever matches a WHERE clause. The bare "owner_id = $2"
-# also appears in claim_run_lease's SET list, which would make the fake demand that
-# an unowned row already be owned before it can be claimed.
+# Anchored on AND so it identifies the WHERE clause rather than any bare
+# "owner_id = $2" appearing in a statement body.
 OWNER_SCOPED_GUARD = "AND owner_id = $2"
 STATUS_FENCE_GUARD = "AND owner_id = $3"
 ACTIVE_STATUS_GUARD = "status = ANY($4::text[])"
@@ -409,103 +407,6 @@ async def _await_call_count(state: Dict[str, int], minimum: int) -> bool:
     return True
 
 
-class TestRunLeaseClaim(unittest.IsolatedAsyncioTestCase):
-    """claim_run_lease: the property that makes a duplicate request harmless."""
-
-    async def test_01_claim_succeeds_on_fresh_running_row(self) -> None:
-        run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", run_id=run_id)])
-
-        result = await claim_run_lease(pool, run_id, "owner-a", 900.0)
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.owner_id, "owner-a")
-        self.assertEqual(result.attempt, 1)
-        self.assertEqual(pool.row(run_id)["owner_id"], "owner-a")
-
-    async def test_02_claim_refused_while_lease_is_unexpired(self) -> None:
-        """The 'retries cannot double-run' property.
-
-        A refused claim must not transfer ownership, and the statement it issued must
-        still carry the expiry guard -- that guard is what makes the refusal real.
-        """
-        run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)])
-
-        result = await claim_run_lease(pool, run_id, "owner-b", 900.0)
-
-        self.assertIsNone(result)
-        self.assertEqual(pool.row(run_id)["owner_id"], "owner-a", "ownership was stolen")
-        self.assertEqual(pool.row(run_id)["attempt"], 0, "attempt incremented on a refused claim")
-
-        claims = pool.find("UPDATE agent_runs")
-        self.assertEqual(len(claims), 1)
-        self.assertIn(LEASE_FREE_GUARD, claims[0][0])
-        self.assertIn(STATUS_GUARD, claims[0][0])
-
-    async def test_03_claim_refused_for_terminal_row(self) -> None:
-        run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="done", owner_id="owner-a", lease_expires_at=None, run_id=run_id)])
-
-        result = await claim_run_lease(pool, run_id, "owner-b", 900.0)
-
-        self.assertIsNone(result)
-        self.assertEqual(pool.row(run_id)["owner_id"], "owner-a")
-
-    async def test_04_claim_takes_expired_lease_and_increments_attempt(self) -> None:
-        run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", owner_id="dead-owner", lease_expires_at=_expired(), attempt=3, run_id=run_id)])
-
-        result = await claim_run_lease(pool, run_id, "owner-b", 900.0)
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.attempt, 4, "reclaim must leave a durable trail of owners")
-        self.assertEqual(pool.row(run_id)["owner_id"], "owner-b")
-        self.assertIn("attempt = agent_runs.attempt + 1", pool.find("UPDATE agent_runs")[0][0])
-
-    async def test_05_two_concurrent_claims_exactly_one_wins(self) -> None:
-        run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", run_id=run_id)])
-
-        first, second = await asyncio.gather(
-            claim_run_lease(pool, run_id, "owner-a", 900.0),
-            claim_run_lease(pool, run_id, "owner-b", 900.0),
-        )
-
-        winners = [r for r in (first, second) if r is not None]
-        self.assertEqual(len(winners), 1, "exactly one claimant may take a free lease")
-        self.assertEqual(pool.row(run_id)["attempt"], 1)
-        self.assertIn(pool.row(run_id)["owner_id"], {"owner-a", "owner-b"})
-
-    async def test_06_claim_refused_for_malformed_run_id(self) -> None:
-        pool = _FakePool([])
-        self.assertIsNone(await claim_run_lease(pool, "not-a-uuid", "owner-a", 900.0))
-        self.assertEqual(pool.executed, [], "a malformed id must never reach the database")
-
-    async def test_07_claim_is_a_single_conditional_update(self) -> None:
-        """No row-lock probe: `pool.acquire()` is not a transaction.
-
-        A `SELECT ... FOR UPDATE SKIP LOCKED` issued outside a transaction autocommits
-        and releases its row lock before the UPDATE runs, so it excluded nobody and cost
-        a round trip. The conditional UPDATE is what serialises claimants: the second
-        one blocks on the first's row lock and re-evaluates its WHERE against the
-        committed row. This pins that the claim is still exactly one statement carrying
-        every guard, so the property does not depend on a probe coming back.
-        """
-        run_id = str(uuid.uuid4())
-        pool = _FakePool([_row(status="running", run_id=run_id)])
-
-        await claim_run_lease(pool, run_id, "owner-a", 900.0)
-
-        self.assertEqual(pool.find("FOR UPDATE"), [])
-        claims = pool.find("UPDATE agent_runs")
-        self.assertEqual(len(claims), 1, "the claim must be a single statement")
-        self.assertIn(STATUS_GUARD, claims[0][0])
-        self.assertIn(LEASE_FREE_GUARD, claims[0][0])
-
-
 class TestRunLeaseRenewRelease(unittest.IsolatedAsyncioTestCase):
     async def test_01_renew_extends_only_for_the_current_owner(self) -> None:
         run_id = str(uuid.uuid4())
@@ -584,9 +485,8 @@ class TestRunLeaseRenewRelease(unittest.IsolatedAsyncioTestCase):
     async def test_08_two_concurrent_claims_yield_exactly_one_winner(self) -> None:
         """The dispatch-level race: two agents racing the same run_id.
 
-        Distinct from claim_run_lease's own test: this is the statement run() actually
-        depends on, and it asserts that exactly one execution is ACCEPTED rather than
-        merely that one claim statement won.
+        This is the statement run() actually depends on, and it asserts that exactly
+        one execution is ACCEPTED rather than merely that one claim statement won.
         """
         run_id = str(uuid.uuid4())
         pool = _FakePool([_row(status="running", run_id=run_id)])
@@ -1823,6 +1723,20 @@ class TestOwnershipLossStopsTheRun(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["status"], "failed")
             self.assertIn("lease", result["summary"])
 
+            # step_start was published before ownership was lost, so it has to be
+            # closed under the same step_id: the frontend opens a step row on
+            # step_start and only resolves it on a terminal frame, so a dangling
+            # start spins for the life of the stream.
+            starts = [e for e in harness.events if e["type"] == "step_start"]
+            failures = [e for e in harness.events if e["type"] == "step_failed"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(len(failures), 1, "the announced step was left unresolved")
+            self.assertEqual(failures[0]["step_id"], starts[0]["step_id"])
+            self.assertEqual(failures[0]["action"], starts[0]["action"])
+            self.assertIn("aborted", failures[0]["error"])
+            # Live only: a superseded execution must not write a durable step row.
+            self.assertEqual(harness.agent.persist_step.await_count, 0)
+
     async def test_13_approval_gate_does_not_consume_a_decision_it_lost_ownership_of(self) -> None:
             """The decision read is an await, so the check cannot sit only before it.
 
@@ -1839,9 +1753,21 @@ class TestOwnershipLossStopsTheRun(unittest.IsolatedAsyncioTestCase):
             redis.clear_approval = AsyncMock(return_value=True)
             redis.set_session_state = AsyncMock(return_value=True)
 
+            # A decision carrying the nonce the request actually issued. A wrong
+            # nonce would be discarded by the fail-closed check below regardless of
+            # ownership, so the test would still pass with the post-read guard
+            # removed -- it would prove nothing about the guard.
+            issued: Dict[str, Any] = {}
+
+            async def _capture(_run_id: str, approval_data: Dict[str, Any]) -> bool:
+                issued.update(approval_data)
+                return True
+
+            redis.set_approval_pending = AsyncMock(side_effect=_capture)
+
             async def _decide(run_id: str) -> Optional[Dict[str, Any]]:
                 agent._mark_run_lease_lost()
-                return {"nonce": "wrong-nonce", "decision": "approved"}
+                return {"nonce": issued.get("nonce"), "decision": "approved"}
 
             redis.get_approval_decision_record = AsyncMock(side_effect=_decide)
             agent.get_redis = AsyncMock(return_value=redis)
@@ -1854,6 +1780,7 @@ class TestOwnershipLossStopsTheRun(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertEqual(outcome, "lease_lost")
+            self.assertTrue(issued.get("nonce"), "the decision's nonce must be the issued one")
             redis.clear_approval.assert_not_awaited()
             self.assertEqual(agent.update_run_status.await_count, 1)
             self.assertEqual(agent.persist_step.await_count, 1)
