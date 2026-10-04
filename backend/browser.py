@@ -178,9 +178,7 @@ async def get_browser_session(
     """
     raw_endpoint = endpoint if endpoint is not None else settings.BROWSER_WS_ENDPOINT
     ws_endpoint = raw_endpoint.strip() if raw_endpoint else ""
-    if not ws_endpoint:
-        raise BrowserConnectionError("BROWSER_WS_ENDPOINT is not configured in environment or .env")
-    use_local = ws_endpoint.lower() in ("local", "none")
+    use_local = not ws_endpoint or ws_endpoint.lower() in ("local", "none", "unset")
     timeout = timeout_ms if timeout_ms is not None else settings.BROWSER_CONNECT_TIMEOUT_MS
 
     p: Optional[Playwright] = None

@@ -12,7 +12,7 @@ interface BadgeConfig {
 }
 
 export function StatusBadge({ status, className = '' }: StatusBadgeProps) {
-  const normalizedStatus = (status || 'unknown').toLowerCase();
+  const normalizedStatus = (typeof status === 'string' ? status : String(status || 'unknown')).toLowerCase();
 
   let config: BadgeConfig;
 

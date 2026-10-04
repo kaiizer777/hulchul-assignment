@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
+import { parseStepDetails } from '../components/LiveStepExecutionLog';
 
 export const AGENT_API_BASE = '/api/agent';
 
@@ -94,10 +95,10 @@ export interface StepEvent {
   step_id?: string;
   step_index?: number;
   action: string;
-  result?: string;
+  result?: unknown;
   timestamp: string;
   has_screenshot?: boolean;
-  error?: string;
+  error?: unknown;
   arguments?: Record<string, unknown>;
 }
 
@@ -257,9 +258,8 @@ function calculateMetrics(
 
 function formatStepToLog(step: StepEvent): string {
   const time = step.timestamp ? new Date(step.timestamp).toLocaleTimeString() : '';
-  const action = step.action || step.type || 'step';
-  const detail = step.result ? ` -> ${step.result}` : step.error ? ` [ERROR: ${step.error}]` : '';
-  return `[${time}] ${action}${detail}`;
+  const parsed = parseStepDetails(step);
+  return `[${time}] [${parsed.badgeLabel}] ${parsed.title} — ${parsed.oneLiner}`;
 }
 
 export interface AgentStoreState {

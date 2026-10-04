@@ -8,10 +8,534 @@ export interface StepEvent {
   step_id?: string;
   step_index?: number;
   action: string;
-  result?: string;
+  result?: unknown;
   timestamp: string;
   has_screenshot?: boolean;
-  error?: string;
+  error?: unknown;
+  arguments?: Record<string, unknown>;
+  duration_ms?: number;
+}
+
+const toSafeString = (val: unknown): string => {
+  if (val === null || val === undefined) return '';
+  if (typeof val === 'string') return val;
+  if (typeof val === 'object') {
+    try {
+      return JSON.stringify(val);
+    } catch {
+      return String(val);
+    }
+  }
+  return String(val);
+};
+
+export interface StepHighlight {
+  label: string;
+  value: string;
+}
+
+export interface ParsedStepInfo {
+  category: 'navigate' | 'click' | 'input' | 'extract' | 'idempotency' | 'approval' | 'screenshot' | 'session' | 'system' | 'error';
+  badgeLabel: string;
+  badgeTone: 'sky' | 'emerald' | 'indigo' | 'teal' | 'purple' | 'amber' | 'rose' | 'zinc';
+  title: string;
+  oneLiner: string;
+  highlights: StepHighlight[];
+  jsonPayload: string | null;
+  rawError: string | null;
+  isFail: boolean;
+  isSession: boolean;
+}
+
+// Helper to safely parse objects from unknown/string payloads
+function extractObject(val: unknown): Record<string, unknown> | null {
+  if (!val) return null;
+  if (typeof val === 'object' && !Array.isArray(val)) {
+    return val as Record<string, unknown>;
+  }
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (
+      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))
+    ) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+// Pretty print JSON safely
+export function parseJsonSafe(raw?: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'object') {
+    try {
+      return JSON.stringify(raw, null, 2);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (
+    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))
+  ) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// Comprehensive domain-aware smart step parser
+export function parseStepDetails(step: StepEvent): ParsedStepInfo {
+  const actionLower = toSafeString(step.action).toLowerCase();
+  const typeLower = toSafeString(step.type).toLowerCase();
+  const resObj = extractObject(step.result);
+  const errObj = extractObject(step.error);
+  const argsObj = step.arguments || extractObject(step.arguments) || {};
+  const resStr = toSafeString(step.result);
+  const errStr = toSafeString(step.error);
+
+  const isFail = Boolean(
+    typeLower === 'step_failed' ||
+    Boolean(step.error) ||
+    resStr.toLowerCase().includes('failed') ||
+    errStr.toLowerCase().includes('failed') ||
+    (resObj && resObj.success === false) ||
+    (errObj && Object.keys(errObj).length > 0)
+  );
+
+  const isSessionLost = Boolean(typeLower === 'session_lost' || actionLower.includes('session_lost'));
+  const isSessionReattached = Boolean(typeLower === 'session_reattached' || actionLower.includes('session_reattached'));
+  const isSession = Boolean(isSessionLost || isSessionReattached || actionLower.includes('session'));
+
+  // JSON payload extraction for inspector
+  let jsonPayload: string | null = null;
+  if (resObj || errObj || (step.arguments && Object.keys(step.arguments).length > 0)) {
+    const combined: Record<string, unknown> = {};
+    if (step.arguments && Object.keys(step.arguments).length > 0) combined.arguments = step.arguments;
+    if (step.result !== undefined) combined.result = resObj || step.result;
+    if (step.error !== undefined) combined.error = errObj || step.error;
+    jsonPayload = parseJsonSafe(combined) || parseJsonSafe(step.result ?? step.error);
+  } else {
+    jsonPayload = parseJsonSafe(step.result ?? step.error);
+  }
+
+  const rawError = errStr || (resObj?.error ? String(resObj.error) : null);
+
+  const highlights: StepHighlight[] = [];
+
+  // 1. Navigation Actions
+  if (
+    actionLower.includes('navigat') ||
+    actionLower.includes('open') ||
+    actionLower.includes('goto') ||
+    actionLower.includes('url')
+  ) {
+    const targetUrl =
+      (resObj?.url as string) ||
+      (argsObj?.url as string) ||
+      resStr.match(/https?:\/\/[^\s\)]+/i)?.[0] ||
+      '/invoices';
+    const status = resObj?.status || resStr.match(/status:?\s*(\d+)/i)?.[1] || 200;
+    const title = (resObj?.title as string) || '';
+
+    if (targetUrl) highlights.push({ label: 'Target URL', value: targetUrl });
+    if (status) highlights.push({ label: 'HTTP Status', value: String(status) });
+    if (title) highlights.push({ label: 'Page Title', value: title });
+
+    const shortUrl = targetUrl.replace(/^https?:\/\/[^\/]+/, '');
+    const displayUrl = shortUrl || targetUrl;
+
+    return {
+      category: 'navigate',
+      badgeLabel: 'NAVIGATE',
+      badgeTone: 'sky',
+      title: 'Navigate Page',
+      oneLiner: `Navigated to ${displayUrl} (Status ${status})`,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 2. Click / Submit Actions
+  if (
+    actionLower.includes('click') ||
+    actionLower.includes('press') ||
+    actionLower.includes('submit') ||
+    actionLower.includes('button')
+  ) {
+    const selector =
+      (argsObj?.selector as string) ||
+      (resObj?.selector as string) ||
+      resStr.match(/clicked\s+([^\s,]+)/i)?.[1] ||
+      resStr.match(/selector\s*[:=]\s*([^\s,]+)/i)?.[1] ||
+      '';
+    const elementText = (resObj?.text as string) || (argsObj?.text as string) || '';
+
+    if (selector) highlights.push({ label: 'Selector', value: selector });
+    if (elementText) highlights.push({ label: 'Target Label', value: elementText });
+
+    const targetDesc = elementText ? `'${elementText}'` : selector ? selector : 'element';
+
+    return {
+      category: 'click',
+      badgeLabel: 'CLICK',
+      badgeTone: 'emerald',
+      title: 'Click Element',
+      oneLiner: isFail
+        ? `Failed to click ${targetDesc}`
+        : `Clicked ${targetDesc}`,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 3. Fill / Type Input Actions
+  if (
+    actionLower.includes('fill') ||
+    actionLower.includes('type') ||
+    actionLower.includes('input') ||
+    actionLower.includes('write')
+  ) {
+    const selector =
+      (argsObj?.selector as string) ||
+      (resObj?.selector as string) ||
+      resStr.match(/filled\s+([^\s=]+)/i)?.[1] ||
+      '';
+    const value =
+      (argsObj?.value as string) ||
+      (resObj?.value as string) ||
+      resStr.match(/=\s*([^\n,]+)/i)?.[1] ||
+      '';
+
+    if (selector) highlights.push({ label: 'Field Selector', value: selector });
+    if (value) highlights.push({ label: 'Entered Value', value: String(value) });
+
+    const cleanField = selector ? selector.replace(/^[#\.]/, '') : 'input field';
+    const valDisplay = value ? `"${value}"` : 'value';
+
+    return {
+      category: 'input',
+      badgeLabel: 'INPUT',
+      badgeTone: 'indigo',
+      title: 'Input Text',
+      oneLiner: `Entered ${valDisplay} into ${cleanField}`,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 4. Select Dropdown Actions
+  if (actionLower.includes('select') || actionLower.includes('dropdown')) {
+    const selected =
+      (resObj?.selected as string) ||
+      (argsObj?.value as string) ||
+      resStr.match(/selected\s+([^\n,]+)/i)?.[1] ||
+      '';
+    const selector = (argsObj?.selector as string) || '';
+
+    if (selected) highlights.push({ label: 'Selected Value', value: selected });
+    if (selector) highlights.push({ label: 'Dropdown Selector', value: selector });
+
+    return {
+      category: 'input',
+      badgeLabel: 'SELECT',
+      badgeTone: 'indigo',
+      title: 'Select Option',
+      oneLiner: `Selected "${selected || 'option'}" from dropdown`,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 5. Idempotency Check Actions
+  if (actionLower.includes('idempotency') || actionLower.includes('check_exists') || actionLower.includes('exists')) {
+    const entityType =
+      (argsObj?.entity_type as string) ||
+      (resObj?.entity_type as string) ||
+      resStr.match(/check_exists\(([^,]+)/i)?.[1] ||
+      'invoice';
+    const identifier =
+      (argsObj?.identifier as string) ||
+      (resObj?.identifier as string) ||
+      resStr.match(/check_exists\([^,]+,\s*([^)]+)\)/i)?.[1] ||
+      resStr.match(/invoice\s+([A-Z0-9_-]+)/i)?.[1] ||
+      '';
+    const exists =
+      resObj?.exists !== undefined
+        ? Boolean(resObj.exists)
+        : resStr.toLowerCase().includes('exists=true') || resStr.toLowerCase().includes('already exists');
+
+    highlights.push({ label: 'Entity Type', value: entityType });
+    if (identifier) highlights.push({ label: 'Identifier', value: identifier.trim() });
+    highlights.push({ label: 'Exists In DB', value: exists ? 'Yes (Duplicate)' : 'No (Available)' });
+
+    let summary = `Verified idempotency: ${entityType} ${identifier || ''} does not exist (Safe to proceed)`;
+    if (exists) {
+      summary = `Duplicate detected: ${entityType} ${identifier || ''} already exists (Skipped)`;
+    }
+
+    return {
+      category: 'idempotency',
+      badgeLabel: 'IDEMPOTENCY',
+      badgeTone: 'teal',
+      title: 'Idempotency Check',
+      oneLiner: summary,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 6. Data Extraction / DOM Inspection
+  if (
+    actionLower.includes('extract') ||
+    actionLower.includes('read_page') ||
+    actionLower.includes('audit') ||
+    actionLower.includes('scan') ||
+    actionLower.includes('evaluat')
+  ) {
+    const count =
+      resObj?.count ||
+      resObj?.items_count ||
+      (Array.isArray(resObj?.items) ? resObj.items.length : null) ||
+      (Array.isArray(resObj?.invoices) ? resObj.invoices.length : null);
+    const sizeBytes = resObj?.size_bytes || resStr.match(/(\d+)\s*bytes/i)?.[1];
+    const url = (resObj?.url as string) || resStr.match(/url:\s*([^\s\)]+)/i)?.[1];
+
+    if (count !== null && count !== undefined) highlights.push({ label: 'Records Found', value: String(count) });
+    if (sizeBytes) {
+      const kb = (Number(sizeBytes) / 1024).toFixed(1);
+      highlights.push({ label: 'Payload Size', value: `${kb} KB` });
+    }
+    if (url) highlights.push({ label: 'Source URL', value: url });
+
+    let summary = 'Extracted page data and DOM structure';
+    if (count !== null && count !== undefined) {
+      summary = `Extracted ${count} records successfully`;
+    } else if (sizeBytes) {
+      const kb = (Number(sizeBytes) / 1024).toFixed(1);
+      summary = `Read page DOM content (${kb} KB)`;
+    }
+
+    return {
+      category: 'extract',
+      badgeLabel: 'EXTRACT',
+      badgeTone: 'teal',
+      title: 'Extract Content',
+      oneLiner: summary,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 7. Screenshot / Evidence Capture
+  if (actionLower.includes('screenshot') || actionLower.includes('capture')) {
+    const sizeBytes = resObj?.size_bytes || resStr.match(/(\d+)\s*bytes/i)?.[1];
+    if (sizeBytes) {
+      const kb = (Number(sizeBytes) / 1024).toFixed(1);
+      highlights.push({ label: 'Image Size', value: `${kb} KB` });
+    }
+    highlights.push({ label: 'Format', value: 'PNG (Base64)' });
+
+    return {
+      category: 'screenshot',
+      badgeLabel: 'EVIDENCE',
+      badgeTone: 'zinc',
+      title: 'Capture Evidence',
+      oneLiner: 'Captured full-page screenshot for audit verification',
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 8. Human-in-the-Loop Approval Gate
+  if (actionLower.includes('approval') || actionLower.includes('gate') || typeLower.includes('approval')) {
+    const vendor = (resObj?.vendor as string) || resStr.match(/vendor=([^,\n]+)/i)?.[1] || '';
+    const amount = (resObj?.amount as number | string) || resStr.match(/amount=([^,\n]+)/i)?.[1] || '';
+    const poNumber = (resObj?.po_number as string) || resStr.match(/po=([^,\n]+)/i)?.[1] || '';
+    const invoiceId = (resObj?.invoice_id as string) || resStr.match(/invoice_id=([^,\n]+)/i)?.[1] || '';
+
+    if (vendor) highlights.push({ label: 'Vendor', value: vendor.trim() });
+    if (amount) {
+      const amtNum = Number(String(amount).replace(/[^0-9.-]+/g, ''));
+      const formattedAmt = !isNaN(amtNum) ? `₹${amtNum.toLocaleString('en-IN')}` : String(amount);
+      highlights.push({ label: 'Amount', value: formattedAmt });
+    }
+    if (poNumber && poNumber !== 'None') highlights.push({ label: 'PO Number', value: poNumber.trim() });
+    if (invoiceId) highlights.push({ label: 'Invoice ID', value: invoiceId.trim() });
+
+    let summary = 'Approval Gate: Held for supervisor verification';
+    if (resStr.includes('approved')) {
+      summary = `Supervisor approved ${vendor ? `invoice for ${vendor}` : 'item'} — continuing workflow`;
+    } else if (resStr.includes('rejected')) {
+      summary = `Supervisor rejected ${vendor ? `invoice for ${vendor}` : 'item'} — skipped entry`;
+    } else if (resStr.includes('timed_out')) {
+      summary = `Approval request timed out after timeout threshold`;
+    } else if (vendor || amount) {
+      const amtNum = Number(String(amount).replace(/[^0-9.-]+/g, ''));
+      const amtDisplay = !isNaN(amtNum) ? `₹${amtNum.toLocaleString('en-IN')}` : amount;
+      summary = `Held for approval: ${vendor || 'Invoice'} (${amtDisplay} > ₹25,000 threshold)`;
+    }
+
+    return {
+      category: 'approval',
+      badgeLabel: 'APPROVAL GATE',
+      badgeTone: 'purple',
+      title: 'Approval Gate',
+      oneLiner: summary,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession,
+    };
+  }
+
+  // 9. Session Disconnect / Reattachment
+  if (isSession) {
+    let summary = isSessionLost
+      ? 'CDP browser session lost — attempting bounded auto-reattach'
+      : 'CDP browser connection restored successfully';
+    if (resStr) {
+      const matchAttempts = resStr.match(/after\s+(\d+)\s+reattach/i);
+      if (matchAttempts) {
+        summary = `CDP session lost after ${matchAttempts[1]} reattach attempt(s)`;
+      }
+    }
+
+    highlights.push({ label: 'Session Status', value: isSessionLost ? 'Lost / Reconnecting' : 'Restored' });
+
+    return {
+      category: 'session',
+      badgeLabel: isSessionLost ? 'SESSION LOST' : 'REATTACHED',
+      badgeTone: isSessionLost ? 'amber' : 'sky',
+      title: isSessionLost ? 'Browser Session Disconnected' : 'Browser Session Restored',
+      oneLiner: summary,
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail: isSessionLost,
+      isSession: true,
+    };
+  }
+
+  // 10. Done / Stalled / Planning System Actions
+  if (actionLower === 'done' || actionLower === 'completed' || typeLower === 'done' || typeLower === 'completed') {
+    return {
+      category: 'system',
+      badgeLabel: 'COMPLETE',
+      badgeTone: 'emerald',
+      title: 'Run Completed',
+      oneLiner: resStr || 'Execution finished successfully. All targets processed.',
+      highlights: [{ label: 'Status', value: 'Completed' }],
+      jsonPayload,
+      rawError,
+      isFail: false,
+      isSession: false,
+    };
+  }
+
+  if (actionLower === 'stalled' || typeLower === 'stalled') {
+    return {
+      category: 'system',
+      badgeLabel: 'STALLED',
+      badgeTone: 'rose',
+      title: 'Run Stalled',
+      oneLiner: resStr || 'Execution reached step iteration limit or paused timeout',
+      highlights: [{ label: 'Status', value: 'Stalled' }],
+      jsonPayload,
+      rawError,
+      isFail: true,
+      isSession: false,
+    };
+  }
+
+  if (actionLower.includes('think') || actionLower.includes('plan') || actionLower.includes('reason')) {
+    return {
+      category: 'system',
+      badgeLabel: 'PLANNING',
+      badgeTone: 'purple',
+      title: 'Agent Planning',
+      oneLiner: resStr ? `Reasoning: ${resStr.replace(/^failed:\s*/i, '')}` : 'Evaluating page state and planning next action',
+      highlights,
+      jsonPayload,
+      rawError,
+      isFail,
+      isSession: false,
+    };
+  }
+
+  // 11. Generic Fallback Action with Smart String/JSON extraction
+  let summary = resStr || errStr || 'Step completed';
+
+  if (resObj) {
+    if (resObj.message) summary = String(resObj.message);
+    else if (resObj.summary) summary = String(resObj.summary);
+    else if (resObj.title) summary = String(resObj.title);
+    else if (resObj.status && resObj.url) summary = `Response ${resObj.status} from ${resObj.url}`;
+    else {
+      const keys = Object.keys(resObj).slice(0, 3);
+      summary = `Processed payload (${keys.join(', ')})`;
+    }
+  }
+
+  // Capitalize readable action title
+  const formattedTitle = step.action
+    ? step.action
+        .replace(/_/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase())
+    : 'Agent Action';
+
+  if (isFail) {
+    summary = `Failed: ${rawError || summary}`;
+  }
+
+  return {
+    category: isFail ? 'error' : 'system',
+    badgeLabel: isFail ? 'FAILED' : 'ACTION',
+    badgeTone: isFail ? 'rose' : 'zinc',
+    title: formattedTitle,
+    oneLiner: summary,
+    highlights,
+    jsonPayload,
+    rawError,
+    isFail,
+    isSession,
+  };
 }
 
 interface LiveStepExecutionLogProps {
@@ -38,12 +562,31 @@ export function LiveStepExecutionLog({
   const [filterCategory, setFilterCategory] = useState<StepCategory>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedStepIds, setExpandedStepIds] = useState<Record<string, boolean>>({});
+  const [inspectorOpenMap, setInspectorOpenMap] = useState<Record<string, boolean>>({});
   const [copiedStepId, setCopiedStepId] = useState<string | null>(null);
+  const [copiedPayloadId, setCopiedPayloadId] = useState<string | null>(null);
   const [copiedAllLogs, setCopiedAllLogs] = useState(false);
 
   const logContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isProgrammaticScrollRef = useRef(false);
+
+  // Parse all steps for high-performance rendering & filtering
+  const parsedStepsWithMeta = useMemo(() => {
+    return steps.map((st, idx) => {
+      const stepKey = st.step_id || `step-${idx}`;
+      const parsed = parseStepDetails(st);
+      const stepNum = st.step_index ?? idx + 1;
+      const timeFormatted = st.timestamp ? new Date(st.timestamp).toLocaleTimeString() : '';
+      return {
+        step: st,
+        stepKey,
+        stepNum,
+        parsed,
+        timeFormatted,
+      };
+    });
+  }, [steps]);
 
   // Compute status counts
   const counts = useMemo(() => {
@@ -51,19 +594,10 @@ export function LiveStepExecutionLog({
     let errorsCount = 0;
     let sessionCount = 0;
 
-    for (const step of steps) {
-      const isFail =
-        step.type === 'step_failed' ||
-        Boolean(step.error) ||
-        Boolean(step.result && step.result.toLowerCase().includes('failed'));
-      const isSession =
-        step.type === 'session_lost' ||
-        step.type === 'session_reattached' ||
-        step.action.includes('session');
-
-      if (isFail) errorsCount++;
-      if (isSession) sessionCount++;
-      if (!isSession) actionsCount++;
+    for (const item of parsedStepsWithMeta) {
+      if (item.parsed.isFail) errorsCount++;
+      if (item.parsed.isSession) sessionCount++;
+      if (!item.parsed.isSession) actionsCount++;
     }
 
     return {
@@ -72,39 +606,34 @@ export function LiveStepExecutionLog({
       errors: errorsCount,
       session: sessionCount,
     };
-  }, [steps]);
+  }, [steps.length, parsedStepsWithMeta]);
 
   // Filtered steps
   const filteredSteps = useMemo(() => {
-    return steps.filter((st, idx) => {
-      const isFail =
-        st.type === 'step_failed' ||
-        Boolean(st.error) ||
-        Boolean(st.result && st.result.toLowerCase().includes('failed'));
-      const isSession =
-        st.type === 'session_lost' ||
-        st.type === 'session_reattached' ||
-        st.action.includes('session');
+    return parsedStepsWithMeta.filter((item) => {
+      const { parsed, step, stepNum } = item;
 
-      if (filterCategory === 'errors' && !isFail) return false;
-      if (filterCategory === 'session' && !isSession) return false;
-      if (filterCategory === 'actions' && isSession) return false;
+      if (filterCategory === 'errors' && !parsed.isFail) return false;
+      if (filterCategory === 'session' && !parsed.isSession) return false;
+      if (filterCategory === 'actions' && parsed.isSession) return false;
 
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
-        const stepNum = (st.step_index ?? idx + 1).toString();
-        const actionMatch = st.action.toLowerCase().includes(q);
-        const resultMatch = (st.result || '').toLowerCase().includes(q);
-        const errorMatch = (st.error || '').toLowerCase().includes(q);
-        const stepMatch = stepNum.includes(q);
-        return actionMatch || resultMatch || errorMatch || stepMatch;
+        const numMatch = stepNum.toString().includes(q);
+        const actionMatch = toSafeString(step.action).toLowerCase().includes(q);
+        const oneLinerMatch = parsed.oneLiner.toLowerCase().includes(q);
+        const titleMatch = parsed.title.toLowerCase().includes(q);
+        const payloadMatch = parsed.jsonPayload?.toLowerCase().includes(q) ?? false;
+        const errorMatch = parsed.rawError?.toLowerCase().includes(q) ?? false;
+
+        return numMatch || actionMatch || oneLinerMatch || titleMatch || payloadMatch || errorMatch;
       }
 
       return true;
     });
-  }, [steps, filterCategory, searchQuery]);
+  }, [parsedStepsWithMeta, filterCategory, searchQuery]);
 
-  // Auto-scroll handler on step arrival, filter change, search change, expansion toggle, or autoScroll toggle
+  // Auto-scroll handler
   useEffect(() => {
     if (!autoScroll) return;
 
@@ -122,7 +651,7 @@ export function LiveStepExecutionLog({
     });
 
     return () => cancelAnimationFrame(rafId);
-  }, [steps, filteredSteps.length, filterCategory, searchQuery, expandedStepIds, autoScroll]);
+  }, [steps.length, filteredSteps.length, filterCategory, searchQuery, expandedStepIds, autoScroll]);
 
   // Handle manual scroll in log container
   const handleScroll = () => {
@@ -164,6 +693,15 @@ export function LiveStepExecutionLog({
     }));
   };
 
+  // Toggle single step payload inspector
+  const toggleInspector = (key: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setInspectorOpenMap((prev) => ({
+      ...prev,
+      [key]: !prev[key],
+    }));
+  };
+
   // Check if all current steps are expanded
   const areAllExpanded = useMemo(() => {
     if (steps.length === 0) return true;
@@ -183,22 +721,30 @@ export function LiveStepExecutionLog({
     setExpandedStepIds(updated);
   };
 
-  // Copy single step output
-  const handleCopyStep = (key: string, content: string) => {
-    navigator.clipboard.writeText(content);
+  // Copy single step summary + payload
+  const handleCopyStep = (key: string, oneLiner: string, jsonPayload: string | null) => {
+    const text = jsonPayload ? `${oneLiner}\n\n[Payload]:\n${jsonPayload}` : oneLiner;
+    navigator.clipboard.writeText(text);
     setCopiedStepId(key);
     setTimeout(() => setCopiedStepId(null), 1800);
   };
 
-  // Copy entire log as structured text
+  // Copy raw payload only
+  const handleCopyPayload = (key: string, jsonPayload: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    navigator.clipboard.writeText(jsonPayload);
+    setCopiedPayloadId(key);
+    setTimeout(() => setCopiedPayloadId(null), 1800);
+  };
+
+  // Copy entire log as structured executive text
   const handleCopyAllLogs = () => {
     if (steps.length === 0) return;
-    const formatted = steps
-      .map((st, idx) => {
-        const num = st.step_index ?? idx + 1;
-        const time = new Date(st.timestamp).toISOString();
-        const output = st.result || st.error || 'Success';
-        return `[Step #${num}] [${time}] [${st.action}] (Type: ${st.type})\n${output}\n`;
+    const formatted = parsedStepsWithMeta
+      .map(({ step, stepNum, parsed }) => {
+        const time = step.timestamp ? new Date(step.timestamp).toISOString() : new Date().toISOString();
+        const payloadText = parsed.jsonPayload ? `\nPayload: ${parsed.jsonPayload}` : '';
+        return `[Step #${stepNum}] [${time}] [${parsed.badgeLabel}] ${parsed.title}\nSummary: ${parsed.oneLiner}${payloadText}\n`;
       })
       .join('\n---\n\n');
 
@@ -207,89 +753,94 @@ export function LiveStepExecutionLog({
     setTimeout(() => setCopiedAllLogs(false), 2000);
   };
 
-  // Helper for JSON detection & pretty printing
-  const parseJsonSafe = (raw?: string) => {
-    if (!raw) return null;
-    const trimmed = raw.trim();
-    if (
-      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-      (trimmed.startsWith('[') && trimmed.endsWith(']'))
-    ) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        return JSON.stringify(parsed, null, 2);
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  };
-
-  // Helper for action icon
-  const renderActionIcon = (actionName: string, isFail: boolean, isSession: boolean) => {
-    const act = actionName.toLowerCase();
-
+  // Helper for action icon rendering
+  const renderActionIcon = (category: ParsedStepInfo['category'], isFail: boolean) => {
     if (isFail) {
       return (
-        <svg className="h-4 w-4 text-rose-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+        <svg className="h-4 w-4 text-rose-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
           <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
         </svg>
       );
     }
 
-    if (isSession) {
-      return (
-        <svg className="h-4 w-4 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
-        </svg>
-      );
+    switch (category) {
+      case 'navigate':
+        return (
+          <svg className="h-4 w-4 text-sky-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+          </svg>
+        );
+      case 'click':
+        return (
+          <svg className="h-4 w-4 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
+          </svg>
+        );
+      case 'input':
+        return (
+          <svg className="h-4 w-4 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+          </svg>
+        );
+      case 'idempotency':
+        return (
+          <svg className="h-4 w-4 text-teal-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          </svg>
+        );
+      case 'extract':
+        return (
+          <svg className="h-4 w-4 text-teal-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 10h16M4 14h16M4 18h16" />
+          </svg>
+        );
+      case 'approval':
+        return (
+          <svg className="h-4 w-4 text-purple-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          </svg>
+        );
+      case 'screenshot':
+        return (
+          <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+          </svg>
+        );
+      case 'session':
+        return (
+          <svg className="h-4 w-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+        );
+      default:
+        return (
+          <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+        );
     }
+  };
 
-    if (act.includes('navigat') || act.includes('open') || act.includes('url') || act.includes('goto')) {
-      return (
-        <svg className="h-4 w-4 text-sky-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-        </svg>
-      );
+  // Helper for badge pill styling
+  const getBadgeStyle = (tone: ParsedStepInfo['badgeTone']) => {
+    switch (tone) {
+      case 'sky':
+        return 'bg-sky-50 text-sky-700 border-sky-200/80';
+      case 'emerald':
+        return 'bg-emerald-50 text-emerald-700 border-emerald-200/80';
+      case 'indigo':
+        return 'bg-indigo-50 text-indigo-700 border-indigo-200/80';
+      case 'teal':
+        return 'bg-teal-50 text-teal-700 border-teal-200/80';
+      case 'purple':
+        return 'bg-purple-50 text-purple-700 border-purple-200/80';
+      case 'amber':
+        return 'bg-amber-50 text-amber-800 border-amber-200/80';
+      case 'rose':
+        return 'bg-rose-50 text-rose-700 border-rose-200/80';
+      default:
+        return 'bg-zinc-100 text-zinc-700 border-zinc-200';
     }
-
-    if (act.includes('click') || act.includes('press') || act.includes('select') || act.includes('submit')) {
-      return (
-        <svg className="h-4 w-4 text-emerald-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
-        </svg>
-      );
-    }
-
-    if (act.includes('type') || act.includes('fill') || act.includes('input') || act.includes('write')) {
-      return (
-        <svg className="h-4 w-4 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-        </svg>
-      );
-    }
-
-    if (act.includes('evaluat') || act.includes('verif') || act.includes('check') || act.includes('extract') || act.includes('audit')) {
-      return (
-        <svg className="h-4 w-4 text-teal-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-        </svg>
-      );
-    }
-
-    if (act.includes('wait') || act.includes('sleep') || act.includes('delay') || act.includes('pause')) {
-      return (
-        <svg className="h-4 w-4 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-          <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-        </svg>
-      );
-    }
-
-    return (
-      <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-        <path strokeLinecap="round" strokeLinejoin="round" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-      </svg>
-    );
   };
 
   return (
@@ -362,7 +913,7 @@ export function LiveStepExecutionLog({
                 )}
               </div>
               <p className="text-xs text-zinc-500 mt-0.5 font-sans">
-                Real-time SSE events streaming agent observations, actions, and results.
+                Real-time agent browser observations, intelligent actions, and telemetry summaries.
               </p>
             </div>
           </div>
@@ -502,7 +1053,7 @@ export function LiveStepExecutionLog({
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Filter steps by action or text..."
+                placeholder="Search steps, actions, payloads..."
                 className="w-full rounded-lg border border-zinc-200 bg-white py-1.5 pl-8 pr-7 text-xs text-zinc-800 placeholder-zinc-400 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-400 font-sans"
               />
               <svg className="pointer-events-none absolute left-2.5 top-2 h-3.5 w-3.5 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
@@ -528,7 +1079,7 @@ export function LiveStepExecutionLog({
       <div
         ref={logContainerRef}
         onScroll={handleScroll}
-        className="max-h-[520px] min-h-[240px] overflow-y-auto p-4 sm:p-6 space-y-3 font-mono text-xs bg-zinc-50/30"
+        className="max-h-[520px] min-h-[240px] overflow-y-auto p-4 sm:p-5 space-y-2.5 font-sans text-xs bg-zinc-50/40"
       >
         {steps.length === 0 ? (
           <div className="flex h-56 flex-col items-center justify-center text-center text-zinc-400 border border-dashed border-zinc-200/90 rounded-2xl bg-white p-8 shadow-2xs">
@@ -557,25 +1108,9 @@ export function LiveStepExecutionLog({
             </button>
           </div>
         ) : (
-          filteredSteps.map((st, idx) => {
-            const stepKey = st.step_id || `step-${idx}`;
+          filteredSteps.map(({ step: st, stepKey, stepNum, parsed, timeFormatted }, idx) => {
             const isExpanded = expandedStepIds[stepKey] !== false;
-
-            const isFail =
-              st.type === 'step_failed' ||
-              Boolean(st.error) ||
-              Boolean(st.result && st.result.toLowerCase().includes('failed'));
-            const isSession =
-              st.type === 'session_lost' ||
-              st.type === 'session_reattached' ||
-              st.action.includes('session');
-            const isSessionLost = st.type === 'session_lost';
-            const isSessionReattached = st.type === 'session_reattached';
-
-            const rawContent = st.result || st.error || 'Success';
-            const formattedJson = parseJsonSafe(rawContent);
-            const stepNum = st.step_index ?? idx + 1;
-            const timeFormatted = new Date(st.timestamp).toLocaleTimeString();
+            const isInspectorOpen = Boolean(inspectorOpenMap[stepKey]);
 
             // Status Styling
             let cardClasses = 'border-t-white border-x-zinc-200/90 border-b-zinc-300/80 bg-white text-zinc-800';
@@ -586,23 +1121,31 @@ export function LiveStepExecutionLog({
               </span>
             );
 
-            if (isSessionLost) {
-              cardClasses = 'border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-amber-50/50 text-amber-950';
+            if (parsed.badgeLabel === 'SESSION LOST') {
+              cardClasses = 'border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-amber-50/40 text-amber-950';
               statusBadge = (
                 <span className="inline-flex items-center gap-1 rounded-md bg-amber-100 border border-amber-300 px-2 py-0.5 text-[10px] font-bold text-amber-900">
                   <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"></span>
                   SESSION LOST
                 </span>
               );
-            } else if (isSessionReattached) {
-              cardClasses = 'border-t-sky-200 border-x-sky-300 border-b-sky-400 bg-sky-50/40 text-sky-950';
+            } else if (parsed.badgeLabel === 'REATTACHED') {
+              cardClasses = 'border-t-sky-200 border-x-sky-300 border-b-sky-400 bg-sky-50/30 text-sky-950';
               statusBadge = (
                 <span className="inline-flex items-center gap-1 rounded-md bg-sky-100 border border-sky-300 px-2 py-0.5 text-[10px] font-bold text-sky-800">
                   <span className="h-1.5 w-1.5 rounded-full bg-sky-500"></span>
                   REATTACHED
                 </span>
               );
-            } else if (isFail) {
+            } else if (parsed.badgeLabel === 'APPROVAL GATE') {
+              cardClasses = 'border-t-purple-200 border-x-purple-300 border-b-purple-400 bg-purple-50/30 text-purple-950';
+              statusBadge = (
+                <span className="inline-flex items-center gap-1 rounded-md bg-purple-100 border border-purple-300 px-2 py-0.5 text-[10px] font-bold text-purple-800">
+                  <span className="h-1.5 w-1.5 rounded-full bg-purple-500"></span>
+                  APPROVAL
+                </span>
+              );
+            } else if (parsed.isFail) {
               cardClasses = 'border-t-rose-200 border-x-rose-300 border-b-rose-400 bg-rose-50/40 text-rose-950';
               statusBadge = (
                 <span className="inline-flex items-center gap-1 rounded-md bg-rose-100 border border-rose-300 px-2 py-0.5 text-[10px] font-bold text-rose-800">
@@ -620,7 +1163,7 @@ export function LiveStepExecutionLog({
                 {/* Step Header Row */}
                 <div
                   onClick={() => toggleStep(stepKey)}
-                  className="flex cursor-pointer select-none items-center justify-between p-3.5 sm:px-4 hover:bg-zinc-50/60 transition-colors rounded-t-xl"
+                  className="flex cursor-pointer select-none items-center justify-between p-3 sm:px-4 hover:bg-zinc-50/60 transition-colors rounded-t-xl"
                   role="button"
                   tabIndex={0}
                   aria-expanded={isExpanded}
@@ -631,23 +1174,39 @@ export function LiveStepExecutionLog({
                     }
                   }}
                 >
-                  <div className="flex items-center gap-2.5 min-w-0">
-                    <span className="flex h-6 min-w-6 px-1.5 items-center justify-center rounded-md border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-100 text-[11px] font-bold text-zinc-700 shadow-2xs">
+                  {/* Left Column: Number, Icon, Badge, Clean Title & One-Liner Summary */}
+                  <div className="flex items-center gap-2.5 min-w-0 pr-2">
+                    <span className="flex h-6 min-w-6 px-1.5 items-center justify-center rounded-md border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-100 font-mono text-[11px] font-bold text-zinc-700 shadow-2xs shrink-0">
                       #{stepNum}
                     </span>
 
                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-zinc-100/90 border border-zinc-200">
-                      {renderActionIcon(st.action, isFail, isSession)}
+                      {renderActionIcon(parsed.category, parsed.isFail)}
                     </span>
 
-                    <span className="font-bold text-zinc-900 truncate text-xs sm:text-[13px]">
-                      {st.action}
+                    <span
+                      className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-bold tracking-wide uppercase border shrink-0 ${getBadgeStyle(
+                        parsed.badgeTone
+                      )}`}
+                    >
+                      {parsed.badgeLabel}
                     </span>
 
-                    {statusBadge}
+                    {/* Step Title + One-Liner Executive Summary */}
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-0.5 sm:gap-2 min-w-0">
+                      <span className="font-bold text-zinc-900 text-xs sm:text-[13px] truncate">
+                        {parsed.title}
+                      </span>
+                      <span className="text-zinc-500 font-sans text-xs truncate max-w-md hidden md:inline">
+                        — {parsed.oneLiner}
+                      </span>
+                    </div>
                   </div>
 
+                  {/* Right Column: Status Badge, Screenshot, Timestamp, Copy, Chevron */}
                   <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+                    {statusBadge}
+
                     {st.has_screenshot && (
                       <button
                         type="button"
@@ -663,11 +1222,11 @@ export function LiveStepExecutionLog({
                           <path strokeLinecap="round" strokeLinejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                           <path strokeLinecap="round" strokeLinejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                         </svg>
-                        <span className="hidden xs:inline">Screenshot</span>
+                        <span className="hidden sm:inline">Screenshot</span>
                       </button>
                     )}
 
-                    <span className="text-[11px] text-zinc-400 font-mono hidden sm:inline" title={st.timestamp}>
+                    <span className="text-[11px] text-zinc-400 font-mono hidden lg:inline" title={st.timestamp}>
                       {timeFormatted}
                     </span>
 
@@ -675,10 +1234,10 @@ export function LiveStepExecutionLog({
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleCopyStep(stepKey, rawContent);
+                        handleCopyStep(stepKey, parsed.oneLiner, parsed.jsonPayload);
                       }}
                       className="rounded-md p-1 text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors"
-                      title="Copy output to clipboard"
+                      title="Copy summary and data to clipboard"
                     >
                       {copiedStepId === stepKey ? (
                         <svg className="h-3.5 w-3.5 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
@@ -705,51 +1264,116 @@ export function LiveStepExecutionLog({
                   </div>
                 </div>
 
-                {/* Collapsible Step Content */}
+                {/* Collapsible Step Body */}
                 {isExpanded && (
-                  <div className="border-t border-zinc-200/70 p-3 sm:p-4 bg-zinc-50/40 rounded-b-xl space-y-2">
-                    {/* Header meta */}
-                    <div className="flex flex-wrap items-center justify-between text-[11px] text-zinc-500 font-sans pb-1">
-                      <div className="flex items-center gap-2">
+                  <div className="border-t border-zinc-200/70 p-3.5 sm:p-4 bg-zinc-50/50 rounded-b-xl space-y-3">
+                    {/* Header meta & timestamps */}
+                    <div className="flex flex-wrap items-center justify-between text-[11px] text-zinc-500 font-sans">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="font-mono text-zinc-700 bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-200 text-[10px]">
                           type:{st.type}
                         </span>
                         {st.step_id && (
-                          <span className="font-mono text-zinc-400 text-[10px]">
+                          <span className="font-mono text-zinc-400 text-[10px] hidden sm:inline">
                             id:{st.step_id}
                           </span>
                         )}
+                        {st.duration_ms !== undefined && (
+                          <span className="font-mono text-zinc-600 bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-200 text-[10px]">
+                            {st.duration_ms}ms
+                          </span>
+                        )}
                       </div>
-                      <span className="font-mono text-zinc-400">
-                        {new Date(st.timestamp).toISOString()}
+                      <span className="font-mono text-zinc-400 text-[10px]">
+                        {st.timestamp ? new Date(st.timestamp).toISOString() : ''}
                       </span>
                     </div>
 
-                    {/* Output / Payload Container */}
-                    {formattedJson ? (
-                      <div className="rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-100 p-3.5 overflow-x-auto shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]">
-                        <div className="flex items-center justify-between pb-2 mb-2 border-b border-zinc-800 text-[10px] text-zinc-400 font-sans">
-                          <span className="font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
-                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
-                            Structured JSON Payload
-                          </span>
-                          <span>{formattedJson.split('\n').length} lines</span>
-                        </div>
-                        <pre className="font-mono text-[11px] leading-relaxed text-emerald-300/90 whitespace-pre">
-                          {formattedJson}
-                        </pre>
+                    {/* Human One-Liner Summary Banner */}
+                    <div
+                      className={`rounded-lg border px-3.5 py-2.5 text-xs font-sans leading-relaxed shadow-2xs ${
+                        parsed.isFail
+                          ? 'bg-rose-50/80 border-rose-200/90 text-rose-950 font-medium'
+                          : parsed.isSession
+                          ? 'bg-amber-50/80 border-amber-200/90 text-amber-950 font-medium'
+                          : 'bg-white border-zinc-200/90 text-zinc-800'
+                      }`}
+                    >
+                      <div className="flex items-start gap-2">
+                        <span className="font-bold shrink-0 text-zinc-900">Summary:</span>
+                        <span className="text-zinc-700">{parsed.oneLiner}</span>
                       </div>
-                    ) : (
-                      <div
-                        className={`rounded-lg border p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] ${
-                          isFail
-                            ? 'bg-rose-50/70 border-rose-200 text-rose-900'
-                            : isSession
-                            ? 'bg-amber-50/70 border-amber-200 text-amber-900'
-                            : 'bg-white border-zinc-200/90 text-zinc-800'
-                        }`}
-                      >
-                        {rawContent}
+                    </div>
+
+                    {/* Key Attributes & Highlights Micro-Grid */}
+                    {parsed.highlights.length > 0 && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                        {parsed.highlights.map((h, hIdx) => (
+                          <div
+                            key={hIdx}
+                            className="rounded-lg border border-zinc-200/80 bg-white p-2.5 shadow-2xs"
+                          >
+                            <span className="text-[10px] uppercase font-bold tracking-wider text-zinc-400 block mb-0.5">
+                              {h.label}
+                            </span>
+                            <span className="text-xs font-mono font-semibold text-zinc-800 break-all select-all">
+                              {h.value}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Subtle Collapsible Payload Inspector Toggle */}
+                    {parsed.jsonPayload && (
+                      <div className="pt-1">
+                        <button
+                          type="button"
+                          onClick={(e) => toggleInspector(stepKey, e)}
+                          className="inline-flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/80 shadow-2xs transition-all active:translate-y-[0.5px]"
+                        >
+                          <svg className="h-3.5 w-3.5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+                          </svg>
+                          <span>{isInspectorOpen ? 'Hide Payload Inspector' : 'Payload Inspector'}</span>
+                          <span className="rounded bg-zinc-100 px-1.5 py-0.2 text-[10px] font-mono text-zinc-500 border border-zinc-200">
+                            JSON
+                          </span>
+                          <svg
+                            className={`h-3.5 w-3.5 text-zinc-400 transition-transform ${isInspectorOpen ? 'rotate-180' : ''}`}
+                            fill="none"
+                            viewBox="0 0 24 24"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                          >
+                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </button>
+
+                        {/* Collapsed Inspector Content */}
+                        {isInspectorOpen && (
+                          <div className="mt-2.5 rounded-xl border border-zinc-800 bg-zinc-950 text-zinc-100 p-3.5 overflow-hidden shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]">
+                            <div className="flex items-center justify-between pb-2 mb-2 border-b border-zinc-800 text-[10px] text-zinc-400 font-sans">
+                              <span className="font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+                                Structured JSON Payload
+                              </span>
+                              <div className="flex items-center gap-3">
+                                <span>{parsed.jsonPayload.split('\n').length} lines</span>
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleCopyPayload(stepKey, parsed.jsonPayload!, e)}
+                                  className="inline-flex items-center gap-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-2 py-0.5 text-[10px] transition-colors"
+                                >
+                                  {copiedPayloadId === stepKey ? 'Copied JSON!' : 'Copy JSON'}
+                                </button>
+                              </div>
+                            </div>
+                            <pre className="font-mono text-[11px] leading-relaxed text-emerald-300/90 whitespace-pre overflow-x-auto max-h-80">
+                              {parsed.jsonPayload}
+                            </pre>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

@@ -59,11 +59,12 @@ class TestPhase2Backend(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data_health["status"], "healthy")
             self.assertEqual(data_health["database"], "connected")
 
-    async def test_04_cdp_browser_error_on_missing_endpoint(self):
-        """Phase 2.2: Verify BrowserConnectionError is raised when endpoint is missing."""
-        with self.assertRaises(BrowserConnectionError):
-            async with get_browser_session(endpoint=""):
-                pass
+    async def test_04_local_browser_session_on_missing_or_local_endpoint(self):
+        """Phase 2.2: Verify local Playwright Chromium is launched when endpoint is empty or 'local'."""
+        async with get_browser_session(endpoint="") as session:
+            self.assertIsNotNone(session.browser)
+            self.assertTrue(session.browser.is_connected())
+            self.assertEqual(session.browser.browser_type.name, "chromium")
 
     async def test_05_cdp_browser_error_on_invalid_endpoint(self):
         """Phase 2.2: Verify BrowserConnectionError is raised when endpoint is invalid."""
@@ -71,13 +72,8 @@ class TestPhase2Backend(unittest.IsolatedAsyncioTestCase):
             async with get_browser_session(endpoint="wss://invalid-ws-url-that-does-not-exist.local", timeout_ms=3000):
                 pass
 
-    async def test_06_remote_cdp_connection_live(self):
-        """Phase 2.2: Verify live connection to Browserless / Steel.dev over CDP without local browser binaries."""
-        self.assertTrue(
-            settings.BROWSER_WS_ENDPOINT.startswith("wss://") or settings.BROWSER_WS_ENDPOINT.startswith("ws://"),
-            "BROWSER_WS_ENDPOINT must be a valid WebSocket URL"
-        )
-        
+    async def test_06_browser_connection_live(self):
+        """Phase 2.2: Verify live connection to browser over CDP or local Chromium."""
         async with get_browser_session() as session:
             self.assertIsNotNone(session.browser)
             self.assertTrue(session.browser.is_connected())
