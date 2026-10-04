@@ -41,7 +41,6 @@ export interface ParsedStepInfo {
   title: string;
   oneLiner: string;
   highlights: StepHighlight[];
-  jsonPayload: string | null;
   rawError: string | null;
   isFail: boolean;
   isSession: boolean;
@@ -72,32 +71,6 @@ function extractObject(val: unknown): Record<string, unknown> | null {
   return null;
 }
 
-// Pretty print JSON safely
-export function parseJsonSafe(raw?: unknown): string | null {
-  if (raw === null || raw === undefined) return null;
-  if (typeof raw === 'object') {
-    try {
-      return JSON.stringify(raw, null, 2);
-    } catch {
-      return null;
-    }
-  }
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  if (
-    (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
-    (trimmed.startsWith('[') && trimmed.endsWith(']'))
-  ) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      return JSON.stringify(parsed, null, 2);
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
 // Comprehensive domain-aware smart step parser
 export function parseStepDetails(step: StepEvent): ParsedStepInfo {
   const actionLower = toSafeString(step.action).toLowerCase();
@@ -120,18 +93,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
   const isSessionLost = Boolean(typeLower === 'session_lost' || actionLower.includes('session_lost'));
   const isSessionReattached = Boolean(typeLower === 'session_reattached' || actionLower.includes('session_reattached'));
   const isSession = Boolean(isSessionLost || isSessionReattached || actionLower.includes('session'));
-
-  // JSON payload extraction for inspector
-  let jsonPayload: string | null = null;
-  if (resObj || errObj || (step.arguments && Object.keys(step.arguments).length > 0)) {
-    const combined: Record<string, unknown> = {};
-    if (step.arguments && Object.keys(step.arguments).length > 0) combined.arguments = step.arguments;
-    if (step.result !== undefined) combined.result = resObj || step.result;
-    if (step.error !== undefined) combined.error = errObj || step.error;
-    jsonPayload = parseJsonSafe(combined) || parseJsonSafe(step.result ?? step.error);
-  } else {
-    jsonPayload = parseJsonSafe(step.result ?? step.error);
-  }
 
   const rawError = errStr || (resObj?.error ? String(resObj.error) : null);
 
@@ -166,7 +127,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Navigate Page',
       oneLiner: `Navigated to ${displayUrl} (Status ${status})`,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -202,7 +162,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
         ? `Failed to click ${targetDesc}`
         : `Clicked ${targetDesc}`,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -240,7 +199,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Input Text',
       oneLiner: `Entered ${valDisplay} into ${cleanField}`,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -266,7 +224,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Select Option',
       oneLiner: `Selected "${selected || 'option'}" from dropdown`,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -307,7 +264,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Idempotency Check',
       oneLiner: summary,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -352,7 +308,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Extract Content',
       oneLiner: summary,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -375,7 +330,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Capture Evidence',
       oneLiner: 'Captured full-page screenshot for audit verification',
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -418,7 +372,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Approval Gate',
       oneLiner: summary,
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession,
@@ -446,7 +399,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: isSessionLost ? 'Browser Session Disconnected' : 'Browser Session Restored',
       oneLiner: summary,
       highlights,
-      jsonPayload,
       rawError,
       isFail: isSessionLost,
       isSession: true,
@@ -462,7 +414,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Run Completed',
       oneLiner: resStr || 'Execution finished successfully. All targets processed.',
       highlights: [{ label: 'Status', value: 'Completed' }],
-      jsonPayload,
       rawError,
       isFail: false,
       isSession: false,
@@ -477,7 +428,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Run Stalled',
       oneLiner: resStr || 'Execution reached step iteration limit or paused timeout',
       highlights: [{ label: 'Status', value: 'Stalled' }],
-      jsonPayload,
       rawError,
       isFail: true,
       isSession: false,
@@ -492,7 +442,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
       title: 'Agent Planning',
       oneLiner: resStr ? `Reasoning: ${resStr.replace(/^failed:\s*/i, '')}` : 'Evaluating page state and planning next action',
       highlights,
-      jsonPayload,
       rawError,
       isFail,
       isSession: false,
@@ -531,7 +480,6 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
     title: formattedTitle,
     oneLiner: summary,
     highlights,
-    jsonPayload,
     rawError,
     isFail,
     isSession,
@@ -562,9 +510,7 @@ export function LiveStepExecutionLog({
   const [filterCategory, setFilterCategory] = useState<StepCategory>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedStepIds, setExpandedStepIds] = useState<Set<string>>(new Set());
-  const [inspectorOpenMap, setInspectorOpenMap] = useState<Record<string, boolean>>({});
   const [copiedStepId, setCopiedStepId] = useState<string | null>(null);
-  const [copiedPayloadId, setCopiedPayloadId] = useState<string | null>(null);
   const [copiedAllLogs, setCopiedAllLogs] = useState(false);
 
   const logContainerRef = useRef<HTMLDivElement>(null);
@@ -623,10 +569,9 @@ export function LiveStepExecutionLog({
         const actionMatch = toSafeString(step.action).toLowerCase().includes(q);
         const oneLinerMatch = parsed.oneLiner.toLowerCase().includes(q);
         const titleMatch = parsed.title.toLowerCase().includes(q);
-        const payloadMatch = parsed.jsonPayload?.toLowerCase().includes(q) ?? false;
         const errorMatch = parsed.rawError?.toLowerCase().includes(q) ?? false;
 
-        return numMatch || actionMatch || oneLinerMatch || titleMatch || payloadMatch || errorMatch;
+        return numMatch || actionMatch || oneLinerMatch || titleMatch || errorMatch;
       }
 
       return true;
@@ -698,15 +643,6 @@ export function LiveStepExecutionLog({
     });
   };
 
-  // Toggle single step payload inspector
-  const toggleInspector = (key: string, e?: React.MouseEvent) => {
-    if (e) e.stopPropagation();
-    setInspectorOpenMap((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
-  };
-
   // Check if all current steps are expanded
   const areAllExpanded = useMemo(() => {
     if (steps.length === 0) return false;
@@ -729,20 +665,11 @@ export function LiveStepExecutionLog({
     }
   };
 
-  // Copy single step summary + payload
-  const handleCopyStep = (key: string, oneLiner: string, jsonPayload: string | null) => {
-    const text = jsonPayload ? `${oneLiner}\n\n[Payload]:\n${jsonPayload}` : oneLiner;
-    navigator.clipboard.writeText(text);
+  // Copy single step summary
+  const handleCopyStep = (key: string, oneLiner: string) => {
+    navigator.clipboard.writeText(oneLiner);
     setCopiedStepId(key);
     setTimeout(() => setCopiedStepId(null), 1800);
-  };
-
-  // Copy raw payload only
-  const handleCopyPayload = (key: string, jsonPayload: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    navigator.clipboard.writeText(jsonPayload);
-    setCopiedPayloadId(key);
-    setTimeout(() => setCopiedPayloadId(null), 1800);
   };
 
   // Copy entire log as structured executive text
@@ -751,8 +678,7 @@ export function LiveStepExecutionLog({
     const formatted = parsedStepsWithMeta
       .map(({ step, stepNum, parsed }) => {
         const time = step.timestamp ? new Date(step.timestamp).toISOString() : new Date().toISOString();
-        const payloadText = parsed.jsonPayload ? `\nPayload: ${parsed.jsonPayload}` : '';
-        return `[Step #${stepNum}] [${time}] [${parsed.badgeLabel}] ${parsed.title}\nSummary: ${parsed.oneLiner}${payloadText}\n`;
+        return `[Step #${stepNum}] [${time}] [${parsed.badgeLabel}] ${parsed.title}\nSummary: ${parsed.oneLiner}\n`;
       })
       .join('\n---\n\n');
 
@@ -1118,7 +1044,6 @@ export function LiveStepExecutionLog({
         ) : (
           filteredSteps.map(({ step: st, stepKey, stepNum, parsed, timeFormatted }, idx) => {
             const isExpanded = expandedStepIds.has(stepKey);
-            const isInspectorOpen = Boolean(inspectorOpenMap[stepKey]);
 
             // Status Styling
             let cardClasses = 'border-t-white border-x-zinc-200/90 border-b-zinc-300/80 bg-white text-zinc-800';
@@ -1243,7 +1168,7 @@ export function LiveStepExecutionLog({
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleCopyStep(stepKey, parsed.oneLiner, parsed.jsonPayload);
+                        handleCopyStep(stepKey, parsed.oneLiner);
                       }}
                       className="rounded-md p-1 text-zinc-400 hover:text-zinc-600 hover:bg-zinc-100 transition-colors"
                       title="Copy summary and data to clipboard"
@@ -1333,58 +1258,6 @@ export function LiveStepExecutionLog({
                       </div>
                     )}
 
-                    {/* Subtle Collapsible Payload Inspector Toggle */}
-                    {parsed.jsonPayload && (
-                      <div className="pt-1">
-                        <button
-                          type="button"
-                          onClick={(e) => toggleInspector(stepKey, e)}
-                          className="inline-flex items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/80 shadow-2xs transition-all active:translate-y-[0.5px]"
-                        >
-                          <svg className="h-3.5 w-3.5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
-                          </svg>
-                          <span>{isInspectorOpen ? 'Hide Payload Inspector' : 'Payload Inspector'}</span>
-                          <span className="rounded bg-zinc-100 px-1.5 py-0.2 text-[10px] font-mono text-zinc-500 border border-zinc-200">
-                            JSON
-                          </span>
-                          <svg
-                            className={`h-3.5 w-3.5 text-zinc-400 transition-transform ${isInspectorOpen ? 'rotate-180' : ''}`}
-                            fill="none"
-                            viewBox="0 0 24 24"
-                            stroke="currentColor"
-                            strokeWidth="2"
-                          >
-                            <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
-                          </svg>
-                        </button>
-
-                        {/* Collapsed Inspector Content */}
-                        {isInspectorOpen && (
-                          <div className="mt-2.5 rounded-xl border border-zinc-800 bg-zinc-950 text-zinc-100 p-3.5 overflow-hidden shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]">
-                            <div className="flex items-center justify-between pb-2 mb-2 border-b border-zinc-800 text-[10px] text-zinc-400 font-sans">
-                              <span className="font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
-                                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
-                                Structured JSON Payload
-                              </span>
-                              <div className="flex items-center gap-3">
-                                <span>{parsed.jsonPayload.split('\n').length} lines</span>
-                                <button
-                                  type="button"
-                                  onClick={(e) => handleCopyPayload(stepKey, parsed.jsonPayload!, e)}
-                                  className="inline-flex items-center gap-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 px-2 py-0.5 text-[10px] transition-colors"
-                                >
-                                  {copiedPayloadId === stepKey ? 'Copied JSON!' : 'Copy JSON'}
-                                </button>
-                              </div>
-                            </div>
-                            <pre className="font-mono text-[11px] leading-relaxed text-emerald-300/90 whitespace-pre overflow-x-auto max-h-80">
-                              {parsed.jsonPayload}
-                            </pre>
-                          </div>
-                        )}
-                      </div>
-                    )}
                   </div>
                 )}
               </div>
