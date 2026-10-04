@@ -21,22 +21,28 @@ interface UploadedFilePreview {
   lastModified: number;
 }
 
-const DEFAULT_LINE_ITEMS: LineItem[] = [
-  {
-    id: 'item-1',
-    description: 'Cloud Infrastructure & API Hosting Services',
-    quantity: 1,
-    unitPrice: 1250.0,
-    taxRate: 0,
-  },
-  {
-    id: 'item-2',
-    description: 'Enterprise Security Compliance Audit',
-    quantity: 1,
-    unitPrice: 3200.0,
-    taxRate: 8.5,
-  },
-];
+// Preview-only display values. Neither is part of the create payload (see
+// CreateInvoiceSchema), so neither is editable.
+const PAYMENT_TERMS_LABELS: Record<string, string> = {
+  immediate: 'Due Immediately',
+  net15: 'Net 15 Days',
+  net30: 'Net 30 Days (Standard)',
+  net60: 'Net 60 Days',
+  net90: 'Net 90 Days',
+};
+
+// A fresh form must not arrive pre-loaded with invented invoice data: seeded
+// line items plus a derived amount let a user post a fabricated payable to the
+// first registered vendor without typing anything. The grid therefore opens on
+// a single empty row, which totals 0.00 and fails the positive-amount check in
+// handleSubmit until real invoice data is supplied.
+const BLANK_LINE_ITEM: LineItem = {
+  id: 'item-1',
+  description: '',
+  quantity: 1,
+  unitPrice: 0,
+  taxRate: 0,
+};
 
 function formatCurrency(amount: number): string {
   return new Intl.NumberFormat('en-US', {
@@ -46,6 +52,11 @@ function formatCurrency(amount: number): string {
     maximumFractionDigits: 2,
   }).format(amount);
 }
+
+// Kept in sync with the `accept` attribute on the file input below; the dropzone
+// copy states the same list and the same 10 MB ceiling.
+const ALLOWED_FILE_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg', '.csv'];
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
 
 function formatFileSize(bytes: number): string {
   if (bytes === 0) return '0 Bytes';
@@ -59,6 +70,14 @@ function NewInvoiceForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const ocrTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelPendingOcr = () => {
+    if (ocrTimeoutRef.current !== null) {
+      clearTimeout(ocrTimeoutRef.current);
+      ocrTimeoutRef.current = null;
+    }
+  };
 
   // Reference data
   const [vendors, setVendors] = useState<VendorDTO[]>([]);
@@ -69,19 +88,20 @@ function NewInvoiceForm() {
   const [vendor, setVendor] = useState('');
   const [customVendor, setCustomVendor] = useState('');
   const [isCustomVendor, setIsCustomVendor] = useState(false);
-  const [amount, setAmount] = useState('4722.00');
+  const [amount, setAmount] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [poNumber, setPoNumber] = useState('');
-  const [invoiceReference, setInvoiceReference] = useState(() => `INV-${Math.floor(100000 + Math.random() * 900000)}`);
-  const [paymentTerms, setPaymentTerms] = useState('net30');
+  const [invoiceReference] = useState(() => `INV-${Math.floor(100000 + Math.random() * 900000)}`);
+  const [paymentTerms] = useState('net30');
 
   // Line Items calculation engine
-  const [lineItems, setLineItems] = useState<LineItem[]>(DEFAULT_LINE_ITEMS);
+  const [lineItems, setLineItems] = useState<LineItem[]>([BLANK_LINE_ITEM]);
   const [isManualAmountOverride, setIsManualAmountOverride] = useState(false);
 
   // File dropzone states
   const [isDragging, setIsDragging] = useState(false);
   const [uploadedFile, setUploadedFile] = useState<UploadedFilePreview | null>(null);
+  const [fileError, setFileError] = useState<string | null>(null);
   const [ocrStatus, setOcrStatus] = useState<'idle' | 'processing' | 'success'>('idle');
   const [ocrMessage, setOcrMessage] = useState<string | null>(null);
 
@@ -139,6 +159,9 @@ function NewInvoiceForm() {
     loadData();
   }, [paramPo, paramVendor]);
 
+  // Drop any in-flight OCR timer on unmount so it cannot set state afterwards.
+  useEffect(() => cancelPendingOcr, []);
+
   // Compute live line-item totals
   const totals = useMemo(() => {
     let subtotal = 0;
@@ -159,7 +182,9 @@ function NewInvoiceForm() {
     };
   }, [lineItems]);
 
-  // Synchronize amount when line items change unless manually overridden
+  // Synchronize amount when line items change unless manually overridden.
+  // A zero estimate is mirrored through deliberately: it is what keeps a freshly
+  // opened form (blank grid) from ever satisfying the positive-amount check.
   useEffect(() => {
     if (!isManualAmountOverride) {
       setAmount(totals.total.toFixed(2));
@@ -226,6 +251,27 @@ function NewInvoiceForm() {
   };
 
   const processUploadedFile = (file: File) => {
+    // The picker's `accept` attribute is only a hint: it is not enforced for
+    // drag-and-drop, and browsers apply it inconsistently. Validate here so both
+    // entry paths enforce the rules the dropzone advertises, instead of marking
+    // an unsupported or oversized file as attached and later reporting an OCR
+    // success for it.
+    const extension = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+    if (!ALLOWED_FILE_EXTENSIONS.includes(extension)) {
+      setFileError(
+        `"${file.name}" is not a supported document. Accepted formats: ${ALLOWED_FILE_EXTENSIONS.join(', ')}.`
+      );
+      return;
+    }
+
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      setFileError(
+        `"${file.name}" is ${formatFileSize(file.size)}, over the ${formatFileSize(MAX_FILE_SIZE_BYTES)} limit.`
+      );
+      return;
+    }
+
+    setFileError(null);
     setUploadedFile({
       name: file.name,
       size: file.size,
@@ -238,24 +284,32 @@ function NewInvoiceForm() {
 
   const handleTriggerOcr = () => {
     if (!uploadedFile) return;
+
+    // A previous run may still be in flight; only the newest one may report.
+    cancelPendingOcr();
+
+    const fileName = uploadedFile.name;
     setOcrStatus('processing');
     setOcrMessage('Running optical character recognition & entity extraction...');
 
-    setTimeout(() => {
+    ocrTimeoutRef.current = setTimeout(() => {
+      ocrTimeoutRef.current = null;
       setOcrStatus('success');
-      setOcrMessage(`Successfully extracted metadata and line items from "${uploadedFile.name}"`);
+      setOcrMessage(`Successfully extracted metadata and line items from "${fileName}"`);
 
-      // Simulated auto-fill based on document context
-      if (vendors.length > 0 && !vendor) {
-        setVendor(vendors[0].name);
-      }
-      if (purchaseOrders.length > 0 && !poNumber) {
-        setPoNumber(purchaseOrders[0].po_number);
-      }
+      // Simulated auto-fill based on document context. Functional updates are
+      // required here: this callback closes over the render that scheduled it, so
+      // reading `vendor`/`poNumber` directly would let a choice the user made
+      // during the 900ms window be overwritten by the stale captured value.
+      setVendor((prev) => (prev ? prev : vendors[0]?.name ?? ''));
+      setPoNumber((prev) => (prev ? prev : purchaseOrders[0]?.po_number ?? ''));
     }, 900);
   };
 
   const handleRemoveFile = () => {
+    // Without this the in-flight callback still fires and auto-fills from a
+    // document the user has already detached.
+    cancelPendingOcr();
     setUploadedFile(null);
     setOcrStatus('idle');
     setOcrMessage(null);
@@ -579,40 +633,41 @@ function NewInvoiceForm() {
               )}
             </div>
 
-            {/* Invoice Reference / Number */}
+            {/* Invoice Reference / Number - preview only.
+                CreateInvoiceSchema is `.strict()` and the invoices table has no
+                reference column, so nothing typed here could ever be persisted.
+                Rendered as a read-only value rather than an input so no one edits
+                data the submit payload silently drops. */}
             <div>
-              <label htmlFor="ref-input" className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
+              <span className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
                 Invoice Reference #
-              </label>
-              <div className="mt-2">
-                <input
-                  id="ref-input"
-                  type="text"
-                  value={invoiceReference}
-                  onChange={(e) => setInvoiceReference(e.target.value)}
-                  className="block w-full rounded-xl border border-zinc-300/80 bg-zinc-50/60 p-3 text-sm font-mono text-zinc-900 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-colors focus:border-zinc-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900/10"
-                />
+                <span className="ml-1.5 font-sans text-[10px] font-medium normal-case tracking-normal text-zinc-400">
+                  (preview only — not saved)
+                </span>
+              </span>
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-xl border border-zinc-200 bg-zinc-100/80 p-3 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)]">
+                <span className="truncate font-mono text-sm text-zinc-700">{invoiceReference}</span>
+                <span className="shrink-0 rounded border border-zinc-300 bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase text-zinc-500">
+                  Not persisted
+                </span>
               </div>
             </div>
 
-            {/* Payment Terms */}
+            {/* Payment Terms - preview only. Same reason as the reference above:
+                the strict create schema and the invoices table carry no terms
+                field, so this select could only ever discard the user's choice. */}
             <div>
-              <label htmlFor="terms-select" className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
+              <span className="block text-xs font-bold uppercase tracking-wider text-zinc-700">
                 Payment Terms
-              </label>
-              <div className="mt-2">
-                <select
-                  id="terms-select"
-                  value={paymentTerms}
-                  onChange={(e) => setPaymentTerms(e.target.value)}
-                  className="block w-full rounded-xl border border-zinc-300/80 bg-zinc-50/60 p-3 text-sm text-zinc-900 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-colors focus:border-zinc-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900/10 cursor-pointer"
-                >
-                  <option value="immediate">Due Immediately</option>
-                  <option value="net15">Net 15 Days</option>
-                  <option value="net30">Net 30 Days (Standard)</option>
-                  <option value="net60">Net 60 Days</option>
-                  <option value="net90">Net 90 Days</option>
-                </select>
+                <span className="ml-1.5 font-sans text-[10px] font-medium normal-case tracking-normal text-zinc-400">
+                  (preview only — not saved)
+                </span>
+              </span>
+              <div className="mt-2 flex items-center justify-between gap-2 rounded-xl border border-zinc-200 bg-zinc-100/80 p-3 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)]">
+                <span className="truncate text-sm text-zinc-700">{PAYMENT_TERMS_LABELS[paymentTerms]}</span>
+                <span className="shrink-0 rounded border border-zinc-300 bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase text-zinc-500">
+                  Not persisted
+                </span>
               </div>
             </div>
           </div>
@@ -655,13 +710,31 @@ function NewInvoiceForm() {
               id="invoice-file-upload"
             />
 
+            {fileError && (
+              <p
+                role="alert"
+                className="mb-3 rounded-lg border border-rose-200 bg-rose-50/90 px-3 py-2 text-xs font-medium text-rose-800"
+              >
+                {fileError}
+              </p>
+            )}
+
             {!uploadedFile ? (
               <div
+                role="button"
+                tabIndex={0}
+                aria-label="Attach an invoice document: click, press Enter or Space, or drop a file"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+                    e.preventDefault();
+                    fileInputRef.current?.click();
+                  }
+                }}
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
                 onClick={() => fileInputRef.current?.click()}
-                className={`flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-8 text-center transition-all cursor-pointer ${
+                className={`flex flex-col items-center justify-center rounded-2xl border-2 border-dashed p-8 text-center transition-all cursor-pointer focus:outline-none focus-visible:border-zinc-800 focus-visible:ring-2 focus-visible:ring-zinc-900/30 focus-visible:ring-offset-2 ${
                   isDragging
                     ? 'border-zinc-800 bg-zinc-100/90 shadow-inner scale-[0.99]'
                     : 'border-zinc-300/90 bg-zinc-50/50 hover:border-zinc-400 hover:bg-zinc-50/90'
@@ -760,15 +833,19 @@ function NewInvoiceForm() {
               </span>
               <div>
                 <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-800">
-                  3. Line Items & Ledger Calculation Grid
+                  3. Amount Estimate Grid
                 </h2>
                 <p className="text-xs text-zinc-400">
-                  Itemize goods and services; subtotals and tax calculate dynamically in real-time.
+                  Working estimate only — subtotal, tax and total are calculated live and feed the
+                  Form Amount below.
                 </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
+              <span className="rounded-lg border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-amber-50 px-2.5 py-1 font-mono text-[10px] font-bold uppercase tracking-wider text-amber-800">
+                Estimate — not stored
+              </span>
               <span className="font-mono text-xs text-zinc-500 rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1">
                 {lineItems.length} {lineItems.length === 1 ? 'Line Item' : 'Line Items'}
               </span>
@@ -907,9 +984,9 @@ function NewInvoiceForm() {
               <div className="border-t border-zinc-200 pt-2 flex items-center justify-between">
                 <div>
                   <span className="text-xs font-bold uppercase tracking-wider text-zinc-900">
-                    Grand Total
+                    Estimated Total
                   </span>
-                  <div className="text-[10px] text-zinc-400">USD Currency</div>
+                  <div className="text-[10px] text-zinc-400">USD — feeds Form Amount</div>
                 </div>
                 <div className="text-right">
                   <span className="font-mono text-lg font-extrabold text-zinc-900 tabular-nums">
@@ -917,6 +994,11 @@ function NewInvoiceForm() {
                   </span>
                 </div>
               </div>
+
+              <p className="text-[10px] leading-relaxed text-zinc-500">
+                Only the Form Amount below is sent to the ERP. Line-item descriptions, quantities,
+                unit prices and tax rates are not stored with the invoice.
+              </p>
 
               {/* Amount Sync / Override Toggle */}
               <div className="border-t border-zinc-200/60 pt-2">
