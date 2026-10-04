@@ -879,7 +879,8 @@ class TestEnsureRunRecordLease(unittest.IsolatedAsyncioTestCase):
         for line in source.splitlines():
             stripped = line.strip()
             if stripped.startswith("await self.update_run_status("):
-                used.add(stripped[len("await self.update_run_status("):].split(")")[0].strip('"\''))
+                first_arg = stripped[len("await self.update_run_status("):].split(")")[0].split(",")[0]
+                used.add(first_arg.strip().strip('"\''))
 
         self.assertTrue(used, "no update_run_status call sites were found")
         for status in used:
@@ -2395,6 +2396,230 @@ class TestLeaseDdl(unittest.TestCase):
         self.assertIn(
             "CREATE INDEX IF NOT EXISTS idx_agent_runs_status_lease ON agent_runs(status, lease_expires_at)",
             self._init_db_source(),
+        )
+
+
+class TestTerminalPublishHoldsLease(unittest.IsolatedAsyncioTestCase):
+    """Issue #64: the run lease must survive the terminal status write.
+
+    ``update_run_status`` used to release the lease in its own ``finally``, so the
+    ``persist_step`` / Redis / hub publishes after a terminal write ran unowned:
+    ``ensure_run_record``'s ON CONFLICT treats the NULL lease as claimable, and a
+    duplicate ``POST /agent/run`` in that window started a second execution. The
+    three terminal sites now pass ``release_lease=False`` and release explicitly
+    once the final publish lands.
+    """
+
+    def _run_agent(
+        self,
+        pool: _FakePool,
+        groq_messages: List[Any],
+        events: List[Dict[str, Any]],
+        max_iterations: int = 5,
+    ) -> ReActAgent:
+        tools = MagicMock(spec=PlaywrightTools)
+        tools.page = MagicMock()
+        tools.page.is_closed = MagicMock(return_value=False)
+        tools.set_run_id = MagicMock()
+        tools.set_page = MagicMock()
+        tools.read_page = AsyncMock(
+            return_value={
+                "success": True,
+                "snapshot": "- button 'Submit'",
+                "url": "http://x",
+                "title": "T",
+            }
+        )
+        tools.execute = AsyncMock(return_value={"success": True, "url": "http://x"})
+        tools.take_screenshot = AsyncMock(return_value={"success": True, "screenshot_b64": ""})
+
+        async def _on_event(evt: Dict[str, Any]) -> None:
+            events.append(evt)
+
+        return ReActAgent(
+            run_id=str(uuid.uuid4()),
+            tools=tools,
+            groq_client=_groq_returning(groq_messages),
+            redis_client=_unconfigured_redis(),
+            max_iterations=max_iterations,
+            on_event=_on_event,
+            pool=pool,
+        )
+
+    async def _cancel_heartbeat(self, agent: ReActAgent) -> None:
+        task = agent._run_heartbeat_task
+        agent._run_heartbeat_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def test_01_completed_holds_lease_until_publishes_complete(self) -> None:
+        """A duplicate claim racing the success-path publishes is refused.
+
+        The probe runs inside the ``done`` persist, i.e. after the ``completed``
+        status write landed but before the Redis snapshot and ``done`` event.
+        With the old ``finally`` the status write already released the lease, so
+        the duplicate's upsert takes over the terminal row and this is accepted.
+        """
+        pool = _FakePool([])
+        events: List[Dict[str, Any]] = []
+        agent = self._run_agent(pool, [_text_message("Task completed successfully.")], events)
+        run_id = agent.run_id
+        probe: Dict[str, Any] = {}
+
+        real_persist = agent.persist_step
+
+        async def _persist_spy(*args: Any, **kwargs: Any) -> str:
+            if kwargs.get("action") == "done":
+                probe["status_at_publish"] = pool.row(run_id)["status"]
+                probe["owner_at_publish"] = pool.row(run_id)["owner_id"]
+                dup = _agent(pool, run_id)
+                probe["duplicate_accepted"] = await dup.ensure_run_record("goal")
+            return await real_persist(*args, **kwargs)
+
+        agent.persist_step = _persist_spy  # type: ignore[method-assign]
+        try:
+            result = await asyncio.wait_for(agent.run("create invoices"), timeout=10.0)
+        finally:
+            await self._cancel_heartbeat(agent)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(probe.get("status_at_publish"), "completed")
+        self.assertEqual(probe.get("owner_at_publish"), agent._run_owner_id)
+        self.assertIn("duplicate_accepted", probe, "the success path never reached its done persist")
+        self.assertFalse(
+            probe["duplicate_accepted"],
+            "a duplicate dispatch claimed the run mid-publish: the terminal "
+            "status write released the lease before the publishes landed",
+        )
+
+    async def test_02_completed_releases_lease_once_publishes_land(self) -> None:
+        """After the success path finishes the run is claimable again.
+
+        The lease must be handed back (owner cleared, heartbeat stopped) so a
+        later legitimate retry -- e.g. the resume/recovery path -- can claim it.
+        Dropping the call-site ``finally`` while keeping ``release_lease=False``
+        strands the lease here and this goes red.
+        """
+        pool = _FakePool([])
+        events: List[Dict[str, Any]] = []
+        agent = self._run_agent(pool, [_text_message("Task completed successfully.")], events)
+        run_id = agent.run_id
+        try:
+            result = await asyncio.wait_for(agent.run("create invoices"), timeout=10.0)
+        finally:
+            await self._cancel_heartbeat(agent)
+
+        self.assertEqual(result["status"], "completed")
+        row = pool.row(run_id)
+        self.assertEqual(row["status"], "completed")
+        self.assertIsNone(row["owner_id"], "a finished run must hand its lease back")
+        self.assertIsNone(row["lease_expires_at"])
+        self.assertIsNone(
+            agent._run_heartbeat_task, "the heartbeat must stop once the run finishes"
+        )
+        retry = _agent(pool, run_id)
+        self.assertTrue(
+            await retry.ensure_run_record("goal"),
+            "a later legitimate retry must be able to claim the finished run",
+        )
+
+    async def test_03_completed_release_ordered_after_persist_and_done(self) -> None:
+        """The release lands after the ``done`` persist and the ``done`` event.
+
+        Moving ``stop_run_lease`` back into the status-write ``finally`` on this
+        path releases before either publish; the recorded order then starts with
+        the release and this fails.
+        """
+        pool = _FakePool([])
+        events: List[Dict[str, Any]] = []
+        agent = self._run_agent(pool, [_text_message("Task completed successfully.")], events)
+        order: List[str] = []
+
+        real_persist = agent.persist_step
+        real_emit = agent.emit_event
+        real_stop = agent.stop_run_lease
+
+        async def _persist_spy(*args: Any, **kwargs: Any) -> str:
+            if kwargs.get("action") == "done":
+                order.append("persist_done")
+            return await real_persist(*args, **kwargs)
+
+        async def _emit_spy(event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+            if event_type == "done":
+                order.append("emit_done")
+            await real_emit(event_type, payload or {})
+
+        async def _stop_spy() -> None:
+            order.append("release")
+            await real_stop()
+
+        agent.persist_step = _persist_spy  # type: ignore[method-assign]
+        agent.emit_event = _emit_spy  # type: ignore[method-assign]
+        agent.stop_run_lease = _stop_spy  # type: ignore[method-assign]
+        try:
+            result = await asyncio.wait_for(agent.run("create invoices"), timeout=10.0)
+        finally:
+            await self._cancel_heartbeat(agent)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(
+            order,
+            ["persist_done", "emit_done", "release"],
+            f"the lease must be released after the terminal publishes, got {order}",
+        )
+
+    async def test_04_hard_cap_holds_lease_until_publishes_complete(self) -> None:
+        """Same hold-until-published guarantee for the hard-cap ``stalled`` site.
+
+        Driven through ``run()`` with ``max_iterations=1`` and a tool call that
+        succeeds, so the loop exits into the hard-cap block. The probe claims
+        from inside the ``stalled`` persist; after the run the lease is handed
+        back and a later retry can claim.
+        """
+        pool = _FakePool([])
+        events: List[Dict[str, Any]] = []
+        agent = self._run_agent(
+            pool,
+            [_tool_call_message("c1", "navigate", {"url": "/invoices"})],
+            events,
+            max_iterations=1,
+        )
+        run_id = agent.run_id
+        probe: Dict[str, Any] = {}
+
+        real_persist = agent.persist_step
+
+        async def _persist_spy(*args: Any, **kwargs: Any) -> str:
+            if kwargs.get("action") == "stalled":
+                probe["status_at_publish"] = pool.row(run_id)["status"]
+                probe["owner_at_publish"] = pool.row(run_id)["owner_id"]
+                dup = _agent(pool, run_id)
+                probe["duplicate_accepted"] = await dup.ensure_run_record("goal")
+            return await real_persist(*args, **kwargs)
+
+        agent.persist_step = _persist_spy  # type: ignore[method-assign]
+        try:
+            result = await asyncio.wait_for(agent.run("create invoices"), timeout=10.0)
+        finally:
+            await self._cancel_heartbeat(agent)
+
+        self.assertEqual(result["status"], "stalled")
+        self.assertEqual(probe.get("status_at_publish"), "stalled")
+        self.assertEqual(probe.get("owner_at_publish"), agent._run_owner_id)
+        self.assertIn("duplicate_accepted", probe, "the hard-cap path never reached its stalled persist")
+        self.assertFalse(
+            probe["duplicate_accepted"],
+            "a duplicate dispatch claimed the run mid-publish on the hard-cap path",
+        )
+        row = pool.row(run_id)
+        self.assertIsNone(row["owner_id"], "a finished run must hand its lease back")
+        self.assertIsNone(row["lease_expires_at"])
+        retry = _agent(pool, run_id)
+        self.assertTrue(
+            await retry.ensure_run_record("goal"),
+            "a later legitimate retry must be able to claim the finished run",
         )
 
 

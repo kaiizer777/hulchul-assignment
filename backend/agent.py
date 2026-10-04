@@ -495,7 +495,7 @@ class ReActAgent:
             # and a lapsed lease on a terminal run is inert.
             logger.warning(f"Failed to release run lease for {self.run_id}: {e}")
 
-    async def update_run_status(self, status: str) -> None:
+    async def update_run_status(self, status: str, release_lease: bool = True) -> None:
         """Update agent_runs record status in Neon database and emit status_change event.
 
         The write is fenced on the lease owner (issue #56). A lease expiring does not
@@ -517,6 +517,10 @@ class ReActAgent:
         startup sweep while this execution is still running, and nothing renews or
         fences it any more. Leaving the lease in place is the safe direction -- it
         lapses on its own and the run stays owned until it does.
+
+        Callers which publish more durable state after the status write must pass
+        ``release_lease=False`` and release explicitly once the final publish lands,
+        otherwise the run is claimable mid-publish.
         """
         landed = False
         try:
@@ -548,7 +552,7 @@ class ReActAgent:
             # is the one place guaranteed to run on each exit path. Non-terminal
             # transitions (running, paused, awaiting_approval) keep the lease: the run
             # is still the caller's to renew.
-            if status in TERMINAL_RUN_STATUSES and landed:
+            if status in TERMINAL_RUN_STATUSES and landed and release_lease:
                 await self.stop_run_lease()
 
     async def persist_step(
@@ -1159,20 +1163,23 @@ class ReActAgent:
                             return self._lease_lost_result(iteration, clean_goal, threshold)
                         if asyncio.get_running_loop().time() > pause_deadline:
                             logger.warning(f"Agent {self.run_id}: Pause wait timed out after {settings.PAUSE_TIMEOUT_SECONDS}s. Stalling run.")
-                            await self.update_run_status("stalled")
-                            await self.persist_step(
-                                action="stalled",
-                                result=f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
-                            )
-                            await self.emit_event("stalled", {"step": iteration, "reason": "pause_timeout"})
-                            return {
-                                "run_id": self.run_id,
-                                "status": "stalled",
-                                "iterations": iteration,
-                                "goal": clean_goal,
-                                "threshold": threshold,
-                                "summary": f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
-                            }
+                            try:
+                                await self.update_run_status("stalled", release_lease=False)
+                                await self.persist_step(
+                                    action="stalled",
+                                    result=f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
+                                )
+                                await self.emit_event("stalled", {"step": iteration, "reason": "pause_timeout"})
+                                return {
+                                    "run_id": self.run_id,
+                                    "status": "stalled",
+                                    "iterations": iteration,
+                                    "goal": clean_goal,
+                                    "threshold": threshold,
+                                    "summary": f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
+                                }
+                            finally:
+                                await self.stop_run_lease()
                         await asyncio.sleep(1.0)
                     logger.info(f"Agent {self.run_id} resumed.")
                     await self.update_run_status("running")
@@ -1275,22 +1282,25 @@ class ReActAgent:
                     logger.info(f"Agent {self.run_id}: Goal finished successfully.")
                     final_summary = response_msg.content or "Task completed successfully."
                     run_status = "completed"
-                    await self.update_run_status("completed")
-                    await self.persist_step(
-                        action="done",
-                        result=final_summary,
-                    )
-                    await redis.set_session_state(
-                        self.run_id,
-                        {
-                            "run_id": self.run_id,
-                            "status": "completed",
-                            "current_step": iteration,
-                            "summary": final_summary,
-                        },
-                    )
-                    await self.emit_event("done", {"summary": final_summary, "total_steps": iteration})
-                    break
+                    try:
+                        await self.update_run_status("completed", release_lease=False)
+                        await self.persist_step(
+                            action="done",
+                            result=final_summary,
+                        )
+                        await redis.set_session_state(
+                            self.run_id,
+                            {
+                                "run_id": self.run_id,
+                                "status": "completed",
+                                "current_step": iteration,
+                                "summary": final_summary,
+                            },
+                        )
+                        await self.emit_event("done", {"summary": final_summary, "total_steps": iteration})
+                        break
+                    finally:
+                        await self.stop_run_lease()
                 else:
                     # Model provided text but no tool call; check if model flagged approval in prose
                     text_content = response_msg.content or ""
@@ -2007,21 +2017,24 @@ class ReActAgent:
                 return self._lease_lost_result(iteration, clean_goal, threshold)
             logger.warning(f"Agent {self.run_id} hit hard cap of {self.max_iterations} iterations. Marking as stalled.")
             run_status = "stalled"
-            await self.update_run_status("stalled")
-            await self.persist_step(
-                action="stalled",
-                result=f"Exceeded maximum iteration cap of {self.max_iterations} steps.",
-            )
-            await redis.set_session_state(
-                self.run_id,
-                {
-                    "run_id": self.run_id,
-                    "status": "stalled",
-                    "current_step": iteration,
-                    "error": "Exceeded maximum iteration cap of 30 steps.",
-                },
-            )
-            await self.emit_event("stalled", {"iterations": iteration, "max_iterations": self.max_iterations})
+            try:
+                await self.update_run_status("stalled", release_lease=False)
+                await self.persist_step(
+                    action="stalled",
+                    result=f"Exceeded maximum iteration cap of {self.max_iterations} steps.",
+                )
+                await redis.set_session_state(
+                    self.run_id,
+                    {
+                        "run_id": self.run_id,
+                        "status": "stalled",
+                        "current_step": iteration,
+                        "error": "Exceeded maximum iteration cap of 30 steps.",
+                    },
+                )
+                await self.emit_event("stalled", {"iterations": iteration, "max_iterations": self.max_iterations})
+            finally:
+                await self.stop_run_lease()
 
         return {
             "run_id": self.run_id,
