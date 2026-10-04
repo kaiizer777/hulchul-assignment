@@ -57,6 +57,10 @@ class Settings:
     # disables login entirely (503) rather than falling back to any default secret.
     AUTH_PASSWORD_HASH: str = os.getenv("AUTH_PASSWORD_HASH", "")
     AUTH_SESSION_TTL_SECONDS: int = int(os.getenv("AUTH_SESSION_TTL_SECONDS", "86400"))
+    # Plaintext service credential for the agent's own browser session. It must be
+    # the password behind AUTH_PASSWORD_HASH: the agent logs into the ERP with it
+    # exactly like a user. Empty disables the agent auto-login (login wall applies).
+    AUTH_AGENT_PASSWORD: str = os.getenv("AUTH_AGENT_PASSWORD", "")
     # /docs, /redoc and /openapi.json sit outside the session guard and publish
     # every route to anonymous callers, so they stay off unless asked for.
     ENABLE_API_DOCS: bool = os.getenv("ENABLE_API_DOCS", "false").lower() == "true"

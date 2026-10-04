@@ -252,6 +252,43 @@ def _log_terminal_write_outcome(terminal_write: "asyncio.Future[None]") -> None:
         logger.warning(f"Terminal status write did not complete cleanly: {write_err}")
 
 
+async def _authenticate_agent_browser_session(session: Any) -> bool:
+    """Log the agent's browser session into the ERP using the service credential.
+
+    The agent drives a fresh Playwright context with no cookies, so the ERP
+    middleware redirects every protected page to /login. When AUTH_AGENT_PASSWORD
+    is configured, this performs a normal user login against the ERP origin's own
+    login route via the browser context's request API, so the issued session
+    cookie lands in the same cookie jar the agent's pages use. The password is
+    verified by the backend (argon2) and the session is a real Redis-backed
+    session: the middleware and auth logic are unchanged and un-bypassed.
+
+    The credential never leaves the backend process except inside the login
+    request body itself: it is never logged, persisted, or attached to any agent
+    event or step record. Returns True when the ERP accepted the login.
+    """
+    service_password = (settings.AUTH_AGENT_PASSWORD or "").strip()
+    if not service_password:
+        logger.info("AUTH_AGENT_PASSWORD is not configured; agent browser stays unauthenticated.")
+        return False
+    login_url = f"{settings.ERP_BASE_URL.rstrip('/')}/api/auth/login"
+    try:
+        response = await session.context.request.post(
+            login_url,
+            data=json.dumps({"password": service_password}),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=15000,
+        )
+    except Exception as exc:
+        logger.warning(f"Agent browser ERP login request failed: {exc}")
+        return False
+    if not response.ok:
+        logger.warning(f"Agent browser ERP login was rejected with status {response.status}")
+        return False
+    logger.info("Agent browser authenticated to the ERP with the service credential.")
+    return True
+
+
 async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     """Run the full ReAct loop off-request; publish live events via run_event_hub."""
     from backend.browser import get_browser_session, run_cancellation_safe, MAX_CDP_REATTACH_ATTEMPTS
@@ -283,6 +320,9 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     try:
         try:
             session = await _enter_cdp_session()
+            # Service credential: give the agent's browser its own normal user
+            # session so the ERP middleware lets it past /login.
+            await _authenticate_agent_browser_session(session)
             tools = PlaywrightTools(page=session.page, run_id=run_id_str)
 
             async def _reattach_page():
@@ -294,6 +334,8 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
                     except Exception as release_err:
                         logger.warning(f"Failed to release previous browser session during reattach: {release_err}")
                 new_session = await _enter_cdp_session()
+                # A reattached session is a fresh cookie jar: re-login identically.
+                await _authenticate_agent_browser_session(new_session)
                 return new_session.page
 
             # No on_event forwarding here: ReActAgent.emit_event already publishes
