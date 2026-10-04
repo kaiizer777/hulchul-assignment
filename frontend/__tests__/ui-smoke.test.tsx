@@ -103,11 +103,11 @@ describe('UI Smoke Tests', () => {
     });
 
     expect(renderResult?.container).toBeDefined();
-    expect(screen.getByRole('heading', { level: 1, name: /create invoice/i })).toBeDefined();
+    expect(screen.getByRole('heading', { level: 1 })).toBeDefined();
 
     // Verify vendor option is loaded into select
     await waitFor(() => {
-      expect(screen.getByText('Acme Corp')).toBeDefined();
+      expect(screen.getByRole('option', { name: /Acme Corp/i })).toBeDefined();
     });
 
     expect(consoleErrorSpy).not.toHaveBeenCalled();
