@@ -8,10 +8,8 @@ Production-grade, resilient autonomous AI agent executing browser-based ERP work
 
 ## Tech Stack
 
-- **Frontend & Mock ERP**: Next.js 16 App Router (Turbopack, TypeScript, Tailwind CSS v4).
-- **Edge Deployment**: **Cloudflare Workers** (`@opennextjs/cloudflare`) — serves Frontend & Mock ERP.
-- **Backend Orchestrator**: FastAPI (Python 3.12, Uvicorn, Pydantic v2).
-- **Serverless Deployment**: **AWS Lambda** via AWS Lambda Web Adapter — runs Backend Orchestrator.
+- **AWS Lambda** through Terraform (`infra/aws`: `lambda.tf`, `ecr.tf`, `iam.tf`) via AWS Lambda Web Adapter — runs FastAPI Backend Orchestrator (Python 3.12, Uvicorn, Pydantic v2).
+- **Cloudflare Workers** (`@opennextjs/cloudflare`) — serves Next.js 16 Frontend & Mock ERP (App Router, Turbopack, TypeScript, Tailwind CSS v4).
 - **Database**: Neon Serverless PostgreSQL (`asyncpg`), storing invoices, purchase orders, agent runs, and step audit trails with base64 screenshots.
 - **State & Coordination**: Upstash Redis (Serverless REST API) for active session state, pause/resume flags, and nonces for human-in-the-loop approval gates.
 - **AI / LLM**: Groq API running `openai/gpt-oss-120b` for ReAct (Reason + Act) loop orchestration.
