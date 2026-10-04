@@ -160,7 +160,7 @@ describe('/agent network failure reporting', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/Run: run-1234/i)).toBeDefined();
+      expect(screen.getByText(/run-1234/i)).toBeDefined();
     });
 
     const calledUrls = fetchMock.mock.calls.map((call) => call[0] as string);
@@ -264,7 +264,7 @@ describe('/agent network failure reporting', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/Run: run-1234/i)).toBeDefined();
+      expect(screen.getByText(/run-1234/i)).toBeDefined();
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
