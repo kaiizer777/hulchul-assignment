@@ -111,6 +111,19 @@ _reserved_agent_runs: Set[str] = set()
 # httpx.AsyncClient(timeout=10.0).
 TERMINAL_WRITE_IO_TIMEOUT_SECONDS: float = 5.0
 
+# Ceiling for the startup orphan sweep (issue #56). The asyncpg pool is built
+# without a command_timeout and acquire() is called without one (backend/db.py),
+# so a connection that is accepted and then never answers parks the sweep
+# indefinitely -- and `except` cannot catch a hang. The sweep runs before
+# `yield`, so that would stop the app serving requests at all, which is strictly
+# worse than an incomplete sweep. Bounding it lets the cold start proceed and
+# leaves the remainder to the next one.
+#
+# Exceeding it abandons the sweep mid-flight, which is safe: every candidate is
+# reclaimed by its own conditional UPDATE, so the runs already processed stay
+# reclaimed and only the rest are deferred.
+STARTUP_RECONCILE_TIMEOUT_SECONDS: float = 15.0
+
 
 async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
     """Record a terminal run status in the database, Redis, and the event hub.
@@ -313,11 +326,20 @@ async def lifespan(app: FastAPI):
     # serverless invocation cannot afford.
     try:
         pool = await get_db_pool()
-        reclaimed = await reconcile_orphaned_agent_runs(pool)
+        reclaimed = await asyncio.wait_for(
+            reconcile_orphaned_agent_runs(pool),
+            timeout=STARTUP_RECONCILE_TIMEOUT_SECONDS,
+        )
         if reclaimed:
             logger.error(
                 f"Reconciled {len(reclaimed)} orphaned agent run(s) on startup: {reclaimed}"
             )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Startup orphan sweep exceeded {STARTUP_RECONCILE_TIMEOUT_SECONDS}s and was "
+            "abandoned; any runs it did not reach stay 'running' and are retried on the "
+            "next cold start."
+        )
     except Exception as e:
         logger.error(f"Failed to reconcile orphaned agent runs on startup: {e}")
     yield
@@ -676,11 +698,24 @@ async def run_agent_endpoint(
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
+            # DO NOTHING, not DO UPDATE SET status = 'running' (issue #56). This runs
+            # before the background task claims the run lease, so it cannot know whether
+            # this request will be accepted. An unconditional update therefore wrote
+            # 'running' for a run whose claim was about to be refused, leaving a row the
+            # client was told was running with no executor behind it, and reset a live
+            # owner's 'paused' / 'awaiting_approval' back to 'running' on every duplicate
+            # request -- which that owner never re-reads, so nothing noticed.
+            #
+            # Creating the row is still this statement's job: the SSE stream replays
+            # agent_runs on connect, so the run has to exist before the client opens it.
+            # Status and goal transitions on an existing row belong to
+            # ReActAgent.ensure_run_record, which is the lease-aware statement and can
+            # make them only once it actually holds the lease.
             await conn.execute(
                 """
                 INSERT INTO agent_runs (run_id, goal, status, created_at)
                 VALUES ($1, $2, 'running', now())
-                ON CONFLICT (run_id) DO UPDATE SET status = 'running';
+                ON CONFLICT (run_id) DO NOTHING;
                 """,
                 uuid.UUID(run_id_str),
                 goal,

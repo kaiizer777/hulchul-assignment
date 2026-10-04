@@ -16,9 +16,11 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1851,6 +1853,83 @@ class TestStartupReconciliationHook(unittest.IsolatedAsyncioTestCase):
             cm = main_module.lifespan(main_module.app)
             await cm.__aenter__()
             await cm.__aexit__(None, None, None)
+
+    async def test_04_a_hanging_sweep_cannot_stop_the_app_from_serving(self) -> None:
+        """`except` cannot catch a hang, and this runs before `yield`.
+
+        The pool has no command_timeout and acquire() is called without one, so a
+        connection that is accepted and then never answers parks the sweep forever.
+        The comment above the hook claims a failed sweep cannot stop startup; a sweep
+        that never returns is the case that claim missed.
+        """
+        from backend import main as main_module
+
+        async def _never_returns(pool: Any) -> List[str]:
+            await asyncio.Event().wait()
+            return []  # pragma: no cover - unreachable
+
+        with patch.object(main_module, "STARTUP_RECONCILE_TIMEOUT_SECONDS", 0.05), patch.object(
+            main_module, "init_db_pool", new=_noop
+        ), patch.object(main_module, "get_db_pool", new=_noop), patch.object(
+            main_module, "reconcile_orphaned_agent_runs", new=_never_returns
+        ), patch.object(main_module, "close_db_pool", new=_noop):
+            cm = main_module.lifespan(main_module.app)
+            # Reached only if the sweep was bounded; without the ceiling this raises
+            # TimeoutError and the app never serves a request.
+            await asyncio.wait_for(cm.__aenter__(), timeout=5.0)
+            await cm.__aexit__(None, None, None)
+
+    async def test_05_a_completed_sweep_is_not_cut_short(self) -> None:
+        """The ceiling is a ceiling, not a replacement timeout for working sweeps."""
+        async def _reconcile(pool: Any) -> List[str]:
+            await asyncio.sleep(0)
+            return ["run-a"]
+
+        order = await self._run_lifespan(_reconcile, None)
+
+        self.assertIn("reconcile", order)
+
+
+class TestRunEndpointDoesNotStealRunStatus(unittest.IsolatedAsyncioTestCase):
+    """backend/main.py: the pre-dispatch upsert must not touch an existing row.
+
+    run_agent_endpoint writes agent_runs before the background task claims the lease, so
+    it cannot know whether this request will be accepted. `DO UPDATE SET status =
+    'running'` therefore stamped 'running' on a run whose claim was about to be refused,
+    and reset a live owner's 'paused' / 'awaiting_approval' back to 'running' on every
+    duplicate request -- a status that owner never re-reads.
+    """
+
+    def _endpoint_run_sql(self) -> str:
+        """The agent_runs INSERT literal inside run_agent_endpoint, comments excluded."""
+        from backend import main as main_module
+
+        source = Path(main_module.__file__).read_text(encoding="utf-8")
+        start = source.index("async def run_agent_endpoint")
+        body = source[start:source.index("\n@app.", start)]
+        # The statement is a triple-quoted literal; slicing it out keeps the
+        # surrounding explanatory comments out of the assertions. The endpoint's
+        # docstring is also a triple-quoted literal, so pick the one that is SQL.
+        sql_literals = [
+            m.group(1) for m in re.finditer(r'"""(.*?)"""', body, re.DOTALL)
+        ]
+        matches = [s for s in sql_literals if "INSERT INTO agent_runs" in s]
+        assert len(matches) == 1, (
+            f"expected exactly one agent_runs INSERT literal, found {len(matches)}"
+        )
+        return matches[0]
+
+    async def test_01_the_endpoint_upsert_never_updates_an_existing_row(self) -> None:
+        sql = self._endpoint_run_sql()
+
+        self.assertIn("ON CONFLICT (run_id) DO NOTHING", sql)
+        self.assertNotIn("DO UPDATE", sql)
+
+    async def test_02_the_endpoint_still_creates_a_missing_row(self) -> None:
+        """The insert itself is still needed: the SSE stream replays agent_runs on connect."""
+        sql = self._endpoint_run_sql()
+
+        self.assertIn("INSERT INTO agent_runs", sql)
 
 
 async def _noop(*args: Any, **kwargs: Any) -> Any:
