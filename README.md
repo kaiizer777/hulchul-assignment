@@ -5,7 +5,7 @@
 [![Backend](https://img.shields.io/badge/Backend-FastAPI%20%7C%20Python%203.12-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
 [![AWS Lambda](https://img.shields.io/badge/Backend-AWS%20Lambda%20%7C%20Terraform-FF9900?style=flat-square&logo=awslambda)](https://aws.amazon.com/lambda/)
 [![Browser](https://img.shields.io/badge/Browser-Playwright%20Remote%20CDP-2EAD33?style=flat-square&logo=playwright)](https://playwright.dev/)
-[![Database](https://img.shields.io/badge/Database-Neon%20Postgres%20%7C%20Upstash%20Redis-00E599?style=flat-square&logo=postgresql)](https://neon.tech/)
+[![Database](https://img.shields.io/badge/Database-Neon%20Postgres%20%7C%20Upstash%20Redis-005F46?style=flat-square&labelColor=1F2937&logo=postgresql)](https://neon.tech/)
 [![LLM](https://img.shields.io/badge/LLM-Groq%20(GPT--OSS--120B)-F55036?style=flat-square)](https://groq.com/)
 
 A production-grade, resilient autonomous AI browser agent engineered for enterprise ERP workflows, invoice reconciliation, and exception handling with human-in-the-loop (HITL) approval gates.
