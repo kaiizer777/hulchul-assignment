@@ -285,10 +285,12 @@ class _FakePool:
             if row.get("owner_id") is not None and row.get("owner_id") != args[2]:
                 return False
         # Fallback terminal write, no owner supplied: this request never claimed a
-        # lease, so a row held under a live lease by anyone is refused.
+        # lease, so a row held under a live lease by anyone is refused. A NULL expiry
+        # counts as refused rather than free: `lease_expires_at <= now()` against NULL
+        # evaluates to NULL, which is not true, so Postgres takes neither branch.
         if TERMINAL_UNCLAIMED_FENCE in query:
             lease = row.get("lease_expires_at")
-            if row.get("owner_id") is not None and lease is not None and lease >= _now():
+            if row.get("owner_id") is not None and (lease is None or lease >= _now()):
                 return False
         return True
 
@@ -1181,6 +1183,16 @@ class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
         The heartbeat must give up once ``lease_seconds`` has passed with no renewal
         actually landing, which is the point at which another instance's reconciliation
         or a duplicate dispatch can take the run.
+
+        The window is 0.5s against a 0.01s interval, not something tighter, because the
+        retry assertion below is only meaningful if a retry is structurally guaranteed.
+        The loop sleeps ``min(interval, remaining)``, so one scheduling stall longer than
+        the window ends the heartbeat before it can retry -- correctly, but it makes
+        "the retry must not be a no-op" a coin flip. Measured on a loaded box, a 0.05s
+        window yielded 0 or 1 renewal attempts and this test failed around a third of the
+        time; at 0.5s it yielded 2 to 21 under the same load and never failed. The
+        sibling cases already use 0.15s and 0.2s for the same reason. Nothing is relaxed:
+        the heartbeat still has to report the loss, and still has to have retried.
         """
         run_id = str(uuid.uuid4())
         pool = _FakePool(
@@ -1192,7 +1204,7 @@ class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs("backend.run_lease", level="ERROR"):
             await asyncio.wait_for(
                 run_lease_heartbeat(
-                    pool, run_id, "owner-a", 0.01, 0.05,
+                    pool, run_id, "owner-a", 0.01, 0.5,
                     on_ownership_lost=lambda: reported.append("lost"),
                 ),
                 timeout=5.0,
@@ -1824,10 +1836,11 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         self,
         row: Dict[str, Any],
         owner_id: Optional[str],
-    ) -> Tuple[Dict[str, Any], _FakeHub, List[Dict[str, Any]]]:
+        db_error: bool = False,
+    ) -> Tuple[Dict[str, Any], _FakeHub, List[Any]]:
         from backend import main as main_module
 
-        pool = _FakePool([row])
+        pool = _FakePool([row], fail_on=["UPDATE agent_runs"] if db_error else None)
         hub = _FakeHub()
 
         async def _get_pool() -> Any:
@@ -1850,8 +1863,14 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         return row, hub, redis.set_session_state.await_args_list
 
     async def test_01_a_newer_owner_is_not_overwritten(self) -> None:
-        """The whole point: a superseded execution must not stamp 'failed'."""
-        row, hub, _ = await self._mark(
+        """The whole point: a superseded execution must not stamp 'failed'.
+
+        The Redis snapshot is asserted too, not just the row and the hub.
+        set_session_state replaces the status outright, so a fenced-out write that
+        still reached it would hand a client reading the mirror exactly the status
+        the durable store just refused.
+        """
+        row, hub, redis_writes = await self._mark(
             _row(
                 status="running",
                 owner_id="owner-new",
@@ -1864,10 +1883,11 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "running")
         self.assertEqual(row["owner_id"], "owner-new")
         self.assertEqual(hub.published, [], "a fenced-out write has no status to announce")
+        self.assertEqual(redis_writes, [], "a fenced-out write must not touch the snapshot")
 
     async def test_02_a_landed_write_hands_the_lease_back(self) -> None:
         """A 'failed' row that still holds its lease refuses a retry for the full window."""
-        row, hub, _ = await self._mark(
+        row, hub, redis_writes = await self._mark(
             _row(status="running", owner_id="owner-me", lease_expires_at=_live(), attempt=1),
             owner_id="owner-me",
         )
@@ -1876,6 +1896,7 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["owner_id"])
         self.assertIsNone(row["lease_expires_at"])
         self.assertEqual([e[1]["status"] for e in hub.published], ["failed"])
+        self.assertEqual(len(redis_writes), 1, "a landed write still mirrors to Redis")
 
     async def test_03_cancelled_before_the_claim_still_records_failed(self) -> None:
         """A NULL owner is writable, or a cancellation racing the claim strands the run."""
@@ -1887,28 +1908,59 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "failed")
 
     async def test_04_no_agent_never_touches_a_live_lease(self) -> None:
-        """No agent means no claim, so this request has no standing on the row at all."""
-        row, hub, _ = await self._mark(
-            _row(
-                status="running",
-                owner_id="owner-somebody-else",
-                lease_expires_at=_live(),
-                attempt=1,
-            ),
-            owner_id=None,
-        )
+        """No agent means no claim, so this request has no standing on the row at all.
 
-        self.assertEqual(row["status"], "running")
-        self.assertEqual(hub.published, [])
+        The NULL-expiry shape is here because it is the one the SQL treats less
+        obviously: `lease_expires_at <= now()` against NULL is NULL, which is not
+        true, so Postgres refuses the row rather than reading the absent expiry as
+        "no lease". The fake has to agree or this test would pass against a guard
+        Postgres does not enforce.
+        """
+        for lease_expiry in (_live(), None):
+            with self.subTest(lease_expires_at=lease_expiry):
+                row, hub, redis_writes = await self._mark(
+                    _row(
+                        status="running",
+                        owner_id="owner-somebody-else",
+                        lease_expires_at=lease_expiry,
+                        attempt=1,
+                    ),
+                    owner_id=None,
+                )
+
+                self.assertEqual(row["status"], "running")
+                self.assertEqual(row["owner_id"], "owner-somebody-else")
+                self.assertEqual(hub.published, [])
+                self.assertEqual(redis_writes, [])
 
     async def test_05_no_agent_may_stamp_an_unowned_row(self) -> None:
         """Pre-existing behaviour, pinned: an unowned row is still ours to fail."""
-        row, _, _ = await self._mark(
+        row, _, redis_writes = await self._mark(
             _row(status="running", owner_id=None, lease_expires_at=None, attempt=0),
             owner_id=None,
         )
 
         self.assertEqual(row["status"], "failed")
+        self.assertEqual(len(redis_writes), 1)
+
+    async def test_06_a_database_error_still_reaches_redis(self) -> None:
+        """The fallback that must survive the fence: nothing is known about the row.
+
+        A database error says nothing about who owns the run, so the read model gets
+        the best information available. This is distinct from a fenced-out write, where
+        the newer owner's state is known to be correct, and it is the contract
+        test_issue29_nonblocking pins for a stalled database.
+        """
+        row, hub, redis_writes = await self._mark(
+            _row(status="running", owner_id="owner-me", lease_expires_at=_live(), attempt=1),
+            owner_id="owner-me",
+            db_error=True,
+        )
+
+        self.assertEqual(row["status"], "running", "the injected error changed no row")
+        self.assertEqual(len(redis_writes), 1)
+        self.assertEqual(redis_writes[0].args[1]["status"], "failed")
+        self.assertEqual(hub.published, [], "nothing reached the durable store to announce")
 
     # --- through _execute_agent_run_background, where the owner id has to be passed ---
 
@@ -1971,7 +2023,7 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
                 )
         return row, hub
 
-    async def test_06_an_exception_does_not_stomp_the_new_owner(self) -> None:
+    async def test_07_an_exception_does_not_stomp_the_new_owner(self) -> None:
         row, hub = await self._drive_exception_path("owner-new", "owner-old")
 
         self.assertEqual(
@@ -1982,7 +2034,7 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["owner_id"], "owner-new")
         self.assertEqual(hub.published, [])
 
-    async def test_07_an_exception_under_our_own_lease_still_fails_the_run(self) -> None:
+    async def test_08_an_exception_under_our_own_lease_still_fails_the_run(self) -> None:
         """The fence must not swallow the write it exists to allow."""
         row, hub = await self._drive_exception_path("owner-me", "owner-me")
 
@@ -1990,7 +2042,7 @@ class TestBackgroundTerminalWriteIsFenced(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["owner_id"], "a terminal row must not keep a live lease")
         self.assertEqual([e[1]["status"] for e in hub.published], ["failed"])
 
-    async def test_08_both_terminal_arms_forward_the_lease_owner(self) -> None:
+    async def test_09_both_terminal_arms_forward_the_lease_owner(self) -> None:
         """Pins the call sites, not just the helper: `None` is a silent unfenced write."""
         from backend import main as main_module
 

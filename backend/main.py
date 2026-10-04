@@ -165,6 +165,9 @@ async def _mark_agent_run_terminal(
     Redis is a separate read model and is still written best-effort.
     """
     db_updated = False
+    # Distinct from db_updated: the database could not be reached or answered, which
+    # says nothing about who owns the run, as opposed to a fence that refused the write.
+    db_errored = False
     try:
         pool = await asyncio.wait_for(get_db_pool(), TERMINAL_WRITE_IO_TIMEOUT_SECONDS)
         async with pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS) as conn:
@@ -194,17 +197,28 @@ async def _mark_agent_run_terminal(
                 "owns the run lease, so the newer owner's state stands."
             )
     except Exception as db_err:
+        db_errored = True
         logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
 
-    try:
-        from backend.redis_client import get_redis_client
-        redis = get_redis_client()
-        state = await redis.get_session_state(run_id_str)
-        if state is not None:
-            state["status"] = status
-            await redis.set_session_state(run_id_str, state)
-    except Exception as redis_err:
-        logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
+    # Only a fenced-out write is skipped. A database error still falls through to
+    # Redis: nothing is known about the durable row in that case, so the read model
+    # gets the best information available rather than none, and
+    # test_issue29_nonblocking pins that contract for a stalled database. A fenced-out
+    # write is the opposite case -- the newer owner's state is known to be correct and
+    # this execution has no claim on the run -- so writing `failed` into the shared
+    # snapshot would hand clients exactly the status the database and the hub just
+    # refused to accept. set_session_state replaces the snapshot's status outright, so
+    # the clobber is not limited to the field.
+    if db_updated or db_errored:
+        try:
+            from backend.redis_client import get_redis_client
+            redis = get_redis_client()
+            state = await redis.get_session_state(run_id_str)
+            if state is not None:
+                state["status"] = status
+                await redis.set_session_state(run_id_str, state)
+        except Exception as redis_err:
+            logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
 
     if not db_updated:
         return
