@@ -7,7 +7,6 @@ import {
   useAgentStore,
   isTerminalStatus,
   PRESET_GOALS,
-  type AgentExecutionStatus,
 } from '../store/useAgentStore';
 
 export default function AgentControlPage() {

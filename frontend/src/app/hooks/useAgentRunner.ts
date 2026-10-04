@@ -48,7 +48,7 @@ export function useAgentRunner() {
   const store = useAgentStore();
 
   useEffect(() => {
-    store.syncFromStorageOrUrl();
+    useAgentStore.getState().syncFromStorageOrUrl();
   }, []);
 
   const selectedPreset = useMemo(

@@ -429,8 +429,8 @@ export function parseStepDetails(step: StepEvent): ParsedStepInfo {
   if (isSession) {
     let summary = isSessionLost
       ? 'CDP browser session lost — attempting bounded auto-reattach'
-      : 'CDP browser connection restored successfully';
-    if (resStr) {
+      : (resStr || 'CDP browser connection restored successfully');
+    if (isSessionLost && resStr) {
       const matchAttempts = resStr.match(/after\s+(\d+)\s+reattach/i);
       if (matchAttempts) {
         summary = `CDP session lost after ${matchAttempts[1]} reattach attempt(s)`;
@@ -1203,10 +1203,11 @@ export function LiveStepExecutionLog({
                     {/* Step Title + One-Liner Executive Summary */}
                     <div className="flex flex-col sm:flex-row sm:items-center gap-0.5 sm:gap-2 min-w-0">
                       <span className="font-bold text-zinc-900 text-xs sm:text-[13px] truncate">
-                        {parsed.title}
+                        {st.action || st.type || parsed.title}
                       </span>
+                      <span className="text-zinc-400 hidden md:inline">—</span>
                       <span className="text-zinc-500 font-sans text-xs truncate max-w-md hidden md:inline">
-                        — {parsed.oneLiner}
+                        {typeof st.result === 'string' && st.result.trim() ? st.result : parsed.oneLiner}
                       </span>
                     </div>
                   </div>

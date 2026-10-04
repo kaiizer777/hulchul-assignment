@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   useAgentStore,
-  PRESET_GOALS,
   findMatchingPreset,
   isTerminalStatus,
 } from '@/app/store/useAgentStore';
