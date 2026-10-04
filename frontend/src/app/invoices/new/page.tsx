@@ -248,6 +248,10 @@ function NewInvoiceForm() {
       const file = e.target.files[0];
       processUploadedFile(file);
     }
+    // Clear the selection so the same file can be picked again after a rejection.
+    // Browsers fire no change event while the input's value is unchanged, which
+    // would otherwise make a corrected re-pick impossible.
+    e.target.value = '';
   };
 
   const processUploadedFile = (file: File) => {
