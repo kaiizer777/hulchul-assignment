@@ -69,14 +69,49 @@ class _FakeConn:
         self._pool.insert_counts[action] = self._pool.insert_counts.get(action, 0) + 1
         return step_id
 
+    async def fetchrow(self, query: str, *args: Any) -> Any:
+        """Serve the run-lease claim, which returns the row it won or nothing.
+
+        ensure_run_record claims the lease with a single upsert carrying a RETURNING
+        clause (issue #56): the atomicity of "take the lease only if nobody holds it"
+        is the whole point, so it cannot be modelled as a bare INSERT. The row comes
+        back because this connection is the first and only owner.
+        """
+        flat = " ".join(query.split())
+        if flat.startswith("INSERT INTO agent_runs"):
+            run_uuid, owner_id = args[0], args[2]
+            self._pool.owners[run_uuid] = owner_id
+            self._pool.runs[run_uuid] = "running"
+            return {
+                "run_id": run_uuid,
+                "status": "running",
+                "owner_id": owner_id,
+                "attempt": 1,
+                "lease_expires_at": datetime.now(timezone.utc),
+            }
+        raise AssertionError(f"unexpected fetchrow query: {flat}")
+
     async def execute(self, query: str, *args: Any) -> str:
         """Serve the run-status writes and screenshot attachment updates."""
         flat = " ".join(query.split())
-        if "INSERT INTO agent_runs" in flat:
-            self._pool.runs.setdefault(args[0], "running")
-            return "INSERT 1"
-        if flat.startswith("UPDATE agent_runs"):
-            self._pool.runs[args[1]] = args[0]
+        if flat.startswith("UPDATE agent_runs SET status"):
+            # Owner-scoped since #56: a write from an execution that lost the lease
+            # must not land, which is what the WHERE clause models.
+            run_uuid, owner_id = args[1], args[2]
+            if self._pool.owners.get(run_uuid) != owner_id:
+                return "UPDATE 0"
+            self._pool.runs[run_uuid] = args[0]
+            return "UPDATE 1"
+        if flat.startswith("UPDATE agent_runs SET lease_expires_at"):
+            run_uuid, owner_id = args[0], args[1]
+            return "UPDATE 1" if self._pool.owners.get(run_uuid) == owner_id else "UPDATE 0"
+        if flat.startswith("UPDATE agent_runs SET owner_id = NULL"):
+            run_uuid, owner_id = args[0], args[1]
+            if self._pool.owners.get(run_uuid) != owner_id:
+                # A stale owner's release matches no row in Postgres; reporting
+                # UPDATE 1 would let a test read a rejected release as successful.
+                return "UPDATE 0"
+            self._pool.owners[run_uuid] = None
             return "UPDATE 1"
         if flat.startswith("UPDATE agent_steps SET screenshot_b64"):
             row = self._pool.rows[args[1]]
@@ -89,6 +124,7 @@ class _FakeStepPool:
     def __init__(self) -> None:
         self.rows: Dict[uuid.UUID, Dict[str, Any]] = {}
         self.runs: Dict[uuid.UUID, str] = {}
+        self.owners: Dict[uuid.UUID, Any] = {}
         self.insert_counts: Dict[str, int] = {}
         self.conn = _FakeConn(self)
 

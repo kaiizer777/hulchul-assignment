@@ -215,7 +215,12 @@ class TestAgentDurableFrameCorrelation(unittest.IsolatedAsyncioTestCase):
             reconnect=reconnect,
             max_reattaches=max_reattaches,
         )
-        agent.ensure_run_record = AsyncMock(return_value=None)
+        # return_value=True, not None (issue #56): ensure_run_record now returns
+        # whether this execution took the run lease, and run() treats a falsy result
+        # as "another live owner holds this run_id" and returns before doing anything.
+        # Mocking it as None therefore short-circuited every run in this class, which
+        # is what made the two step_id-correlation tests below see no events at all.
+        agent.ensure_run_record = AsyncMock(return_value=True)
         agent.get_last_successful_step_index = AsyncMock(return_value=0)
         agent.persist_step = AsyncMock(side_effect=fake_persist_step)
         agent.update_run_status = AsyncMock(return_value=None)

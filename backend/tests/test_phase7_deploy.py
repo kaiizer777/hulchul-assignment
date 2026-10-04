@@ -196,6 +196,8 @@ def test_backend_env_example_keys() -> None:
         "UPSTASH_REDIS_REST_TOKEN",
         "PORT",
         "CORS_ORIGINS",
+        "RUN_LEASE_SECONDS",
+        "RUN_HEARTBEAT_SECONDS",
     ]
     for key in required_keys:
         assert key in content, f"backend/.env.example must document {key}"
