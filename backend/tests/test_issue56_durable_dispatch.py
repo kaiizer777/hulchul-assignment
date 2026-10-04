@@ -1931,6 +1931,29 @@ class TestRunEndpointDoesNotStealRunStatus(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("INSERT INTO agent_runs", sql)
 
+    async def test_03_the_redis_seed_is_gated_on_the_row_actually_being_created(self) -> None:
+        """set_session_state is a plain SET, so it must not run for an existing row.
+
+        Seeding unconditionally replaced a live run's whole snapshot -- status back to
+        'running' and step index back to 0 -- on every duplicate request, from any
+        process, while the Postgres row the agent and the SSE poll read kept its real
+        status.
+        """
+        from backend import main as main_module
+
+        source = Path(main_module.__file__).read_text(encoding="utf-8")
+        start = source.index("async def run_agent_endpoint")
+        body = source[start:source.index("\n@app.", start)]
+
+        # Anchor on the call, not the bare name: the explanatory comment above it
+        # also says set_session_state, which would match first.
+        seed_at = body.index("await redis.set_session_state(")
+        self.assertIn(
+            "if affected_rows(insert_tag) > 0:",
+            body[:seed_at],
+            "the Redis seed is not gated on this request having created the row",
+        )
+
 
 async def _noop(*args: Any, **kwargs: Any) -> Any:
     return None

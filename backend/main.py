@@ -15,7 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
-from backend.run_lease import reconcile_orphaned_agent_runs
+from backend.run_lease import affected_rows, reconcile_orphaned_agent_runs
 from backend.verification import VerificationReport, generate_verification_report
 from backend.auth import (
     AUTH_UNAVAILABLE_DETAIL,
@@ -711,7 +711,13 @@ async def run_agent_endpoint(
             # Status and goal transitions on an existing row belong to
             # ReActAgent.ensure_run_record, which is the lease-aware statement and can
             # make them only once it actually holds the lease.
-            await conn.execute(
+            #
+            # RETURNING is not needed to tell the two outcomes apart: with DO NOTHING the
+            # command tag already carries it -- "INSERT 0 1" when this request created
+            # the row, "INSERT 0 0" when it already existed. execute() rather than
+            # fetchval() keeps this a single round trip and leaves the statement's shape
+            # unchanged for anything asserting on it.
+            insert_tag = await conn.execute(
                 """
                 INSERT INTO agent_runs (run_id, goal, status, created_at)
                 VALUES ($1, $2, 'running', now())
@@ -721,21 +727,28 @@ async def run_agent_endpoint(
                 goal,
             )
 
-        try:
-            from backend.redis_client import get_redis_client
-            redis = get_redis_client()
-            await redis.set_session_state(
-                run_id_str,
-                {
-                    "run_id": run_id_str,
-                    "goal": goal,
-                    "threshold": threshold,
-                    "current_step": 0,
-                    "status": "running",
-                },
-            )
-        except Exception as redis_err:
-            logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
+        # Only for a row this request actually created. set_session_state is a plain
+        # SET, so it replaces the whole snapshot: seeding it unconditionally would
+        # rewrite a live run's 'paused' / 'awaiting_approval' state and its step index
+        # back to running/0 on every duplicate request, from any process, while the
+        # Postgres row -- which the agent and the SSE poll both read -- correctly kept
+        # its status. run() seeds the snapshot itself once it holds the lease.
+        if affected_rows(insert_tag) > 0:
+            try:
+                from backend.redis_client import get_redis_client
+                redis = get_redis_client()
+                await redis.set_session_state(
+                    run_id_str,
+                    {
+                        "run_id": run_id_str,
+                        "goal": goal,
+                        "threshold": threshold,
+                        "current_step": 0,
+                        "status": "running",
+                    },
+                )
+            except Exception as redis_err:
+                logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
 
         task = asyncio.create_task(_execute_agent_run_background(run_id_str, goal))
         _active_agent_tasks[run_id_str] = task
