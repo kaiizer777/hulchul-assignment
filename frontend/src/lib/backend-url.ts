@@ -38,10 +38,22 @@ const LOCAL_HOSTNAMES = ['localhost', '127.0.0.1'];
  * bug. Preferring the production default means a bundle built without the
  * variable still reaches the real backend.
  */
+const isLocalUrl = (url: string): boolean => {
+  try {
+    const parsed = new URL(url);
+    return LOCAL_HOSTNAMES.includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+};
+
 export const getBackendUrl = (): string => {
-  const configured = process.env.NEXT_PUBLIC_BACKEND_URL;
+  const configured = process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, '');
   if (configured) {
-    return configured.replace(/\/$/, '');
+    if (process.env.NODE_ENV === 'production' && isLocalUrl(configured)) {
+      return PRODUCTION_BACKEND_URL.replace(/\/+$/, '');
+    }
+    return configured;
   }
   if (typeof window !== 'undefined' && LOCAL_HOSTNAMES.includes(window.location.hostname)) {
     return LOCAL_BACKEND_URL;
@@ -49,5 +61,6 @@ export const getBackendUrl = (): string => {
   if (process.env.NODE_ENV !== 'production') {
     return LOCAL_BACKEND_URL;
   }
-  return PRODUCTION_BACKEND_URL;
+  return PRODUCTION_BACKEND_URL.replace(/\/+$/, '');
 };
+

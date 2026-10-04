@@ -33,7 +33,8 @@ const RETURN_TO_BASE = 'https://return-to.invalid';
  */
 export const resolveReturnTo = (candidate: string | null | undefined): string => {
   if (typeof candidate !== 'string') return DEFAULT_RETURN_TO;
-  if (candidate !== '/' && !SAFE_RETURN_TO_PATTERN.test(candidate)) return DEFAULT_RETURN_TO;
+  if (candidate === '/') return DEFAULT_RETURN_TO;
+  if (!SAFE_RETURN_TO_PATTERN.test(candidate)) return DEFAULT_RETURN_TO;
 
   try {
     const resolved = new URL(candidate, RETURN_TO_BASE);

@@ -17,18 +17,18 @@ export interface GoalPreset {
 
 export const PRESET_GOALS: GoalPreset[] = [
   {
-    id: 'all_pending',
-    label: 'All Pending Invoices',
-    goal: 'Process all pending invoices',
-    description: 'Scan and process all pending invoices in queue',
-    badge: 'Default',
-  },
-  {
     id: 'vendor_acme',
     label: 'Vendor: Acme Corp',
     goal: 'Process only invoices from Vendor Acme',
     description: 'Filter and process only invoices from Vendor Acme',
     badge: 'Vendor Filter',
+  },
+  {
+    id: 'all_pending',
+    label: 'All Pending Invoices',
+    goal: 'Process all pending invoices',
+    description: 'Scan and process all pending invoices in queue',
+    badge: 'Default',
   },
   {
     id: 'approval_threshold',
@@ -337,8 +337,8 @@ export const useAgentStore = create<AgentStoreState>()(
   persist(
     (set, get) => ({
       // Default Persisted State
-      goal: 'Process all pending invoices',
-      selectedPresetId: 'all_pending',
+      goal: 'Process only invoices from Vendor Acme',
+      selectedPresetId: 'vendor_acme',
       autoScroll: true,
 
       // Runtime In-Memory State

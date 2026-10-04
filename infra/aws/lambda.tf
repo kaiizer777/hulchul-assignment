@@ -18,10 +18,15 @@ resource "aws_lambda_function" "backend" {
       AWS_LWA_INVOKE_MODE        = "response_stream"
       DATABASE_URL               = var.database_url
       GROQ_API_KEY               = var.groq_api_key
+      OPENCODE_API_KEY           = var.opencode_api_key
+      OPENCODE_BASE_URL          = var.opencode_base_url
+      OPENCODE_MODEL             = var.opencode_model
       UPSTASH_REDIS_REST_URL     = var.upstash_redis_rest_url
       UPSTASH_REDIS_REST_TOKEN   = var.upstash_redis_rest_token
       BROWSER_WS_ENDPOINT        = var.browser_ws_endpoint
       AUTH_PASSWORD_HASH         = var.auth_password_hash
+      ERP_BASE_URL               = var.erp_base_url
+      FRONTEND_URL               = var.frontend_url
       NEXT_PUBLIC_API_URL        = var.frontend_url
       CORS_ORIGINS               = var.cors_origins
     }

@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { NextResponse } from 'next/server';
 
 /**
@@ -79,12 +78,14 @@ export function getSessionToken(request: Request): string | null {
 
 /**
  * Lowercase hex SHA-256 of a raw token, matching the digest the backend stores
- * the Redis key under (§1). `crypto.subtle` is deliberately avoided: it yields
- * an ArrayBuffer that would need encoding back to hex, for no benefit on a path
- * that runs once per authenticated request.
+ * the Redis key under (§1). Uses standard Web Crypto (crypto.subtle) for
+ * edge and runtime portability.
  */
 export async function hashSessionToken(token: string): Promise<string> {
-  return createHash('sha256').update(token, 'utf8').digest('hex');
+  const msgUint8 = new TextEncoder().encode(token);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**

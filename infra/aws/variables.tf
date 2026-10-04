@@ -43,3 +43,24 @@ variable "image_tag" {
   default = "latest"
 }
 
+variable "opencode_api_key" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
+variable "opencode_base_url" {
+  type    = string
+  default = "https://opencode.ai/zen/v1"
+}
+
+variable "opencode_model" {
+  type    = string
+  default = "space-bunny-free"
+}
+
+variable "erp_base_url" {
+  type    = string
+  default = "https://hulchul-frontend.sufiyanx.workers.dev"
+}
+

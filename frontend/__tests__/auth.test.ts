@@ -611,7 +611,7 @@ describe('login returnTo open-redirect guard', () => {
 
   it.each([
     ['/agent', '/agent'],
-    ['/', '/'],
+    ['/', '/agent'],
     ['/agent/runs/run-1234', '/agent/runs/run-1234'],
     ['/invoices?status=pending', '/invoices?status=pending'],
   ])('accepts %s', (candidate, expected) => {

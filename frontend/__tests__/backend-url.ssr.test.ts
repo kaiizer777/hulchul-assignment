@@ -45,4 +45,15 @@ describe('getBackendUrl during server rendering', () => {
     process.env[ENV_KEY] = 'https://backend.example.com/';
     expect(getBackendUrl()).toBe('https://backend.example.com');
   });
+
+  it('rejects localhost and falls back to production backend in production', () => {
+    process.env[ENV_KEY] = 'http://localhost:8051///';
+    vi.stubEnv('NODE_ENV', 'production');
+    expect(getBackendUrl()).toBe(PRODUCTION_BACKEND_URL);
+  });
+
+  it('strips multiple trailing slashes', () => {
+    process.env[ENV_KEY] = 'https://custom-backend.example.com///';
+    expect(getBackendUrl()).toBe('https://custom-backend.example.com');
+  });
 });

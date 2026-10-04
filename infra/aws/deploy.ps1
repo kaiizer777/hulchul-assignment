@@ -160,10 +160,14 @@ else:
 $tfvarsObj = @{
     database_url             = $envDict["database_url"]
     groq_api_key             = $envDict["groq_api_key"]
+    opencode_api_key         = if ($envDict.ContainsKey("opencode_api_key")) { $envDict["opencode_api_key"] } else { "" }
+    opencode_base_url        = if ($envDict.ContainsKey("opencode_base_url")) { $envDict["opencode_base_url"] } else { "https://opencode.ai/zen/v1" }
+    opencode_model           = if ($envDict.ContainsKey("opencode_model")) { $envDict["opencode_model"] } else { "space-bunny-free" }
     upstash_redis_rest_url   = $envDict["upstash_redis_rest_url"]
     upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
     browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
     auth_password_hash       = $envDict["auth_password_hash"]
+    erp_base_url             = $frontendUrl
     frontend_url             = $frontendUrl
     cors_origins             = $corsOrigins
 }
@@ -192,11 +196,8 @@ if ([string]::IsNullOrWhiteSpace($ecrDomain)) {
 }
 
 Write-Host "Logging into AWS ECR..." -ForegroundColor Cyan
-$pass = aws ecr get-login-password --region us-east-1
-if ($LASTEXITCODE -ne 0) { throw "aws ecr get-login-password failed with exit code $LASTEXITCODE" }
-
 $registryHost = $ecrDomain.Split('/')[0]
-$pass | docker login --username AWS --password-stdin $registryHost
+cmd.exe /c "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $registryHost"
 if ($LASTEXITCODE -ne 0) { throw "docker login failed with exit code $LASTEXITCODE" }
 
 $imageTag = (Get-Date -Format "yyyyMMddHHmmss")

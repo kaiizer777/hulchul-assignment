@@ -10,8 +10,8 @@ describe('useAgentStore (Zustand with persist)', () => {
     // Reset store state before each test
     useAgentStore.getState().resetRun();
     useAgentStore.setState({
-      goal: 'Process all pending invoices',
-      selectedPresetId: 'all_pending',
+      goal: 'Process only invoices from Vendor Acme',
+      selectedPresetId: 'vendor_acme',
       autoScroll: true,
       status: 'idle',
       connectionState: 'disconnected',
@@ -29,19 +29,19 @@ describe('useAgentStore (Zustand with persist)', () => {
 
   it('initializes with default goal and preset', () => {
     const state = useAgentStore.getState();
-    expect(state.goal).toBe('Process all pending invoices');
-    expect(state.selectedPresetId).toBe('all_pending');
+    expect(state.goal).toBe('Process only invoices from Vendor Acme');
+    expect(state.selectedPresetId).toBe('vendor_acme');
     expect(state.autoScroll).toBe(true);
     expect(state.status).toBe('idle');
   });
 
   it('selects preset correctly and updates goal and preset ID', () => {
     const { selectPreset } = useAgentStore.getState();
-    selectPreset('vendor_acme');
+    selectPreset('all_pending');
 
     const state = useAgentStore.getState();
-    expect(state.selectedPresetId).toBe('vendor_acme');
-    expect(state.goal).toBe('Process only invoices from Vendor Acme');
+    expect(state.selectedPresetId).toBe('all_pending');
+    expect(state.goal).toBe('Process all pending invoices');
   });
 
   it('sets custom goal and matches preset if text aligns', () => {
