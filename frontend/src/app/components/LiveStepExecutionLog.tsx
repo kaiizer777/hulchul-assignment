@@ -561,7 +561,7 @@ export function LiveStepExecutionLog({
 }: LiveStepExecutionLogProps) {
   const [filterCategory, setFilterCategory] = useState<StepCategory>('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [expandedStepIds, setExpandedStepIds] = useState<Record<string, boolean>>({});
+  const [expandedStepIds, setExpandedStepIds] = useState<Set<string>>(new Set());
   const [inspectorOpenMap, setInspectorOpenMap] = useState<Record<string, boolean>>({});
   const [copiedStepId, setCopiedStepId] = useState<string | null>(null);
   const [copiedPayloadId, setCopiedPayloadId] = useState<string | null>(null);
@@ -687,10 +687,15 @@ export function LiveStepExecutionLog({
 
   // Toggle single step expansion
   const toggleStep = (key: string) => {
-    setExpandedStepIds((prev) => ({
-      ...prev,
-      [key]: prev[key] === undefined ? false : !prev[key],
-    }));
+    setExpandedStepIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
   };
 
   // Toggle single step payload inspector
@@ -704,21 +709,24 @@ export function LiveStepExecutionLog({
 
   // Check if all current steps are expanded
   const areAllExpanded = useMemo(() => {
-    if (steps.length === 0) return true;
+    if (steps.length === 0) return false;
     return steps.every((st, idx) => {
       const key = st.step_id || `step-${idx}`;
-      return expandedStepIds[key] !== false;
+      return expandedStepIds.has(key);
     });
   }, [steps, expandedStepIds]);
 
   const toggleAllSteps = () => {
-    const nextState = !areAllExpanded;
-    const updated: Record<string, boolean> = {};
-    steps.forEach((st, idx) => {
-      const key = st.step_id || `step-${idx}`;
-      updated[key] = nextState;
-    });
-    setExpandedStepIds(updated);
+    if (areAllExpanded) {
+      setExpandedStepIds(new Set());
+    } else {
+      const allKeys = new Set<string>();
+      steps.forEach((st, idx) => {
+        const key = st.step_id || `step-${idx}`;
+        allKeys.add(key);
+      });
+      setExpandedStepIds(allKeys);
+    }
   };
 
   // Copy single step summary + payload
@@ -1109,7 +1117,7 @@ export function LiveStepExecutionLog({
           </div>
         ) : (
           filteredSteps.map(({ step: st, stepKey, stepNum, parsed, timeFormatted }, idx) => {
-            const isExpanded = expandedStepIds[stepKey] !== false;
+            const isExpanded = expandedStepIds.has(stepKey);
             const isInspectorOpen = Boolean(inspectorOpenMap[stepKey]);
 
             // Status Styling
