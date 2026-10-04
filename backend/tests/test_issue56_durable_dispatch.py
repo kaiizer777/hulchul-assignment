@@ -25,7 +25,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.agent import ReActAgent
+from backend.auth import Session
+from backend.auth import require_session as _require_session_dep
 from backend.config import settings, validate_run_lease_settings
+from httpx import ASGITransport, AsyncClient
 from backend.run_lease import (
     ACTIVE_RUN_STATUSES,
     ORPHANED_RUN_STATUS,
@@ -1938,21 +1941,65 @@ class TestRunEndpointDoesNotStealRunStatus(unittest.IsolatedAsyncioTestCase):
         'running' and step index back to 0 -- on every duplicate request, from any
         process, while the Postgres row the agent and the SSE poll read kept its real
         status.
+
+        Driven through the endpoint for both command tags rather than asserted on the
+        source: 'INSERT 0 0' is what a duplicate request gets, and only 'INSERT 0 1'
+        means this request created the row.
         """
         from backend import main as main_module
 
-        source = Path(main_module.__file__).read_text(encoding="utf-8")
-        start = source.index("async def run_agent_endpoint")
-        body = source[start:source.index("\n@app.", start)]
+        for tag, expect_seeded in (("INSERT 0 1", True), ("INSERT 0 0", False)):
+            with self.subTest(command_tag=tag):
+                mock_conn = AsyncMock()
+                mock_conn.execute.return_value = tag
+                cm = AsyncMock()
+                cm.__aenter__.return_value = mock_conn
+                cm.__aexit__.return_value = False
+                pool = MagicMock()
+                pool.acquire.return_value = cm
 
-        # Anchor on the call, not the bare name: the explanatory comment above it
-        # also says set_session_state, which would match first.
-        seed_at = body.index("await redis.set_session_state(")
-        self.assertIn(
-            "if affected_rows(insert_tag) > 0:",
-            body[:seed_at],
-            "the Redis seed is not gated on this request having created the row",
-        )
+                async def _get_pool() -> MagicMock:
+                    return pool
+
+                mock_redis = AsyncMock()
+                mock_redis.set_session_state.return_value = True
+
+                async def _background(run_id_str: str, goal: str) -> None:
+                    return None
+
+                main_module.app.dependency_overrides[_require_session_dep] = (
+                    _operator_session
+                )
+                try:
+                    with patch.object(main_module, "get_db_pool", new=_get_pool), patch(
+                        "backend.redis_client.get_redis_client", return_value=mock_redis
+                    ), patch.object(
+                        main_module, "_execute_agent_run_background", new=_background
+                    ):
+                        transport = ASGITransport(app=main_module.app)
+                        async with AsyncClient(
+                            transport=transport, base_url="http://test"
+                        ) as ac:
+                            resp = await ac.post(
+                                "/agent/run",
+                                json={"goal": "Process all pending invoices"},
+                            )
+                finally:
+                    main_module.app.dependency_overrides.pop(_require_session_dep, None)
+                    main_module._reserved_agent_runs.clear()
+                    main_module._active_agent_tasks.clear()
+
+                self.assertEqual(resp.status_code, 202)
+                self.assertEqual(
+                    mock_redis.set_session_state.await_count > 0,
+                    expect_seeded,
+                    f"{tag} should {'seed' if expect_seeded else 'not seed'} the snapshot",
+                )
+
+
+async def _operator_session() -> Session:
+    """Bypass the auth guard: the endpoint's behaviour here is not about sessions."""
+    return Session(sub="operator", exp=9999999999)
 
 
 async def _noop(*args: Any, **kwargs: Any) -> Any:
