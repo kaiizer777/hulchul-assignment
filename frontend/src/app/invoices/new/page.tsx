@@ -21,22 +21,18 @@ interface UploadedFilePreview {
   lastModified: number;
 }
 
-const DEFAULT_LINE_ITEMS: LineItem[] = [
-  {
-    id: 'item-1',
-    description: 'Cloud Infrastructure & API Hosting Services',
-    quantity: 1,
-    unitPrice: 1250.0,
-    taxRate: 0,
-  },
-  {
-    id: 'item-2',
-    description: 'Enterprise Security Compliance Audit',
-    quantity: 1,
-    unitPrice: 3200.0,
-    taxRate: 8.5,
-  },
-];
+// A fresh form must not arrive pre-loaded with invented invoice data: seeded
+// line items plus a derived amount let a user post a fabricated payable to the
+// first registered vendor without typing anything. The grid therefore opens on
+// a single empty row, which totals 0.00 and fails the positive-amount check in
+// handleSubmit until real invoice data is supplied.
+const BLANK_LINE_ITEM: LineItem = {
+  id: 'item-1',
+  description: '',
+  quantity: 1,
+  unitPrice: 0,
+  taxRate: 0,
+};
 
 function formatCurrency(amount: number): string {
   return new Intl.NumberFormat('en-US', {
@@ -69,14 +65,14 @@ function NewInvoiceForm() {
   const [vendor, setVendor] = useState('');
   const [customVendor, setCustomVendor] = useState('');
   const [isCustomVendor, setIsCustomVendor] = useState(false);
-  const [amount, setAmount] = useState('4722.00');
+  const [amount, setAmount] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [poNumber, setPoNumber] = useState('');
   const [invoiceReference, setInvoiceReference] = useState(() => `INV-${Math.floor(100000 + Math.random() * 900000)}`);
   const [paymentTerms, setPaymentTerms] = useState('net30');
 
   // Line Items calculation engine
-  const [lineItems, setLineItems] = useState<LineItem[]>(DEFAULT_LINE_ITEMS);
+  const [lineItems, setLineItems] = useState<LineItem[]>([BLANK_LINE_ITEM]);
   const [isManualAmountOverride, setIsManualAmountOverride] = useState(false);
 
   // File dropzone states
@@ -159,7 +155,9 @@ function NewInvoiceForm() {
     };
   }, [lineItems]);
 
-  // Synchronize amount when line items change unless manually overridden
+  // Synchronize amount when line items change unless manually overridden.
+  // A zero estimate is mirrored through deliberately: it is what keeps a freshly
+  // opened form (blank grid) from ever satisfying the positive-amount check.
   useEffect(() => {
     if (!isManualAmountOverride) {
       setAmount(totals.total.toFixed(2));
