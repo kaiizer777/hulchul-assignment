@@ -296,11 +296,29 @@ async def run_lease_heartbeat(
     longer prove it holds -- which is the correct direction to be wrong in, since a
     premature stop leaves a resumable run while an unfenced run duplicates invoices.
 
+    The window also bounds the *await*, not only the retry count, and that is the part
+    a deadline checked after the fact cannot cover. The pool is built without an asyncpg
+    ``command_timeout`` and ``pool.acquire()`` is called without a timeout
+    (``backend/db.py``), so a connection that is accepted and then never answers parks
+    ``await renew_run_lease(...)`` indefinitely: the heartbeat cannot reach its own
+    deadline check, cannot report the loss, and the superseded run keeps driving the
+    browser while its lease sits expired and claimable. Each attempt is therefore
+    wrapped in ``asyncio.wait_for`` with the time remaining in the window as its
+    timeout, the inter-renewal sleep is capped by the same remainder so the heartbeat
+    never sleeps past the point where it could still renew, and the deadline is
+    re-checked before each attempt rather than only on the failure path.
+
+    ``last_renewed_at`` is stamped with the *start* of the attempt that landed, not its
+    completion. The expiry the database wrote was computed by ``now()`` when the UPDATE
+    ran, which is at or after the attempt began, so starting the clock early can only
+    under-estimate how long this execution is still the owner -- the safe direction,
+    and the same one the monotonic clock is chosen for.
+
     Losing the lease is reported through ``on_ownership_lost`` before the heartbeat
-    returns, on either path: a renewal that matches zero rows (the run was reclaimed,
-    or a newer execution claimed it) or a renewal that could not be completed inside
-    the window. Stopping silently is not enough -- the owner-scoped fence in
-    ``ReActAgent.update_run_status`` only drops a status write, it does not stop
+    returns, on any of three paths: a renewal that matches zero rows (the run was
+    reclaimed, or a newer execution claimed it), a renewal that raised, or one that did
+    not complete inside the window. Stopping silently is not enough -- the owner-scoped
+    fence in ``ReActAgent.update_run_status`` only drops a status write, it does not stop
     ``tools.execute``, step persistence, Redis writes or the ``done`` event, so the
     loop has to be told to unwind. The callback is invoked at most once and its own
     failure is logged rather than raised: the heartbeat is already returning.
@@ -321,6 +339,17 @@ async def run_lease_heartbeat(
     loop = asyncio.get_event_loop()
     last_renewed_at = loop.time()
 
+    def _remaining_window() -> float:
+        """Seconds left in which this execution can still prove it owns the run."""
+        return lease_seconds - (loop.time() - last_renewed_at)
+
+    def _report_window_exhausted() -> None:
+        logger.error(
+            f"Run lease for {run_id} could not be renewed within its {lease_seconds}s "
+            "window; treating ownership as lost."
+        )
+        _report_ownership_lost()
+
     try:
         while True:
             if owner_task is not None and owner_task.done():
@@ -328,25 +357,43 @@ async def run_lease_heartbeat(
                     f"Run lease heartbeat for {run_id} stopping: owner task finished."
                 )
                 return
-            await asyncio.sleep(interval_seconds)
+            remaining = _remaining_window()
+            if remaining <= 0.0:
+                _report_window_exhausted()
+                return
+            # Capped by the window: sleeping the full interval past the point where
+            # the lease can no longer be renewed would mean sitting on an
+            # unrenewable lease instead of finding out.
+            await asyncio.sleep(min(interval_seconds, remaining))
             if owner_task is not None and owner_task.done():
                 logger.info(
                     f"Run lease heartbeat for {run_id} stopping: owner task finished."
                 )
                 return
+            remaining = _remaining_window()
+            if remaining <= 0.0:
+                _report_window_exhausted()
+                return
+            attempt_started = loop.time()
             try:
-                renewed = await renew_run_lease(pool, run_id, owner_id, lease_seconds)
+                renewed = await asyncio.wait_for(
+                    renew_run_lease(pool, run_id, owner_id, lease_seconds),
+                    timeout=remaining,
+                )
             except asyncio.CancelledError:
                 raise
+            except asyncio.TimeoutError:
+                # The attempt is still parked on a connection that never answered.
+                # wait_for has cancelled it, so this heartbeat can unwind and stop
+                # the run rather than sitting here past its own expiry.
+                logger.error(
+                    f"Run lease renewal for {run_id} did not complete inside its "
+                    f"{lease_seconds}s window; treating ownership as lost."
+                )
+                _report_ownership_lost()
+                return
             except Exception as e:
                 logger.warning(f"Run lease heartbeat renewal failed for {run_id}: {e}")
-                if loop.time() - last_renewed_at >= lease_seconds:
-                    logger.error(
-                        f"Run lease for {run_id} could not be renewed within its "
-                        f"{lease_seconds}s window; treating ownership as lost."
-                    )
-                    _report_ownership_lost()
-                    return
                 continue
             if not renewed:
                 logger.error(
@@ -354,7 +401,7 @@ async def run_lease_heartbeat(
                 )
                 _report_ownership_lost()
                 return
-            last_renewed_at = loop.time()
+            last_renewed_at = attempt_started
     except asyncio.CancelledError:
         logger.info(f"Run lease heartbeat for {run_id} cancelled.")
         raise

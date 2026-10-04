@@ -1330,9 +1330,13 @@ class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
         reported: List[str] = []
         real_renew = renew_run_lease
         state = {"n": 0, "failing": False}
-        # 8 renewals at a 10ms interval is comfortably more than one 200ms window,
-        # so the clock has to be reset per renewal for this to pass.
-        healthy_needed = 8
+        # The healthy phase has to outlast a whole window on its own, or this test
+        # cannot tell a per-renewal clock reset from a single seed at startup: 8
+        # renewals at a 10ms interval is 80ms, well inside the 200ms window, so the
+        # failures below would still land before the deadline even if the clock were
+        # never reset. 40 renewals is ~400ms, twice the window, which fails if the
+        # reset is removed and still finishes far inside the 5s bound.
+        healthy_needed = 40
         failures_needed = 3
 
         async def _fail_after_healthy(*args: Any, **kwargs: Any) -> bool:
@@ -1369,6 +1373,94 @@ class TestHeartbeatReportsOwnershipLoss(unittest.IsolatedAsyncioTestCase):
                     await task
 
         self.assertEqual(reported, [])
+
+    async def test_09_a_stalled_renewal_is_bounded_and_reports_the_loss(self) -> None:
+        """A renewal parked on a connection that never answers must still time out.
+
+        The pool is built without an asyncpg command_timeout and acquire() is called
+        without one, so ``renew_run_lease`` can hang indefinitely. A deadline checked
+        only after the await returns is never reached in that case: the heartbeat
+        cannot report the loss, and the superseded run keeps driving the browser while
+        its lease sits expired and claimable by a duplicate request.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)]
+        )
+        reported: List[str] = []
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def _stalls_forever(*args: Any, **kwargs: Any) -> bool:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return True  # pragma: no cover - unreachable
+
+        with patch("backend.run_lease.renew_run_lease", new=_stalls_forever):
+            with self.assertLogs("backend.run_lease", level="ERROR"):
+                # lease_seconds is the whole bound: the heartbeat must be gone well
+                # inside the 5s ceiling, and gone because the attempt was cancelled
+                # rather than because the stub returned.
+                await asyncio.wait_for(
+                    run_lease_heartbeat(
+                        pool, run_id, "owner-a", 0.01, 0.15,
+                        on_ownership_lost=lambda: reported.append("lost"),
+                    ),
+                    timeout=5.0,
+                )
+
+        self.assertTrue(entered.is_set(), "the stalled attempt was never reached")
+        self.assertTrue(cancelled.is_set(), "the parked attempt must be cancelled, not abandoned")
+        self.assertEqual(reported, ["lost"])
+
+    async def test_10_the_sleep_never_outlasts_the_renewable_window(self) -> None:
+        """The interval is capped by the window, so no sleep sits past the expiry.
+
+        With a plain ``asyncio.sleep(interval_seconds)`` and an interval longer than
+        the lease, the first sleep alone would carry the heartbeat well past its own
+        expiry before it ever attempted a renewal.
+
+        validate_run_lease_settings rejects this configuration outright, so what is
+        pinned here is the defensive behaviour rather than a supported setting: the
+        capped sleep consumes the window, no time is left to renew in, and the
+        heartbeat reports the loss promptly instead of sleeping out the interval.
+        """
+        run_id = str(uuid.uuid4())
+        pool = _FakePool(
+            [_row(status="running", owner_id="owner-a", lease_expires_at=_live(), run_id=run_id)]
+        )
+        reported: List[str] = []
+        calls = {"n": 0}
+
+        async def _always_refused(*args: Any, **kwargs: Any) -> bool:
+            calls["n"] += 1
+            return False
+
+        interval_seconds = 10.0
+        lease_seconds = 0.15
+        started = asyncio.get_event_loop().time()
+        with patch("backend.run_lease.renew_run_lease", new=_always_refused):
+            with self.assertLogs("backend.run_lease", level="ERROR"):
+                await asyncio.wait_for(
+                    run_lease_heartbeat(
+                        pool, run_id, "owner-a", interval_seconds, lease_seconds,
+                        on_ownership_lost=lambda: reported.append("lost"),
+                    ),
+                    timeout=5.0,
+                )
+        elapsed = asyncio.get_event_loop().time() - started
+
+        self.assertEqual(calls["n"], 0, "the capped sleep leaves no window to renew in")
+        self.assertEqual(reported, ["lost"])
+        self.assertLess(
+            elapsed,
+            interval_seconds / 2,
+            "the heartbeat slept the full interval instead of the remaining window",
+        )
 
 
 class _LoopHarness:
