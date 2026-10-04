@@ -1154,6 +1154,19 @@ def _status_change_frame(run_id_str: str, status: str, timestamp: str) -> Dict[s
     }
 
 
+def _done_frame(run_id_str: str, status: str = "completed") -> Dict[str, Any]:
+    """Build the SSE terminal 'done' frame."""
+    return {
+        "event": "done",
+        "data": json.dumps({
+            "type": "done",
+            "run_id": run_id_str,
+            "status": status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }),
+    }
+
+
 def _step_row_to_frame(run_id_str: str, row: Any, step_index: int) -> Dict[str, Any]:
     """Map a persisted agent_steps row to its SSE frame.
 
@@ -1220,6 +1233,7 @@ async def stream_agent_run_endpoint(
         # depending on the frontend's dedupe. Bounded by the run's own step
         # count, which the agent's iteration cap bounds.
         emitted_step_ids: Set[str] = set()
+        emitted_done: bool = False
         # (timestamp, step_id) of the newest step delivered so far. Seeded by the
         # replay so the poll resumes strictly after it; the row comparison in
         # _SSE_STEPS_AFTER_CURSOR_SQL keeps rows sharing a timestamp from being
@@ -1250,6 +1264,10 @@ async def stream_agent_run_endpoint(
                         step_cursor = (r["timestamp"], r["step_id"])
                         yield _step_row_to_frame(run_id_str, r, next_step_index)
                         next_step_index += 1
+
+                    if run_row and run_row["status"] in ("completed", "done"):
+                        yield _done_frame(run_id_str, last_status or "completed")
+                        emitted_done = True
             except Exception as db_err:
                 # Falling through to the live loop keeps buffered events flowing
                 # instead of leaving them stranded in the queue.
@@ -1261,7 +1279,7 @@ async def stream_agent_run_endpoint(
                 Reads through the same cursor the replay and the live path advance,
                 so neither of them can produce a duplicate delivery.
                 """
-                nonlocal step_cursor, last_status, next_step_index
+                nonlocal step_cursor, last_status, next_step_index, emitted_done
                 frames: List[Dict[str, Any]] = []
                 pool = await get_db_pool()
                 async with pool.acquire() as conn:
@@ -1316,6 +1334,9 @@ async def stream_agent_run_endpoint(
                     emitted_step_ids.add(step_id)
                     frames.append(_step_row_to_frame(run_id_str, r, next_step_index))
                     next_step_index += 1
+                if status in ("completed", "done") and not emitted_done:
+                    frames.append(_done_frame(run_id_str, status))
+                    emitted_done = True
                 return frames
 
             # 2. Live hub delivery plus durable-state reconciliation. The hub is
@@ -1357,6 +1378,10 @@ async def stream_agent_run_endpoint(
                         next_step_index += 1
                     if event_type == "status_change" and event.get("status"):
                         last_status = event["status"]
+                    if event_type == "done":
+                        if emitted_done:
+                            continue
+                        emitted_done = True
                     yield {
                         "event": event_type,
                         "data": json.dumps(event)
