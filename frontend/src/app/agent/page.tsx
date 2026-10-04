@@ -2,12 +2,33 @@
 
 import React, { useState, useEffect } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
-import { LiveStepExecutionLog } from '../components/LiveStepExecutionLog';
+import { LiveStepExecutionLog, requestScrollToStep } from '../components/LiveStepExecutionLog';
 import {
   useAgentStore,
   isTerminalStatus,
   PRESET_GOALS,
 } from '../store/useAgentStore';
+
+const TERMINAL_FAILURE_COPY: Record<
+  'failed' | 'stalled' | 'session_lost',
+  { banner: string; message: string }
+> = {
+  failed: {
+    banner: 'border-red-200 bg-red-50/90 text-red-800',
+    message:
+      'Run failed: the agent stopped with an error. Review the steps below, then start a fresh run with the same goal.',
+  },
+  stalled: {
+    banner: 'border-orange-200 bg-orange-50/90 text-orange-800',
+    message:
+      'Run stalled: the agent hit the step limit or timed out. Start a fresh run with the same goal.',
+  },
+  session_lost: {
+    banner: 'border-amber-300 bg-amber-50/90 text-amber-900',
+    message:
+      'Browser session lost: the remote Steel/Browserless CDP target was evicted mid-run. Bounded reattach was attempted and exhausted. Start a new run to retry.',
+  },
+};
 
 export default function AgentControlPage() {
   const goal = useAgentStore((s) => s.goal);
@@ -61,6 +82,13 @@ export default function AgentControlPage() {
     e.preventDefault();
     if (isBusy || !goal.trim()) return;
     await startRun();
+  };
+
+  // Honest new run: re-POSTs the same goal via startRun (fresh run_id,
+  // cleared steps — no replayed or duplicated actions).
+  const handleStartNewRun = () => {
+    if (isBusy || isStarting || !goal.trim()) return;
+    void startRun();
   };
 
   const copyRunIdToClipboard = async () => {
@@ -269,10 +297,24 @@ export default function AgentControlPage() {
           </div>
         )}
 
-        {status === 'session_lost' && (
-          <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50/90 p-4 text-xs text-amber-900 shadow-2xs">
-            Browser session lost: the remote Steel/Browserless CDP target was evicted mid-run. Bounded reattach
-            was attempted and exhausted. Start a new run to retry.
+        {(status === 'failed' || status === 'stalled' || status === 'session_lost') && (
+          <div
+            className={`mt-4 flex flex-col gap-3 rounded-xl border p-4 text-xs shadow-2xs sm:flex-row sm:items-center sm:justify-between ${TERMINAL_FAILURE_COPY[status].banner}`}
+          >
+            <span>{TERMINAL_FAILURE_COPY[status].message}</span>
+            <button
+              type="button"
+              onClick={handleStartNewRun}
+              disabled={isBusy || isStarting || !goal.trim()}
+              title="Starts a fresh run with the same goal (new run_id)"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-black bg-gradient-to-b from-zinc-800 via-zinc-900 to-zinc-950 px-3.5 py-1.5 text-xs font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_6px_rgba(0,0,0,0.25)] transition-all active:translate-y-[0.5px] disabled:opacity-50"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <span>{isStarting ? 'Starting...' : 'Start new run'}</span>
+            </button>
           </div>
         )}
       </div>
@@ -461,11 +503,29 @@ export default function AgentControlPage() {
                     Failed Step Screenshots & Evidence ({verificationReport.failed_steps.length})
                   </h4>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    {verificationReport.failed_steps.map((step, idx) => (
+                    {verificationReport.failed_steps.map((step, idx) => {
+                      const hasLogStep =
+                        Boolean(step.step_id) && steps.some((s) => s.step_id === step.step_id);
+                      return (
                       <div key={idx} className="rounded-xl border border-red-200 bg-red-50/50 p-4 space-y-3 shadow-2xs">
-                        <div className="flex items-center justify-between text-xs font-mono">
-                          <span className="font-bold text-red-900">{step.action}</span>
-                          <span className="text-zinc-400">{new Date(step.timestamp).toLocaleTimeString()}</span>
+                        <div className="flex items-center justify-between gap-2 text-xs font-mono">
+                          <span className="font-bold text-red-900 truncate">{step.action}</span>
+                          <span className="flex shrink-0 items-center gap-2">
+                            <span className="text-zinc-400">{new Date(step.timestamp).toLocaleTimeString()}</span>
+                            <button
+                              type="button"
+                              onClick={() => requestScrollToStep(step.step_id)}
+                              disabled={!hasLogStep}
+                              title={
+                                hasLogStep
+                                  ? 'Scroll to this step in the execution log'
+                                  : 'Step not present in the current execution log'
+                              }
+                              className="inline-flex items-center gap-1 rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-2 py-0.5 text-[11px] font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)] hover:bg-zinc-100 active:translate-y-[0.5px] disabled:opacity-50 disabled:hover:bg-white"
+                            >
+                              View in log
+                            </button>
+                          </span>
                         </div>
                         <div className="text-xs font-mono text-red-800 bg-white/80 p-2.5 rounded-lg border border-red-200">
                           {step.result || 'Failed step'}
@@ -489,7 +549,8 @@ export default function AgentControlPage() {
                           <div className="text-[11px] text-zinc-400 italic">No screenshot captured for this step.</div>
                         )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}

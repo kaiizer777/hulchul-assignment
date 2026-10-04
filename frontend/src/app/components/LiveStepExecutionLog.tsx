@@ -498,6 +498,16 @@ interface LiveStepExecutionLogProps {
 
 type StepCategory = 'all' | 'actions' | 'errors' | 'session';
 
+// Deep-link target: verification report "View in log" buttons dispatch this
+// event; the log clears filters, expands the card, scrolls it into view and
+// flashes a highlight ring. Card anchors use `agent-step-${stepKey}` ids.
+export const AGENT_SCROLL_TO_STEP_EVENT = 'hulchul:scroll-to-step';
+
+export function requestScrollToStep(stepId: string) {
+  if (typeof window === 'undefined' || !stepId) return;
+  window.dispatchEvent(new CustomEvent(AGENT_SCROLL_TO_STEP_EVENT, { detail: { stepId } }));
+}
+
 export function LiveStepExecutionLog({
   steps,
   status,
@@ -512,6 +522,8 @@ export function LiveStepExecutionLog({
   const [expandedStepIds, setExpandedStepIds] = useState<Set<string>>(new Set());
   const [copiedStepId, setCopiedStepId] = useState<string | null>(null);
   const [copiedAllLogs, setCopiedAllLogs] = useState(false);
+  const [highlightedStepKey, setHighlightedStepKey] = useState<string | null>(null);
+  const highlightTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const logContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -597,6 +609,38 @@ export function LiveStepExecutionLog({
 
     return () => cancelAnimationFrame(rafId);
   }, [steps.length, filteredSteps.length, filterCategory, searchQuery, expandedStepIds, autoScroll]);
+
+  // Deep-link handler: jump to a step card from the verification report.
+  // Resets filters so the target renders, stops auto-scroll so the view
+  // stays put, expands the card, then scrolls + flashes a highlight ring.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const stepId = (e as CustomEvent<{ stepId?: string }>).detail?.stepId;
+      if (!stepId) return;
+      const matchIdx = steps.findIndex((s) => s.step_id === stepId);
+      if (matchIdx === -1) return;
+      const key = steps[matchIdx].step_id || `step-${matchIdx}`;
+      setFilterCategory('all');
+      setSearchQuery('');
+      if (onSetAutoScroll) onSetAutoScroll(false);
+      setExpandedStepIds((prev) => new Set(prev).add(key));
+      // Wait a tick for the filtered list to re-render, then scroll + flash.
+      setTimeout(() => {
+        const el = document.getElementById(`agent-step-${key}`);
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+        setHighlightedStepKey(key);
+        if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
+        highlightTimeoutRef.current = setTimeout(() => setHighlightedStepKey(null), 2200);
+      }, 60);
+    };
+    window.addEventListener(AGENT_SCROLL_TO_STEP_EVENT, handler);
+    return () => {
+      window.removeEventListener(AGENT_SCROLL_TO_STEP_EVENT, handler);
+      if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
+    };
+  }, [steps, onSetAutoScroll]);
 
   // Handle manual scroll in log container
   const handleScroll = () => {
@@ -1091,7 +1135,11 @@ export function LiveStepExecutionLog({
             return (
               <div
                 key={stepKey}
-                className={`rounded-xl border shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] transition-all ${cardClasses}`}
+                id={`agent-step-${stepKey}`}
+                data-step-id={st.step_id ?? ''}
+                className={`rounded-xl border shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02)] transition-all ${cardClasses}${
+                  highlightedStepKey === stepKey ? ' ring-2 ring-rose-500 ring-offset-2 ring-offset-white' : ''
+                }`}
               >
                 {/* Step Header Row */}
                 <div
