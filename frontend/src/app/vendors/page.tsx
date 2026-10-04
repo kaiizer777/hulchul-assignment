@@ -322,6 +322,14 @@ export default function VendorsPage() {
     [profiles, selectedVendorId]
   );
 
+  // Drop a stale selection once loading settles so a removed vendor cannot
+  // reopen the dialog on a later refresh. Preserved while loading/refreshing.
+  useEffect(() => {
+    if (selectedVendorId !== null && selectedVendor === null && !isLoading && !isRefreshing) {
+      setSelectedVendorId(null);
+    }
+  }, [selectedVendor, selectedVendorId, isLoading, isRefreshing]);
+
   const metrics = useMemo(() => {
     const openTotal = profiles.reduce((acc, profile) => acc + profile.openTotal, 0);
     const openCount = profiles.reduce((acc, profile) => acc + profile.openCount, 0);
