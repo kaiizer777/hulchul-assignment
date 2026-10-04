@@ -960,6 +960,18 @@ SSE_DURABLE_POLL_INTERVAL_SECONDS: float = 3.0
 # than the poll interval, so a live stream still reconciles several times per
 # ping.
 SSE_PING_INTERVAL_SECONDS: float = 15.0
+# Ceiling on one durable reconcile read. The cursor poll's queries are bounded
+# work -- an indexed SELECT over the rows committed since the last read, or the
+# run's whole step list only on the first poll of a stream that has replayed
+# nothing -- so anything slower than this is a stalled connection rather than a
+# large result. Left unbounded, such a read blocks the generator and stops the
+# ping above, which is the silent stall this poll design exists to prevent.
+# Deliberately above the poll interval so a single slow-but-successful read is
+# not killed and rescheduled every 3s, and below the ping interval so one
+# timeout delays keep-alive by at most 5s instead of forever. It is 1.7% of the
+# 300s Lambda function timeout, so a stream absorbs many consecutive timeouts
+# within one invocation.
+SSE_RECONCILE_TIMEOUT_SECONDS: float = 5.0
 
 # Whole step list for a run, ordered by the same (timestamp, step_id) key the
 # incremental poll uses so the two orderings cannot disagree.
@@ -973,7 +985,9 @@ _SSE_STEPS_ALL_SQL = """
 # Steps committed after the last one this stream delivered. The row comparison
 # advances the cursor past every row it has already seen, so a batch of steps
 # sharing one timestamp is neither skipped nor replayed.
-# idx_agent_steps_run_timestamp (run_id, timestamp) covers the predicate.
+# idx_agent_steps_run_timestamp (run_id, timestamp, step_id) covers the predicate.
+# Both comparison columns have to be in the index: Postgres can only use a row
+# comparison as an index qual when the index covers every column it spans.
 _SSE_STEPS_AFTER_CURSOR_SQL = """
     SELECT step_id, action, result, screenshot_b64, timestamp
     FROM agent_steps
@@ -1116,28 +1130,49 @@ async def stream_agent_run_endpoint(
                 frames: List[Dict[str, Any]] = []
                 pool = await get_db_pool()
                 async with pool.acquire() as conn:
-                    status = await conn.fetchval(
-                        "SELECT status FROM agent_runs WHERE run_id = $1;",
-                        run_id,
-                    )
-                    if status is not None and status != last_status:
-                        last_status = status
-                        frames.append(
-                            _status_change_frame(
-                                run_id_str, status, datetime.now(timezone.utc).isoformat()
-                            )
-                        )
-                    if step_cursor is None:
-                        # Nothing has been replayed (no steps yet, or the replay
-                        # above failed), so the whole list is still unread.
-                        rows = await conn.fetch(_SSE_STEPS_ALL_SQL, run_id)
-                    else:
-                        rows = await conn.fetch(
-                            _SSE_STEPS_AFTER_CURSOR_SQL,
+                    try:
+                        status = await conn.fetchval(
+                            "SELECT status FROM agent_runs WHERE run_id = $1;",
                             run_id,
-                            step_cursor[0],
-                            step_cursor[1],
                         )
+                        status_changed = status is not None and status != last_status
+                        if step_cursor is None:
+                            # Nothing has been replayed (no steps yet, or the replay
+                            # above failed), so the whole list is still unread.
+                            rows = await conn.fetch(_SSE_STEPS_ALL_SQL, run_id)
+                        else:
+                            rows = await conn.fetch(
+                                _SSE_STEPS_AFTER_CURSOR_SQL,
+                                run_id,
+                                step_cursor[0],
+                                step_cursor[1],
+                            )
+                    except asyncio.CancelledError:
+                        # Terminate rather than return a connection that was
+                        # cancelled mid-query. Pool release shields itself from
+                        # cancellation and then blocks on asyncpg's
+                        # cancellation wait and connection reset, which have no
+                        # bound here because the pool sets no command_timeout --
+                        # so asyncio.wait_for would wait on that cleanup instead
+                        # of returning, and the bound above would not bound
+                        # anything. A terminated connection is released
+                        # immediately and the pool opens a replacement. Nothing is
+                        # lost: these are autocommit SELECTs with no open
+                        # transaction.
+                        conn.terminate()
+                        raise
+                # Every await this reconcile depends on has returned. Only now
+                # advance the status and the cursor: doing either inside the
+                # block above would consume state whose frame is thrown away
+                # with the local list if the read times out or fails, silently
+                # dropping a status_change or skipping the rows behind the cursor.
+                if status_changed:
+                    last_status = status
+                    frames.append(
+                        _status_change_frame(
+                            run_id_str, status, datetime.now(timezone.utc).isoformat()
+                        )
+                    )
                 for r in rows:
                     step_cursor = (r["timestamp"], r["step_id"])
                     step_id = str(r["step_id"])
@@ -1197,8 +1232,26 @@ async def stream_agent_run_endpoint(
 
                 if time.monotonic() >= poll_deadline:
                     try:
-                        for frame in await _reconcile_durable_state():
+                        # Bounded like the queue wait above. A stalled reconcile
+                        # read must not hold the generator open: it would stop the
+                        # ping below and turn a database hiccup into a silently
+                        # frozen stream.
+                        reconcile = await asyncio.wait_for(
+                            _reconcile_durable_state(),
+                            timeout=SSE_RECONCILE_TIMEOUT_SECONDS,
+                        )
+                        for frame in reconcile:
                             yield frame
+                    except asyncio.TimeoutError:
+                        # Logged apart from a read failure because the two mean
+                        # different things operationally: a timeout is the bound
+                        # above firing on a stalled connection, not a query that
+                        # returned an error. The cursor is untouched either way, so
+                        # the next deadline re-reads the gap.
+                        logger.warning(
+                            f"Timed out reconciling durable state for SSE stream {run_id_str} "
+                            f"after {SSE_RECONCILE_TIMEOUT_SECONDS}s"
+                        )
                     except Exception as db_err:
                         # A transient read must not close the stream. The cursor is
                         # left untouched, so the next deadline re-reads the gap.
