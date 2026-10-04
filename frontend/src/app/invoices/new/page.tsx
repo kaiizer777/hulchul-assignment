@@ -103,18 +103,18 @@ export default function NewInvoicePage() {
 
   return (
     <div className="mx-auto max-w-2xl space-y-6">
-      <div className="flex items-center justify-between border-b border-zinc-200 pb-5 dark:border-zinc-800">
+      <div className="flex items-center justify-between border-b border-zinc-200/80 pb-5 dark:border-zinc-800">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
             Create Invoice
           </h1>
           <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-            Record a new invoice into the operations ledger.
+            Record a new vendor invoice into the operations ledger.
           </p>
         </div>
         <Link
           href="/invoices"
-          className="rounded-lg border border-zinc-200 bg-white px-3 py-1.5 text-xs font-medium text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          className="rounded-lg border border-zinc-200 bg-white px-3.5 py-1.5 text-xs font-medium text-zinc-700 shadow-2xs transition-colors hover:bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
         >
           Cancel
         </Link>
@@ -123,7 +123,7 @@ export default function NewInvoicePage() {
       {generalError && (
         <div
           role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300"
+          className="rounded-xl border border-red-200 bg-red-50/80 p-4 text-sm text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300"
         >
           <div className="flex items-center gap-2 font-medium">
             <svg className="h-4 w-4 text-red-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -135,7 +135,7 @@ export default function NewInvoicePage() {
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="space-y-6 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/60">
+      <form onSubmit={handleSubmit} className="space-y-6 rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.03)] dark:border-zinc-800/90 dark:bg-zinc-900/80">
         {/* Vendor Field */}
         <div>
           <label htmlFor="vendor" className="block text-xs font-semibold uppercase tracking-wider text-zinc-700 dark:text-zinc-300">
@@ -151,7 +151,7 @@ export default function NewInvoicePage() {
                 onChange={(e) => setVendor(e.target.value)}
                 aria-invalid={!!fieldErrors.vendor}
                 aria-describedby={fieldErrors.vendor ? 'vendor-error' : undefined}
-                className="block w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
+                className="block w-full rounded-xl border border-zinc-300 bg-white px-3.5 py-2.5 text-sm text-zinc-900 shadow-2xs focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
               >
                 <option value="" disabled>Select a vendor</option>
                 {vendors.map((v) => (
@@ -174,8 +174,8 @@ export default function NewInvoicePage() {
           <label htmlFor="amount" className="block text-xs font-semibold uppercase tracking-wider text-zinc-700 dark:text-zinc-300">
             Amount (USD) <span className="text-red-500">*</span>
           </label>
-          <div className="relative mt-1.5 rounded-lg shadow-sm">
-            <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3">
+          <div className="relative mt-1.5 rounded-xl shadow-2xs">
+            <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3.5">
               <span className="text-sm font-medium text-zinc-500">$</span>
             </div>
             <input
@@ -188,7 +188,7 @@ export default function NewInvoicePage() {
               onChange={(e) => setAmount(e.target.value)}
               aria-invalid={!!fieldErrors.amount}
               aria-describedby={fieldErrors.amount ? 'amount-error' : undefined}
-              className="block w-full rounded-lg border border-zinc-300 bg-white py-2 pl-7 pr-3 text-sm text-zinc-900 shadow-sm focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400 font-mono"
+              className="block w-full rounded-xl border border-zinc-300 bg-white py-2.5 pl-8 pr-3.5 text-sm text-zinc-900 shadow-2xs focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400 font-mono"
             />
           </div>
           {fieldErrors.amount && (
@@ -211,7 +211,7 @@ export default function NewInvoicePage() {
               onChange={(e) => setDate(e.target.value)}
               aria-invalid={!!fieldErrors.date}
               aria-describedby={fieldErrors.date ? 'date-error' : undefined}
-              className="block w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
+              className="block w-full rounded-xl border border-zinc-300 bg-white px-3.5 py-2.5 text-sm text-zinc-900 shadow-2xs focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
             />
           </div>
           {fieldErrors.date && (
@@ -235,7 +235,7 @@ export default function NewInvoicePage() {
               onChange={(e) => setPoNumber(e.target.value)}
               aria-invalid={!!fieldErrors.po_number}
               aria-describedby={fieldErrors.po_number ? 'po-error' : undefined}
-              className="block w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-mono text-zinc-900 shadow-sm focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
+              className="block w-full rounded-xl border border-zinc-300 bg-white px-3.5 py-2.5 text-sm font-mono text-zinc-900 shadow-2xs focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
             />
           </div>
           {fieldErrors.po_number && (
@@ -256,7 +256,7 @@ export default function NewInvoicePage() {
           <button
             type="submit"
             disabled={isSubmitting}
-            className="inline-flex items-center justify-center rounded-lg bg-zinc-900 px-5 py-2 text-sm font-medium text-white shadow-sm transition-all hover:bg-zinc-800 active:translate-y-px disabled:opacity-50 disabled:pointer-events-none dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+            className="inline-flex items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-black bg-gradient-to-b from-zinc-800 to-zinc-950 px-6 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_2px_4px_rgba(0,0,0,0.25)] transition-all hover:from-zinc-750 hover:to-zinc-900 active:translate-y-[0.5px] disabled:opacity-50 dark:border-t-white dark:border-x-zinc-200 dark:border-b-zinc-400 dark:from-zinc-100 dark:to-zinc-200 dark:text-zinc-900"
           >
             {isSubmitting ? (
               <span className="flex items-center gap-2">

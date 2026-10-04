@@ -77,19 +77,22 @@ function LoginForm() {
   };
 
   return (
-    <div className="mx-auto w-full max-w-md space-y-6">
-      <div>
+    <div className="mx-auto w-full max-w-md space-y-6 pt-6">
+      <div className="text-center sm:text-left">
+        <div className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-b from-zinc-800 to-zinc-950 text-white font-mono text-sm font-bold shadow-md border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-black dark:from-zinc-100 dark:to-zinc-300 dark:text-zinc-900 mb-3">
+          ERP
+        </div>
         <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
-          Sign in
+          Sign in to ERP Hub
         </h1>
         <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-          Operator access to invoices, purchase orders, vendors and the agent console.
+          Operator access to invoices, purchase orders, vendors, and the autonomous agent console.
         </p>
       </div>
 
       <form
         onSubmit={handleSubmit}
-        className="space-y-5 rounded-xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900/60"
+        className="space-y-5 rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.03)] dark:border-zinc-800/90 dark:bg-zinc-900/80"
       >
         <div>
           <label
@@ -108,14 +111,14 @@ function LoginForm() {
             value={password}
             onChange={(event) => setPassword(event.target.value)}
             placeholder="Enter the operator password"
-            className="mt-1.5 block w-full rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm placeholder-zinc-400 focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
+            className="mt-1.5 block w-full rounded-xl border border-zinc-300 bg-white px-3.5 py-2.5 text-sm text-zinc-900 shadow-2xs placeholder-zinc-400 focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
           />
         </div>
 
         {error && (
           <p
             role="alert"
-            className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-xs font-medium text-red-700 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300"
+            className="flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50/80 p-3 text-xs font-medium text-rose-700 dark:border-rose-900/50 dark:bg-rose-950/40 dark:text-rose-300"
           >
             <svg
               className="h-4 w-4 shrink-0"
@@ -137,7 +140,7 @@ function LoginForm() {
         <button
           type="submit"
           disabled={isSubmitting || password.length === 0}
-          className="inline-flex w-full items-center justify-center rounded-lg bg-zinc-900 px-5 py-2 text-sm font-medium text-white shadow-sm transition-all hover:bg-zinc-800 active:translate-y-px disabled:pointer-events-none disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
+          className="inline-flex w-full items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-black bg-gradient-to-b from-zinc-800 to-zinc-950 px-5 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_2px_4px_rgba(0,0,0,0.25)] transition-all hover:from-zinc-750 hover:to-zinc-900 active:translate-y-[0.5px] disabled:opacity-50 dark:border-t-white dark:border-x-zinc-200 dark:border-b-zinc-400 dark:from-zinc-100 dark:to-zinc-200 dark:text-zinc-900"
         >
           {isSubmitting ? (
             <span className="flex items-center gap-2">
@@ -145,7 +148,7 @@ function LoginForm() {
                 <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
               </svg>
-              Signing in
+              Signing in...
             </span>
           ) : (
             <span>Sign in</span>
@@ -154,19 +157,17 @@ function LoginForm() {
       </form>
 
       <p className="text-center text-xs text-zinc-400 dark:text-zinc-500">
-        The session cookie is HttpOnly, Secure and SameSite=Lax. Closing the browser ends the session.
+        The session cookie is HttpOnly, Secure, and SameSite=Lax. Closing the browser ends the session.
       </p>
     </div>
   );
 }
 
 export default function LoginPage() {
-  // `useSearchParams` opts a page out of static prerendering unless it is read
-  // inside a Suspense boundary.
   return (
     <Suspense
       fallback={
-        <div className="mx-auto h-72 w-full max-w-md animate-pulse rounded-xl border border-zinc-200/70 bg-white/60 p-6 dark:border-zinc-800 dark:bg-zinc-900/40" />
+        <div className="mx-auto h-72 w-full max-w-md animate-pulse rounded-2xl border border-zinc-200/70 bg-white/60 p-6 dark:border-zinc-800 dark:bg-zinc-900/40" />
       }
     >
       <LoginForm />

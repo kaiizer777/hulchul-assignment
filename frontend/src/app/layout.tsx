@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { Navbar } from "./components/Navbar";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -12,11 +13,9 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-import { Navbar } from "./components/Navbar";
-
 export const metadata: Metadata = {
   title: "ERP Operations Hub",
-  description: "Enterprise Resource Planning and Invoicing System",
+  description: "Enterprise Resource Planning and Invoicing System with Autonomous Browser Agent",
 };
 
 export default function RootLayout({
@@ -29,7 +28,7 @@ export default function RootLayout({
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-zinc-50 font-sans text-zinc-900 dark:bg-zinc-950 dark:text-zinc-50">
+      <body className="min-h-full flex flex-col bg-zinc-50 font-sans text-zinc-900 antialiased selection:bg-zinc-200">
         <Navbar />
         <main className="flex-1 w-full max-w-7xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
           {children}

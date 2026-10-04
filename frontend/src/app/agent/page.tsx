@@ -1,38 +1,15 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useCallback, useTransition } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
 
-/**
- * Every agent request goes through this origin's own proxy instead of the
- * backend's absolute URL.
- *
- * `EventSource` cannot attach a session cookie to a cross-origin request, so a
- * stream opened against the backend host directly would always come back
- * unauthenticated. Routing through `/api/agent` keeps the browser same-origin,
- * which is what makes both the cookie and the stream work.
- */
 const AGENT_API_BASE = '/api/agent';
 
-/**
- * Builds the message for a request that failed below the HTTP layer, where no
- * response was ever produced.
- *
- * It deliberately does not claim the server never saw the request: a rejected
- * fetch cannot distinguish "never arrived" from "arrived and was refused", and
- * `POST /agent/run` returns 202 + run id immediately while the agent loop
- * continues in the background. Asserting no run started would invite a duplicate
- * submission of side-effecting work, so the operator is told to check the run
- * status instead.
- */
 const agentProxyUnreachableMessage = (): string =>
   `Cannot read a response from the agent proxy at ${AGENT_API_BASE} on this origin. ` +
   'The request may have reached the backend, so the run status may be unknown: ' +
   'check it before retrying. This origin, its proxy, or the backend behind it may be down.';
 
-/**
- * Interface representing a recorded agent step event.
- */
 interface StepEvent {
   type: string;
   run_id: string;
@@ -45,9 +22,6 @@ interface StepEvent {
   error?: string;
 }
 
-/**
- * Interface representing approval gate details.
- */
 interface ApprovalData {
   run_id: string;
   status: string;
@@ -59,9 +33,6 @@ interface ApprovalData {
   nonce?: string;
 }
 
-/**
- * Interface representing an individual invoice verification record.
- */
 interface VerificationRow {
   invoice_id: string;
   vendor: string;
@@ -74,9 +45,6 @@ interface VerificationRow {
   classification: string;
 }
 
-/**
- * Interface representing an incomplete or flagged invoice item.
- */
 interface IncompleteItem {
   invoice_id: string;
   vendor: string;
@@ -86,9 +54,6 @@ interface IncompleteItem {
   reason: string;
 }
 
-/**
- * Interface representing failed step execution evidence with screenshot.
- */
 interface FailedStepEvidence {
   step_id: string;
   action: string;
@@ -97,9 +62,6 @@ interface FailedStepEvidence {
   timestamp: string;
 }
 
-/**
- * Interface representing the comprehensive verification report for an agent run.
- */
 interface VerificationReport {
   run_id: string;
   total_invoices: number;
@@ -117,23 +79,8 @@ const DEFAULT_GOALS = [
   "Hold anything over ₹25,000 for approval"
 ];
 
-/**
- * Marks the case where no HTTP response was ever produced.
- *
- * fetch() rejects with a TypeError for connection refusal, DNS failure, TLS
- * failure and CORS rejection, but a response body stream that dies mid-transfer
- * also rejects with a TypeError. The thrown value's class alone therefore cannot
- * distinguish "backend unreachable" from "backend answered, body unreadable", so
- * the distinction is made by where the rejection happened instead.
- */
 class BackendUnreachableError extends Error {}
 
-/**
- * Reads the JSON body of a response that was successfully received.
- *
- * @param res - A response with an ok status.
- * @returns The parsed body.
- */
 const readJsonBody = async <T,>(res: Response): Promise<T> => {
   try {
     return (await res.json()) as T;
@@ -144,10 +91,6 @@ const readJsonBody = async <T,>(res: Response): Promise<T> => {
   }
 };
 
-/**
- * AgentControlPage component provides the interactive UI for dispatching browser agent runs,
- * streaming real-time execution steps, managing pause/resume/approval states, and viewing screenshots.
- */
 export default function AgentControlPage() {
   const [goal, setGoal] = useState("Process all pending invoices");
   const [runId, setRunId] = useState<string | null>(null);
@@ -156,6 +99,7 @@ export default function AgentControlPage() {
   const [isStarting, setIsStarting] = useState(false);
   const [isPausingOrResuming, setIsPausingOrResuming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copiedRunId, setCopiedRunId] = useState(false);
 
   // Approval Modal State
   const [approvalData, setApprovalData] = useState<ApprovalData | null>(null);
@@ -170,9 +114,6 @@ export default function AgentControlPage() {
   const logContainerRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
 
-  /**
-   * Handles manual scroll container interaction to pause or resume auto-scrolling of step logs.
-   */
   const handleScroll = () => {
     if (!logContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
@@ -180,22 +121,18 @@ export default function AgentControlPage() {
     setAutoScroll(isAtBottom);
   };
 
-  // Auto-scroll effect
   useEffect(() => {
     if (autoScroll && logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
   }, [steps, autoScroll]);
 
-  // Verification Report State (Phase 4)
+  // Verification Report State
   const [verificationReport, setVerificationReport] = useState<VerificationReport | null>(null);
   const [isFetchingVerification, setIsFetchingVerification] = useState(false);
   const [verificationError, setVerificationError] = useState<string | null>(null);
 
-  /**
-   * Fetches the comprehensive verification report for the active agent run from the FastAPI backend.
-   */
-  const handleFetchVerification = async () => {
+  const handleFetchVerification = useCallback(async () => {
     if (!runId) return;
     setIsFetchingVerification(true);
     setVerificationError(null);
@@ -226,19 +163,14 @@ export default function AgentControlPage() {
     } finally {
       setIsFetchingVerification(false);
     }
-  };
+  }, [runId]);
 
-  // Automatically fetch verification report when run completes, fails, or loses session
   useEffect(() => {
     if (runId && (status === 'done' || status === 'failed' || status === 'session_lost')) {
       handleFetchVerification();
     }
-  }, [runId, status]);
+  }, [runId, status, handleFetchVerification]);
 
-  /**
-   * Dispatches a new agent run with the specified goal instruction.
-   * Prevents starting while running, paused, or awaiting approval.
-   */
   const handleRunAgent = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!goal.trim() || isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval') return;
@@ -247,6 +179,7 @@ export default function AgentControlPage() {
     setError(null);
     setSteps([]);
     setStatus("running");
+    setVerificationReport(null);
     submittedNonceRef.current = null;
 
     try {
@@ -271,9 +204,6 @@ export default function AgentControlPage() {
       setRunId(data.run_id);
       setStatus(data.status || "running");
     } catch (err: unknown) {
-      // Only a rejection from fetch() itself means no response was produced.
-      // A body that arrived but could not be parsed is a different fault and
-      // gets its own message, so "backend unreachable" stays trustworthy.
       setError(
         err instanceof BackendUnreachableError
           ? agentProxyUnreachableMessage()
@@ -287,17 +217,6 @@ export default function AgentControlPage() {
     }
   };
 
-  /**
-   * Appends a step event unless that step_id is already rendered.
-   *
-   * `GET /agent/runs/{run_id}/stream` replays the whole `agent_steps` history on
-   * every connection, and the agent persists a step before it emits the matching
-   * live event, so a step can arrive both from history playback and from the live
-   * queue. EventSource also reconnects on its own whenever the stream drops, and
-   * the run now outlives the POST request, so mid-run reconnects are routine. Both
-   * paths would otherwise re-append every earlier step. Events without a step_id
-   * cannot be correlated and are always appended.
-   */
   const appendStep = useCallback((step: StepEvent) => {
     setSteps((prev) => {
       if (step.step_id && prev.some((existing) => existing.step_id === step.step_id)) {
@@ -307,7 +226,6 @@ export default function AgentControlPage() {
     });
   }, []);
 
-  // If we have a runId, connect to SSE stream and poll approval status
   useEffect(() => {
     if (!runId) return;
 
@@ -316,8 +234,6 @@ export default function AgentControlPage() {
     const abortController = new AbortController();
 
     try {
-      // Same-origin, so the session cookie rides along automatically and the
-      // stream needs no CORS preflight to stay open.
       eventSource = new EventSource(`${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/stream`);
 
       eventSource.onmessage = (event) => {
@@ -399,7 +315,7 @@ export default function AgentControlPage() {
         }
       });
 
-      eventSource.addEventListener('done', (event: MessageEvent) => {
+      eventSource.addEventListener('done', () => {
         setStatus('done');
       });
 
@@ -423,7 +339,6 @@ export default function AgentControlPage() {
       console.error('Failed to establish EventSource connection', e);
     }
 
-    // Poll approval endpoint periodically while run is active or awaiting approval
     pollInterval = setInterval(async () => {
       try {
         const res = await fetch(
@@ -445,7 +360,6 @@ export default function AgentControlPage() {
           }
         }
       } catch (e) {
-        // Teardown aborts this poll on purpose, so only a real fault is reported.
         if (!(e instanceof Error && e.name === 'AbortError')) {
           console.warn('Approval status poll failed', e);
         }
@@ -459,9 +373,6 @@ export default function AgentControlPage() {
     };
   }, [runId, appendStep]);
 
-  /**
-   * Toggles the pause or resume state of the active agent run.
-   */
   const handleTogglePause = async () => {
     if (!runId || isPausingOrResuming) return;
     setIsPausingOrResuming(true);
@@ -485,10 +396,6 @@ export default function AgentControlPage() {
     }
   };
 
-  /**
-   * Submits human approval decision ('approved' or 'rejected') for the pending approval gate.
-   * @param decision - The approval decision to submit.
-   */
   const handleApprovalDecision = async (decision: 'approved' | 'rejected') => {
     if (!runId || isSubmittingApproval || !approvalData?.nonce) return;
     setIsSubmittingApproval(true);
@@ -522,10 +429,6 @@ export default function AgentControlPage() {
     }
   };
 
-  /**
-   * Fetches and displays the screenshot associated with a specific step ID or index.
-   * @param stepIdentifier - The unique step ID or step index identifier.
-   */
   const handleViewScreenshot = async (stepIdentifier?: string) => {
     if (!stepIdentifier) return;
     setIsFetchingScreenshot(true);
@@ -548,18 +451,29 @@ export default function AgentControlPage() {
     }
   };
 
+  const copyRunIdToClipboard = async () => {
+    if (!runId) return;
+    try {
+      await navigator.clipboard.writeText(runId);
+      setCopiedRunId(true);
+      setTimeout(() => setCopiedRunId(false), 2000);
+    } catch {
+      console.warn('Clipboard write failed');
+    }
+  };
+
   return (
-    <div className="space-y-6 pb-12">
+    <div className="space-y-6 pb-14">
       {/* Page Header */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
+          <div className="flex flex-wrap items-center gap-3">
+            <h1 className="text-2xl font-bold tracking-tight text-zinc-900">
               Agent Control & Live Monitor
             </h1>
             <StatusBadge status={status} />
           </div>
-          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+          <p className="mt-1 text-sm text-zinc-500">
             Dispatch autonomous browser agents to process accounts payable, evaluate purchase orders, and manage approvals.
           </p>
         </div>
@@ -567,17 +481,33 @@ export default function AgentControlPage() {
         {runId && (
           <div className="flex items-center gap-2">
             <button
+              onClick={copyRunIdToClipboard}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-3 py-1.5 font-mono text-xs text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_2px_rgba(0,0,0,0.04)] transition-all hover:bg-zinc-50 active:translate-y-[0.5px]"
+              title="Click to copy full Run ID"
+            >
+              <svg className="h-3.5 w-3.5 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+              </svg>
+              <span>{runId.slice(0, 8)}...</span>
+              {copiedRunId ? (
+                <span className="text-emerald-600 font-sans text-[10px] font-bold">Copied!</span>
+              ) : (
+                <span className="text-zinc-400 font-sans text-[10px]">Copy</span>
+              )}
+            </button>
+
+            <button
               onClick={handleTogglePause}
               disabled={isPausingOrResuming || status === 'done' || status === 'failed' || status === 'session_lost'}
-              className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-2 text-xs font-semibold shadow-xs transition-all active:translate-y-[0.5px] disabled:opacity-50 ${
+              className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-1.5 text-xs font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition-all active:translate-y-[0.5px] disabled:opacity-50 ${
                 status === 'paused'
-                  ? 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-300'
-                  : 'border-amber-300 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-300'
+                  ? 'border-t-emerald-200 border-x-emerald-300 border-b-emerald-400 bg-gradient-to-b from-emerald-50 to-emerald-100/70 text-emerald-800 hover:from-emerald-100 hover:to-emerald-200/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]'
+                  : 'border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-gradient-to-b from-amber-50 to-amber-100/70 text-amber-800 hover:from-amber-100 hover:to-amber-200/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]'
               }`}
             >
               {status === 'paused' ? (
                 <>
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
@@ -585,67 +515,86 @@ export default function AgentControlPage() {
                 </>
               ) : (
                 <>
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
                   <span>Pause Agent</span>
                 </>
               )}
             </button>
-            <span className="font-mono text-xs text-zinc-400 dark:text-zinc-500">
-              Run: {runId.slice(0, 8)}...
-            </span>
           </div>
         )}
       </div>
 
       {/* Goal Dispatch Section */}
-      <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60">
+      <div className="rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)] transition-all">
         <form onSubmit={handleRunAgent} className="space-y-4">
           <div>
-            <label htmlFor="goal-input" className="block text-xs font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-400">
-              Agent Goal / Instruction
-            </label>
-            <div className="mt-2">
+            <div className="flex items-center justify-between">
+              <label htmlFor="goal-input" className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-zinc-700">
+                <span className="flex h-5 w-5 items-center justify-center rounded-md bg-zinc-100 text-zinc-700 border border-zinc-200 shadow-2xs">
+                  <svg className="h-3 w-3 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                </span>
+                Agent Goal & Instruction
+              </label>
+              <span className="text-[11px] text-zinc-400 font-medium">Press <kbd className="rounded border border-zinc-200 bg-zinc-100 px-1 py-0.5 font-mono text-[10px] text-zinc-600">Ctrl + Enter</kbd> to run</span>
+            </div>
+            <div className="mt-2.5">
               <textarea
                 id="goal-input"
                 rows={3}
                 value={goal}
                 onChange={(e) => setGoal(e.target.value)}
-                placeholder="Enter plain English goal for the browser agent..."
-                className="block w-full rounded-xl border border-zinc-200 bg-white p-3.5 text-sm text-zinc-900 placeholder-zinc-400 shadow-xs transition-colors focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 dark:border-zinc-700/80 dark:bg-zinc-950/70 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-400 dark:focus:ring-zinc-400"
+                onKeyDown={(e) => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                    e.preventDefault();
+                    handleRunAgent(e);
+                  }
+                }}
+                placeholder="Enter natural language instruction for the autonomous browser agent..."
+                className="block w-full rounded-xl border border-zinc-300/80 bg-zinc-50/60 p-3.5 text-sm text-zinc-900 placeholder-zinc-400 shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-colors focus:border-zinc-800 focus:bg-white focus:outline-none focus:ring-2 focus:ring-zinc-900/10 font-sans leading-relaxed"
               />
             </div>
           </div>
 
-          {/* Preset Goal Suggestion Buttons */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Suggestions:</span>
+          {/* Preset Goal Suggestions */}
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <span className="text-xs font-semibold text-zinc-400">Suggestions:</span>
             {DEFAULT_GOALS.map((suggestion, idx) => (
               <button
                 key={idx}
                 type="button"
                 onClick={() => setGoal(suggestion)}
-                className="rounded-lg border border-zinc-200/80 bg-zinc-50 px-2.5 py-1 text-xs font-medium text-zinc-700 transition-colors hover:border-zinc-300 hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-800/60 dark:text-zinc-300 dark:hover:border-zinc-700 dark:hover:bg-zinc-800"
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-all active:translate-y-[0.5px] ${
+                  goal === suggestion
+                    ? 'border-t-zinc-700 border-x-zinc-800 border-b-black bg-zinc-900 text-white shadow-xs'
+                    : 'border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 text-zinc-700 hover:border-zinc-300 hover:bg-zinc-100/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.02)]'
+                }`}
               >
                 {suggestion}
               </button>
             ))}
           </div>
 
-          <div className="flex items-center justify-between pt-2">
-            <div className="text-xs text-zinc-500 dark:text-zinc-400">
-              Agent operates mock ERP via remote browser CDP.
+          <div className="flex flex-col gap-3 pt-3 sm:flex-row sm:items-center sm:justify-between border-t border-zinc-100">
+            <div className="flex items-center gap-2 text-xs text-zinc-500">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+              </span>
+              <span>Agent operates mock ERP via remote browser CDP (Steel / Browserless)</span>
             </div>
 
             <button
               type="submit"
               disabled={isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval'}
-              className="inline-flex items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-zinc-950 bg-gradient-to-b from-zinc-800 to-zinc-900 px-5 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_2px_4px_rgba(0,0,0,0.2)] transition-all hover:from-zinc-750 hover:to-zinc-850 active:translate-y-[0.5px] disabled:opacity-50 dark:border-t-white dark:border-x-zinc-200 dark:border-b-zinc-400 dark:from-zinc-100 dark:to-zinc-200 dark:text-zinc-900 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_2px_4px_rgba(0,0,0,0.1)]"
+              className="inline-flex items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-black bg-gradient-to-b from-zinc-800 via-zinc-900 to-zinc-950 px-6 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_6px_rgba(0,0,0,0.25)] transition-all hover:from-zinc-750 hover:to-zinc-900 active:translate-y-[0.5px] disabled:opacity-50"
             >
               {isStarting ? (
                 <>
-                  <svg className="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                  <svg className="h-4 w-4 animate-spin text-zinc-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
                   <span>Initializing...</span>
@@ -669,41 +618,42 @@ export default function AgentControlPage() {
         </form>
 
         {error && (
-          <div className="mt-4 rounded-xl border border-red-200 bg-red-50 p-4 text-xs text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
+          <div className="mt-4 rounded-xl border border-red-200 bg-red-50/90 p-4 text-xs text-red-800 shadow-2xs">
             {error}
           </div>
         )}
 
         {status === 'session_lost' && (
-          <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50/90 p-4 text-xs text-amber-900 shadow-2xs">
             Browser session lost: the remote Steel/Browserless CDP target was evicted mid-run. Bounded reattach
-            was attempted and exhausted. This is distinct from a step failure. Start a new run to retry.
+            was attempted and exhausted. Start a new run to retry.
           </div>
         )}
       </div>
 
       {/* Real-Time Step Log via SSE */}
-      <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60">
-        <div className="flex items-center justify-between pb-4 border-b border-zinc-200/80 dark:border-zinc-800">
+      <div className="rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)]">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-zinc-200/80">
           <div>
-            <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+            <h3 className="text-base font-bold text-zinc-900 flex items-center gap-2">
+              <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" />
               Live Step Execution Log
             </h3>
-            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+            <p className="text-xs text-zinc-500 mt-0.5">
               Real-time SSE events streaming agent observations, actions, and results.
             </p>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2.5">
             {!autoScroll && (
               <button
                 onClick={() => setAutoScroll(true)}
-                className="rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-xs font-medium text-zinc-600 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                className="rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)] active:translate-y-[0.5px]"
               >
                 Resume Auto-scroll
               </button>
             )}
-            <span className="inline-flex items-center gap-1.5 font-mono text-xs text-zinc-500 dark:text-zinc-400">
+            <span className="inline-flex items-center gap-1.5 font-mono text-xs text-zinc-600 rounded-lg border border-zinc-200/80 bg-zinc-50 px-2.5 py-1 shadow-2xs">
               <span className={`h-2 w-2 rounded-full ${status === 'running' ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-400'}`} />
               {steps.length} {steps.length === 1 ? 'step' : 'steps'} logged
             </span>
@@ -713,14 +663,17 @@ export default function AgentControlPage() {
         <div
           ref={logContainerRef}
           onScroll={handleScroll}
-          className="mt-4 max-h-[420px] min-h-[200px] overflow-y-auto space-y-3 font-mono text-xs pr-2"
+          className="mt-4 max-h-[460px] min-h-[220px] overflow-y-auto space-y-3 font-mono text-xs pr-1"
         >
           {steps.length === 0 ? (
-            <div className="flex h-48 flex-col items-center justify-center text-center text-zinc-400 dark:text-zinc-600">
-              <svg className="h-8 w-8 mb-2 opacity-40" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
-              <span>No execution steps recorded yet. Start an agent run above.</span>
+            <div className="flex h-48 flex-col items-center justify-center text-center text-zinc-400 border border-dashed border-zinc-200/90 rounded-xl bg-zinc-50/40 p-6">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-200 bg-white mb-2.5 shadow-2xs">
+                <svg className="h-5 w-5 text-zinc-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.7">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                </svg>
+              </div>
+              <span className="font-semibold text-zinc-700">No execution steps recorded yet</span>
+              <span className="text-[11px] text-zinc-400 mt-0.5">Submit a goal above to start the autonomous browser execution.</span>
             </div>
           ) : (
             steps.map((st, idx) => {
@@ -728,45 +681,45 @@ export default function AgentControlPage() {
               const isSessionLost = st.type === 'session_lost' || st.type === 'session_reattached';
               return (
                 <div
-                  key={idx}
-                  className={`rounded-xl border p-4 transition-all ${
+                  key={st.step_id || idx}
+                  className={`rounded-xl border p-4 transition-all shadow-[0_1px_2px_rgba(0,0,0,0.02)] ${
                     isSessionLost
-                      ? 'border-amber-300 bg-amber-50/70 text-amber-900 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-200'
+                      ? 'border-amber-300/80 bg-amber-50/60 text-amber-900 border-l-4 border-l-amber-500'
                       : isFail
-                        ? 'border-red-200 bg-red-50/70 text-red-900 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-200'
-                        : 'border-zinc-200/80 bg-zinc-50/70 text-zinc-800 dark:border-zinc-800 dark:bg-zinc-950/50 dark:text-zinc-200'
+                        ? 'border-rose-300/80 bg-rose-50/60 text-rose-900 border-l-4 border-l-rose-500'
+                        : 'border-zinc-200/90 bg-zinc-50/60 text-zinc-800 border-l-4 border-l-emerald-500'
                   }`}
                 >
-                  <div className="flex items-center justify-between pb-2 border-b border-zinc-200/60 dark:border-zinc-800/80 text-[11px]">
+                  <div className="flex items-center justify-between pb-2 border-b border-zinc-200/70 text-[11px]">
                     <div className="flex items-center gap-2">
-                      <span className="font-bold text-zinc-500 dark:text-zinc-400">
+                      <span className="font-bold text-zinc-500">
                         #{st.step_index || idx + 1}
                       </span>
-                      <span className="font-semibold text-zinc-900 dark:text-zinc-100">
+                      <span className="font-semibold text-zinc-900">
                         {st.action}
                       </span>
                     </div>
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2.5">
                       {st.has_screenshot && (
                         <button
                           onClick={() => handleViewScreenshot(st.step_id || st.step_index?.toString() || (idx + 1).toString())}
                           disabled={isFetchingScreenshot}
-                          className="inline-flex items-center gap-1 rounded bg-zinc-200/80 px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:bg-zinc-300 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                          className="inline-flex items-center gap-1 rounded-md border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-2 py-0.5 text-[10px] font-medium text-zinc-700 hover:bg-zinc-100 shadow-2xs active:translate-y-[0.5px]"
                         >
-                          <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                          <svg className="h-3 w-3 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                             <path strokeLinecap="round" strokeLinejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                           </svg>
                           <span>Screenshot</span>
                         </button>
                       )}
-                      <span className="text-zinc-400 dark:text-zinc-500">
+                      <span className="text-zinc-400">
                         {new Date(st.timestamp).toLocaleTimeString()}
                       </span>
                     </div>
                   </div>
 
-                  <div className="mt-2.5 whitespace-pre-wrap text-xs font-mono leading-relaxed">
+                  <div className="mt-2.5 rounded-lg bg-white p-3 font-mono text-xs leading-relaxed border border-zinc-200 text-zinc-800 whitespace-pre-wrap shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
                     {st.result || st.error || 'Success'}
                   </div>
                 </div>
@@ -778,32 +731,37 @@ export default function AgentControlPage() {
 
       {/* Verification Report Section (Phase 4) */}
       {(verificationReport || isFetchingVerification || verificationError || (runId && (status === 'done' || status === 'failed' || status === 'session_lost'))) && (
-        <div className="rounded-2xl border border-zinc-200/80 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02)] backdrop-blur-xs dark:border-zinc-800 dark:bg-zinc-900/60 space-y-6">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-4 border-b border-zinc-200/80 dark:border-zinc-800">
+        <div className="rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)] space-y-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-4 border-b border-zinc-200/80">
             <div>
-              <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+              <h3 className="text-base font-bold text-zinc-900 flex items-center gap-2">
+                <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-2xs">
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </span>
                 Phase 4: Verification & Evidence Report
               </h3>
-              <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              <p className="text-xs text-zinc-500 mt-0.5">
                 Automated post-run comparison of actual ERP invoice states against expected seed rules.
               </p>
             </div>
             <button
               onClick={handleFetchVerification}
               disabled={isFetchingVerification || !runId}
-              className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-zinc-50 px-3.5 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 disabled:opacity-50"
+              className="inline-flex items-center gap-2 rounded-xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 px-3.5 py-2 text-xs font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)] hover:bg-zinc-100 active:translate-y-[0.5px] disabled:opacity-50"
             >
               {isFetchingVerification ? (
                 <>
                   <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
-                  <span>Refreshing Verification...</span>
+                  <span>Refreshing...</span>
                 </>
               ) : (
                 <>
-                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                  <svg className="h-3.5 w-3.5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
                   <span>Refresh Report</span>
                 </>
@@ -812,7 +770,7 @@ export default function AgentControlPage() {
           </div>
 
           {verificationError && (
-            <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-xs text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
+            <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-xs text-red-800 shadow-2xs">
               {verificationError}
             </div>
           )}
@@ -821,43 +779,43 @@ export default function AgentControlPage() {
             <>
               {/* Summary Metrics Cards */}
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-                <div className="rounded-xl border border-zinc-200/80 bg-zinc-50/50 p-4 dark:border-zinc-800 dark:bg-zinc-950/40">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">Total Invoices</div>
-                  <div className="mt-1 text-2xl font-bold text-zinc-900 dark:text-zinc-100">{verificationReport.total_invoices}</div>
+                <div className="rounded-xl border border-t-zinc-200 border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)]">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Total Invoices</div>
+                  <div className="mt-1 font-mono text-2xl font-bold text-zinc-900 tabular-nums">{verificationReport.total_invoices}</div>
                 </div>
-                <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-4 dark:border-emerald-900/50 dark:bg-emerald-950/30">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-700 dark:text-emerald-400">Passed</div>
-                  <div className="mt-1 text-2xl font-bold text-emerald-800 dark:text-emerald-300">{verificationReport.pass_count}</div>
+                <div className="rounded-xl border border-t-emerald-200 border-x-emerald-300 border-b-emerald-400 bg-gradient-to-b from-emerald-50/60 to-emerald-100/30 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)]">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-emerald-700">Passed</div>
+                  <div className="mt-1 font-mono text-2xl font-bold text-emerald-700 tabular-nums">{verificationReport.pass_count}</div>
                 </div>
-                <div className="rounded-xl border border-rose-200/80 bg-rose-50/50 p-4 dark:border-rose-900/50 dark:bg-rose-950/30">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-rose-700 dark:text-rose-400">Failed / Mismatched</div>
-                  <div className="mt-1 text-2xl font-bold text-rose-800 dark:text-rose-300">{verificationReport.fail_count}</div>
+                <div className="rounded-xl border border-t-rose-200 border-x-rose-300 border-b-rose-400 bg-gradient-to-b from-rose-50/60 to-rose-100/30 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)]">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-rose-700">Failed / Mismatched</div>
+                  <div className="mt-1 font-mono text-2xl font-bold text-rose-700 tabular-nums">{verificationReport.fail_count}</div>
                 </div>
-                <div className="rounded-xl border border-amber-200/80 bg-amber-50/50 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
-                  <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">Incomplete / Flagged</div>
-                  <div className="mt-1 text-2xl font-bold text-amber-800 dark:text-amber-300">{verificationReport.incomplete_count}</div>
+                <div className="rounded-xl border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-gradient-to-b from-amber-50/60 to-amber-100/30 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)]">
+                  <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-700">Incomplete / Flagged</div>
+                  <div className="mt-1 font-mono text-2xl font-bold text-amber-700 tabular-nums">{verificationReport.incomplete_count}</div>
                 </div>
               </div>
 
               {/* Incomplete / Flagged Items Callout */}
               {verificationReport.incomplete_items.length > 0 && (
-                <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
-                  <h4 className="text-xs font-bold uppercase tracking-wider text-amber-900 dark:text-amber-300 mb-2">
+                <div className="rounded-xl border border-amber-200/90 bg-amber-50/70 p-4 shadow-2xs">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-amber-900 mb-2">
                     Incomplete / Flagged Items Requiring Attention ({verificationReport.incomplete_items.length})
                   </h4>
                   <div className="space-y-2">
                     {verificationReport.incomplete_items.map((item, idx) => (
-                      <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between text-xs gap-1 border-t border-amber-200/60 dark:border-amber-900/40 pt-2 font-mono">
+                      <div key={idx} className="flex flex-col sm:flex-row sm:items-center justify-between text-xs gap-1 border-t border-amber-200/60 pt-2 font-mono">
                         <div>
-                          <span className="font-bold text-zinc-900 dark:text-zinc-100">{item.vendor}</span>
+                          <span className="font-bold text-zinc-900">{item.vendor}</span>
                           <span className="text-zinc-500 ml-2">({item.po_number || 'No PO'})</span>
-                          <span className="ml-2 font-semibold text-emerald-700 dark:text-emerald-400">₹{item.amount.toLocaleString()}</span>
+                          <span className="ml-2 font-semibold text-emerald-700">₹{item.amount.toLocaleString()}</span>
                         </div>
                         <div className="flex items-center gap-2">
-                          <span className="rounded bg-amber-200/70 px-2 py-0.5 text-[10px] font-semibold text-amber-900 dark:bg-amber-900 dark:text-amber-200 uppercase">
+                          <span className="rounded bg-amber-200 px-2 py-0.5 text-[10px] font-bold text-amber-900 uppercase">
                             {item.status}
                           </span>
-                          <span className="text-zinc-600 dark:text-zinc-400">{item.reason}</span>
+                          <span className="text-zinc-600">{item.reason}</span>
                         </div>
                       </div>
                     ))}
@@ -866,9 +824,9 @@ export default function AgentControlPage() {
               )}
 
               {/* Verification Table */}
-              <div className="overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800">
+              <div className="overflow-x-auto rounded-xl border border-zinc-200 shadow-2xs">
                 <table className="w-full text-left text-xs font-mono">
-                  <thead className="border-b border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300">
+                  <thead className="border-b border-zinc-200 bg-zinc-50 text-zinc-700">
                     <tr>
                       <th className="p-3">ID / Vendor</th>
                       <th className="p-3">Amount</th>
@@ -879,47 +837,47 @@ export default function AgentControlPage() {
                       <th className="p-3">Reason / Details</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
+                  <tbody className="divide-y divide-zinc-200 bg-white">
                     {verificationReport.verification_table.map((row, idx) => (
-                      <tr key={idx} className="hover:bg-zinc-50/50 dark:hover:bg-zinc-800/40">
+                      <tr key={idx} className="hover:bg-zinc-50/80 transition-colors">
                         <td className="p-3">
-                          <div className="font-semibold text-zinc-900 dark:text-zinc-100">{row.vendor}</div>
+                          <div className="font-semibold text-zinc-900">{row.vendor}</div>
                           <div className="text-[10px] text-zinc-400">{row.invoice_id.slice(0, 8)}...</div>
                         </td>
-                        <td className="p-3 font-semibold text-zinc-900 dark:text-zinc-100">
+                        <td className="p-3 font-semibold text-zinc-900">
                           ₹{row.amount.toLocaleString()}
                         </td>
-                        <td className="p-3 text-zinc-700 dark:text-zinc-300">
+                        <td className="p-3 text-zinc-700">
                           {row.po_number || <span className="text-zinc-400 italic">None</span>}
                         </td>
                         <td className="p-3">
-                          <span className="rounded bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
+                          <span className="rounded bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-800">
                             {row.expected_status}
                           </span>
                         </td>
                         <td className="p-3">
                           <span className={`rounded px-2 py-0.5 text-[10px] font-medium ${
                             row.actual_status === 'completed'
-                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300'
+                              ? 'bg-emerald-100 text-emerald-800'
                               : row.actual_status === 'flagged'
-                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300'
-                              : 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300'
+                              ? 'bg-amber-100 text-amber-800'
+                              : 'bg-rose-100 text-rose-800'
                           }`}>
                             {row.actual_status}
                           </span>
                         </td>
                         <td className="p-3">
                           {row.pass_fail ? (
-                            <span className="inline-flex items-center gap-1 font-bold text-emerald-600 dark:text-emerald-400">
+                            <span className="inline-flex items-center gap-1 font-bold text-emerald-600">
                               ✅ Pass
                             </span>
                           ) : (
-                            <span className="inline-flex items-center gap-1 font-bold text-rose-600 dark:text-rose-400">
+                            <span className="inline-flex items-center gap-1 font-bold text-rose-600">
                               ❌ Fail
                             </span>
                           )}
                         </td>
-                        <td className="p-3 text-zinc-600 dark:text-zinc-400">
+                        <td className="p-3 text-zinc-600">
                           <div>{row.reason}</div>
                           <div className="text-[10px] text-zinc-400 mt-0.5 font-sans">Class: {row.classification}</div>
                         </td>
@@ -932,17 +890,17 @@ export default function AgentControlPage() {
               {/* Failed Step Screenshots Inline Evidence */}
               {verificationReport.failed_steps.length > 0 && (
                 <div className="space-y-3 pt-2">
-                  <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-900 dark:text-zinc-100">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-900">
                     Failed Step Screenshots & Evidence ({verificationReport.failed_steps.length})
                   </h4>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     {verificationReport.failed_steps.map((step, idx) => (
-                      <div key={idx} className="rounded-xl border border-red-200 bg-red-50/50 p-4 space-y-3 dark:border-red-900/50 dark:bg-red-950/20">
+                      <div key={idx} className="rounded-xl border border-red-200 bg-red-50/50 p-4 space-y-3 shadow-2xs">
                         <div className="flex items-center justify-between text-xs font-mono">
-                          <span className="font-bold text-red-900 dark:text-red-200">{step.action}</span>
+                          <span className="font-bold text-red-900">{step.action}</span>
                           <span className="text-zinc-400">{new Date(step.timestamp).toLocaleTimeString()}</span>
                         </div>
-                        <div className="text-xs font-mono text-red-800 dark:text-red-300 bg-white/50 dark:bg-black/30 p-2 rounded">
+                        <div className="text-xs font-mono text-red-800 bg-white/80 p-2.5 rounded-lg border border-red-200">
                           {step.result || 'Failed step'}
                         </div>
                         {step.screenshot_b64 ? (
@@ -950,6 +908,7 @@ export default function AgentControlPage() {
                             onClick={() => setSelectedScreenshot(step.screenshot_b64 || null)}
                             className="cursor-pointer overflow-hidden rounded-lg border border-red-200 bg-black group relative"
                           >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img
                               src={`data:image/png;base64,${step.screenshot_b64}`}
                               alt="Failed Step Screenshot"
@@ -978,42 +937,42 @@ export default function AgentControlPage() {
 
       {/* Approval Modal */}
       {status === 'awaiting_approval' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/60 backdrop-blur-xs p-4 animate-in fade-in duration-200">
-          <div className="w-full max-w-lg rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/50 backdrop-blur-sm p-4">
+          <div className="w-full max-w-lg rounded-2xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white p-6 shadow-2xl space-y-4">
             <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-100 text-amber-700 dark:bg-amber-950/80 dark:text-amber-300">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-100 text-amber-700 border border-amber-200 shadow-2xs">
                 <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                 </svg>
               </div>
               <div>
-                <h3 className="text-lg font-bold text-zinc-900 dark:text-zinc-100">
+                <h3 className="text-lg font-bold text-zinc-900">
                   Human Approval Required
                 </h3>
-                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                <p className="text-xs text-zinc-500">
                   Agent paused because invoice amount exceeds approval threshold.
                 </p>
               </div>
             </div>
 
-            <div className="my-5 rounded-xl border border-zinc-200/80 bg-zinc-50 p-4 space-y-2.5 font-mono text-xs dark:border-zinc-800 dark:bg-zinc-950/60">
+            <div className="my-5 rounded-xl border border-zinc-200 bg-zinc-50/70 p-4 space-y-2.5 font-mono text-xs shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
               <div className="flex justify-between">
-                <span className="text-zinc-500 dark:text-zinc-400">Vendor:</span>
-                <span className="font-bold text-zinc-900 dark:text-zinc-100">{approvalData?.vendor || '—'}</span>
+                <span className="text-zinc-500">Vendor:</span>
+                <span className="font-bold text-zinc-900">{approvalData?.vendor || '—'}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-zinc-500 dark:text-zinc-400">Invoice Amount:</span>
-                <span className="font-bold text-emerald-600 dark:text-emerald-400">
+                <span className="text-zinc-500">Invoice Amount:</span>
+                <span className="font-bold text-emerald-600">
                   {approvalData?.amount != null ? `₹${approvalData.amount.toLocaleString()}` : '—'}
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-zinc-500 dark:text-zinc-400">PO Number:</span>
-                <span className="text-zinc-900 dark:text-zinc-100">{approvalData?.po_number || '—'}</span>
+                <span className="text-zinc-500">PO Number:</span>
+                <span className="text-zinc-900">{approvalData?.po_number || '—'}</span>
               </div>
               <div className="flex justify-between">
-                <span className="text-zinc-500 dark:text-zinc-400">Threshold:</span>
-                <span className="text-zinc-900 dark:text-zinc-100">
+                <span className="text-zinc-500">Threshold:</span>
+                <span className="text-zinc-900">
                   {approvalData?.threshold != null ? `₹${approvalData.threshold.toLocaleString()}` : '—'}
                 </span>
               </div>
@@ -1024,7 +983,7 @@ export default function AgentControlPage() {
                 type="button"
                 disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
                 onClick={() => handleApprovalDecision('rejected')}
-                className="rounded-xl border border-rose-300 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-800 hover:bg-rose-100 dark:border-rose-900/60 dark:bg-rose-950/50 dark:text-rose-300 disabled:opacity-50"
+                className="rounded-xl border border-t-rose-200 border-x-rose-300 border-b-rose-400 bg-gradient-to-b from-rose-50 to-rose-100 px-4 py-2.5 text-xs font-semibold text-rose-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)] hover:bg-rose-100 active:translate-y-[0.5px] disabled:opacity-50"
               >
                 Reject Invoice
               </button>
@@ -1033,7 +992,7 @@ export default function AgentControlPage() {
                 type="button"
                 disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
                 onClick={() => handleApprovalDecision('approved')}
-                className="rounded-xl border border-emerald-300 bg-emerald-600 px-5 py-2.5 text-xs font-semibold text-white shadow-md hover:bg-emerald-700 dark:border-emerald-700 dark:bg-emerald-600 dark:hover:bg-emerald-700 disabled:opacity-50"
+                className="rounded-xl border-t border-t-emerald-400 border-x border-x-emerald-600 border-b border-b-emerald-800 bg-gradient-to-b from-emerald-600 to-emerald-700 px-5 py-2.5 text-xs font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_4px_rgba(0,0,0,0.15)] hover:from-emerald-550 hover:to-emerald-650 active:translate-y-[0.5px] disabled:opacity-50"
               >
                 {isSubmittingApproval ? 'Processing...' : 'Approve & Continue'}
               </button>
@@ -1044,15 +1003,18 @@ export default function AgentControlPage() {
 
       {/* Screenshot Preview Modal */}
       {selectedScreenshot && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/70 backdrop-blur-xs p-4 animate-in fade-in duration-200">
-          <div className="w-full max-w-4xl rounded-2xl border border-zinc-800 bg-zinc-900 p-6 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-zinc-800">
-              <h3 className="text-sm font-semibold text-zinc-100">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-4xl rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-zinc-200">
+              <h3 className="text-sm font-bold text-zinc-900 flex items-center gap-2">
+                <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                </svg>
                 Step Screenshot Preview
               </h3>
               <button
                 onClick={() => setSelectedScreenshot(null)}
-                className="rounded-lg bg-zinc-800 p-1.5 text-zinc-400 hover:text-white"
+                className="rounded-lg bg-zinc-100 p-1.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 transition-colors"
               >
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
@@ -1060,11 +1022,12 @@ export default function AgentControlPage() {
               </button>
             </div>
 
-            <div className="overflow-hidden rounded-xl border border-zinc-800 bg-black flex items-center justify-center p-2">
+            <div className="overflow-hidden rounded-xl border border-zinc-200 bg-zinc-100 flex items-center justify-center p-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={`data:image/png;base64,${selectedScreenshot}`}
                 alt="Agent Step Screenshot"
-                className="max-h-[70vh] w-auto object-contain rounded"
+                className="max-h-[70vh] w-auto object-contain rounded-lg shadow-sm"
               />
             </div>
           </div>
