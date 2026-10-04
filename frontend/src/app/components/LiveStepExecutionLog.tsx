@@ -42,23 +42,8 @@ export function LiveStepExecutionLog({
   const [copiedAllLogs, setCopiedAllLogs] = useState(false);
 
   const logContainerRef = useRef<HTMLDivElement>(null);
-
-  // Auto-scroll handler on step arrival
-  useEffect(() => {
-    if (autoScroll && logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-    }
-  }, [steps, autoScroll]);
-
-  // Handle manual scroll in log container
-  const handleScroll = () => {
-    if (!logContainerRef.current || !onSetAutoScroll) return;
-    const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight < 40;
-    if (isAtBottom !== autoScroll) {
-      onSetAutoScroll(isAtBottom);
-    }
-  };
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const isProgrammaticScrollRef = useRef(false);
 
   // Compute status counts
   const counts = useMemo(() => {
@@ -118,6 +103,58 @@ export function LiveStepExecutionLog({
       return true;
     });
   }, [steps, filterCategory, searchQuery]);
+
+  // Auto-scroll handler on step arrival, filter change, search change, expansion toggle, or autoScroll toggle
+  useEffect(() => {
+    if (!autoScroll) return;
+
+    const rafId = requestAnimationFrame(() => {
+      isProgrammaticScrollRef.current = true;
+      if (bottomRef.current && typeof bottomRef.current.scrollIntoView === 'function') {
+        bottomRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+      if (logContainerRef.current) {
+        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+      }
+      setTimeout(() => {
+        isProgrammaticScrollRef.current = false;
+      }, 200);
+    });
+
+    return () => cancelAnimationFrame(rafId);
+  }, [steps, filteredSteps.length, filterCategory, searchQuery, expandedStepIds, autoScroll]);
+
+  // Handle manual scroll in log container
+  const handleScroll = () => {
+    if (!logContainerRef.current || isProgrammaticScrollRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 45;
+    if (onSetAutoScroll && isAtBottom !== autoScroll) {
+      onSetAutoScroll(isAtBottom);
+    }
+  };
+
+  const handleToggleAutoScroll = () => {
+    if (onToggleAutoScroll) {
+      onToggleAutoScroll();
+    } else if (onSetAutoScroll) {
+      onSetAutoScroll(!autoScroll);
+    }
+    if (!autoScroll) {
+      requestAnimationFrame(() => {
+        isProgrammaticScrollRef.current = true;
+        if (bottomRef.current) {
+          bottomRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+        if (logContainerRef.current) {
+          logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+        }
+        setTimeout(() => {
+          isProgrammaticScrollRef.current = false;
+        }, 200);
+      });
+    }
+  };
 
   // Toggle single step expansion
   const toggleStep = (key: string) => {
@@ -296,7 +333,7 @@ export function LiveStepExecutionLog({
                   </span>
                 )}
 
-                {status === 'done' && (
+                {(status === 'done' || status === 'completed') && (
                   <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-300/80 px-2.5 py-0.5 text-[10px] font-bold tracking-wide uppercase text-emerald-800 shadow-2xs">
                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-600"></span>
                     Execution Done
@@ -307,6 +344,13 @@ export function LiveStepExecutionLog({
                   <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-50 border border-rose-300/80 px-2.5 py-0.5 text-[10px] font-bold tracking-wide uppercase text-rose-800 shadow-2xs">
                     <span className="h-1.5 w-1.5 rounded-full bg-rose-600"></span>
                     Failed
+                  </span>
+                )}
+
+                {status === 'stalled' && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-orange-50 border border-orange-300/80 px-2.5 py-0.5 text-[10px] font-bold tracking-wide uppercase text-orange-800 shadow-2xs">
+                    <span className="h-1.5 w-1.5 rounded-full bg-orange-600"></span>
+                    Stalled
                   </span>
                 )}
 
@@ -331,10 +375,12 @@ export function LiveStepExecutionLog({
                 className={`h-2 w-2 rounded-full ${
                   status === 'running'
                     ? 'bg-emerald-500 animate-pulse shadow-[0_0_6px_rgba(16,185,129,0.7)]'
-                    : status === 'done'
+                    : status === 'done' || status === 'completed'
                     ? 'bg-emerald-500'
                     : status === 'failed'
                     ? 'bg-rose-500'
+                    : status === 'stalled'
+                    ? 'bg-orange-500'
                     : 'bg-zinc-400'
                 }`}
               />
@@ -344,7 +390,7 @@ export function LiveStepExecutionLog({
             {/* Auto-scroll toggle */}
             <button
               type="button"
-              onClick={onToggleAutoScroll}
+              onClick={handleToggleAutoScroll}
               title={autoScroll ? 'Auto-scroll is active' : 'Click to resume auto-scrolling'}
               className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-all active:translate-y-[0.5px] ${
                 autoScroll
@@ -712,6 +758,7 @@ export function LiveStepExecutionLog({
             );
           })
         )}
+        <div ref={bottomRef} className="h-px w-full shrink-0" aria-hidden="true" />
       </div>
     </div>
   );

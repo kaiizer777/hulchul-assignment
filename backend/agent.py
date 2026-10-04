@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 
 import asyncpg
+import httpx
 from groq import AsyncGroq
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -174,33 +175,43 @@ class ParsedToolCall(BaseModel):
 
 def parse_tool_call(response_message: Any) -> Optional[ParsedToolCall]:
     """
-    Parses tool call information from a Groq / OpenAI ChatCompletionMessage.
+    Parses tool call information from OpenCode Zen (dict) or Groq / OpenAI ChatCompletionMessage.
     Returns ParsedToolCall or None if no valid tool call was returned.
     """
     if not response_message:
         return None
 
-    # Check native tool_calls attribute
-    tool_calls = getattr(response_message, "tool_calls", None)
+    # Check native tool_calls attribute or dict key
+    if isinstance(response_message, dict):
+        tool_calls = response_message.get("tool_calls")
+    else:
+        tool_calls = getattr(response_message, "tool_calls", None)
+
     if tool_calls and len(tool_calls) > 0:
         first_call = tool_calls[0]
-        call_id = str(getattr(first_call, "id", f"call_{uuid.uuid4().hex[:8]}"))
-        fn = getattr(first_call, "function", None)
-        if fn:
-            raw_name = getattr(fn, "name", "")
-            name = str(raw_name) if raw_name is not None else ""
-            raw_args = getattr(fn, "arguments", "{}")
-            if isinstance(raw_args, dict):
-                args = raw_args
-            elif isinstance(raw_args, str):
-                try:
-                    args = json.loads(raw_args) if raw_args.strip() else {}
-                except Exception as e:
-                    logger.warning(f"Failed to parse tool call arguments '{raw_args}': {e}")
-                    args = {}
-            else:
+        if isinstance(first_call, dict):
+            call_id = str(first_call.get("id") or f"call_{uuid.uuid4().hex[:8]}")
+            fn = first_call.get("function") or {}
+            raw_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
+            raw_args = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
+        else:
+            call_id = str(getattr(first_call, "id", f"call_{uuid.uuid4().hex[:8]}"))
+            fn = getattr(first_call, "function", None)
+            raw_name = getattr(fn, "name", "") if fn else ""
+            raw_args = getattr(fn, "arguments", "{}") if fn else "{}"
+
+        name = str(raw_name) if raw_name is not None else ""
+        if isinstance(raw_args, dict):
+            args = raw_args
+        elif isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args) if raw_args.strip() else {}
+            except Exception as e:
+                logger.warning(f"Failed to parse tool call arguments '{raw_args}': {e}")
                 args = {}
-            return ParsedToolCall(id=call_id, name=name, arguments=args)
+        else:
+            args = {}
+        return ParsedToolCall(id=call_id, name=name, arguments=args)
 
     return None
 
@@ -212,7 +223,11 @@ def is_goal_done(response_message: Any) -> bool:
     if not response_message:
         return False
 
-    content = getattr(response_message, "content", None)
+    if isinstance(response_message, dict):
+        content = response_message.get("content")
+    else:
+        content = getattr(response_message, "content", None)
+
     if not content or not isinstance(content, str):
         return False
 
@@ -246,13 +261,13 @@ class ReActAgent:
         pool: Optional[asyncpg.Pool] = None,
         groq_client: Optional[AsyncGroq] = None,
         redis_client: Optional[UpstashRedisClient] = None,
-        model: str = settings.GROQ_MODEL,
+        model: str = settings.OPENCODE_MODEL,
         max_iterations: int = settings.MAX_AGENT_ITERATIONS,
         on_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
         reconnect: Optional[Callable[[], Awaitable[Any]]] = None,
         max_reattaches: int = MAX_SESSION_REATTACHES,
     ):
-        """Initialize ReAct loop agent with tools, database pool, Groq LLM, and Redis clients."""
+        """Initialize ReAct loop agent with tools, database pool, OpenCode / Groq LLM, and Redis clients."""
         self.run_id = str(run_id or uuid.uuid4())
         self.tools = tools or PlaywrightTools(run_id=self.run_id, pool=pool)
         self.pool = pool
@@ -289,6 +304,73 @@ class ReActAgent:
 
         # Approval threshold extracted from goal or default
         self.approval_threshold: float = settings.DEFAULT_APPROVAL_THRESHOLD
+
+    async def call_llm(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
+        """
+        Executes an LLM chat completion using OpenCode Zen (Primary) with automatic
+        fallback to Groq if OpenCode fails, times out, rate-limits, or lacks an API key.
+        """
+        # 1. Try OpenCode Zen Primary (only if no custom Groq client was injected)
+        has_custom_groq = self._groq_client is not None or getattr(self.get_groq_client, "__func__", None) is not ReActAgent.get_groq_client
+        opencode_key = (settings.OPENCODE_API_KEY or "").strip()
+        opencode_base_url = (settings.OPENCODE_BASE_URL or "https://opencode.ai/zen/v1").strip().rstrip("/")
+        raw_opencode_model = (settings.OPENCODE_MODEL or "space-bunny-free").strip()
+        opencode_model = "space-bunny-free" if raw_opencode_model == "space-bunny" else raw_opencode_model
+
+        if not has_custom_groq and opencode_key:
+            endpoint = f"{opencode_base_url}/chat/completions" if not opencode_base_url.endswith("/chat/completions") else opencode_base_url
+            headers = {
+                "Authorization": f"Bearer {opencode_key}",
+                "Content-Type": "application/json",
+            }
+            payload: Dict[str, Any] = {
+                "model": opencode_model,
+                "messages": messages,
+                "temperature": 0.1,
+            }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+
+            try:
+                async with httpx.AsyncClient(timeout=35.0) as http_client:
+                    response = await http_client.post(endpoint, json=payload, headers=headers)
+                    if response.status_code == 200:
+                        data = response.json()
+                        choices = data.get("choices", [])
+                        if choices:
+                            raw_msg = choices[0].get("message", {})
+                            logger.info(f"Agent {self.run_id}: LLM completion succeeded via OpenCode Zen ({opencode_model}).")
+                            return raw_msg
+                        else:
+                            logger.warning(f"Agent {self.run_id}: OpenCode Zen response missing choices: {data}")
+                    else:
+                        logger.warning(f"Agent {self.run_id}: OpenCode Zen returned status {response.status_code}: {response.text[:200]}")
+            except Exception as oc_err:
+                logger.warning(f"Agent {self.run_id}: OpenCode Zen call failed ({oc_err}). Falling back to Groq...")
+        else:
+            logger.info(f"Agent {self.run_id}: OPENCODE_API_KEY not configured. Falling back to Groq...")
+
+        # 2. Fallback to Groq
+        groq_client = await self.get_groq_client()
+        groq_model = settings.GROQ_MODEL or "openai/gpt-oss-120b"
+        logger.info(f"Agent {self.run_id}: Calling fallback LLM Groq ({groq_model})...")
+        kwargs: Dict[str, Any] = {
+            "model": groq_model,
+            "messages": messages,
+            "temperature": 0.1,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        chat_completion = await groq_client.chat.completions.create(**kwargs)
+        choice = chat_completion.choices[0]
+        return choice.message
 
     async def get_groq_client(self) -> AsyncGroq:
         """Get or initialize the asynchronous Groq API client."""
@@ -1117,7 +1199,6 @@ class ReActAgent:
             {"role": "user", "content": f"Goal: {clean_goal}"},
         ]
 
-        groq_client = await self.get_groq_client()
         iteration = current_step_idx
         run_status = "running"
         final_summary: Optional[str] = None
@@ -1240,19 +1321,14 @@ class ReActAgent:
             iter_messages = list(messages)
             iter_messages.append({"role": "user", "content": page_context})
 
-            # Step 2: THINK - Send to Groq (openai/gpt-oss-120b) with tool definitions
+            # Step 2: THINK - Send to OpenCode Zen (Primary) with Groq fallback
             try:
-                chat_completion = await groq_client.chat.completions.create(
-                    model=self.model,
+                response_msg = await self.call_llm(
                     messages=iter_messages,
                     tools=TOOL_DEFINITIONS,
-                    tool_choice="auto",
-                    temperature=0.1,
                 )
-                choice = chat_completion.choices[0]
-                response_msg = choice.message
             except Exception as llm_err:
-                logger.error(f"Groq LLM completion failed on iteration {iteration}: {llm_err}")
+                logger.error(f"LLM completion failed on iteration {iteration}: {llm_err}")
                 llm_step_id = await self.persist_step(
                     action="llm_think",
                     result=f"failed: {llm_err}",
@@ -1280,7 +1356,8 @@ class ReActAgent:
                     if self._lease_ownership_lost:
                         return self._lease_lost_result(iteration, clean_goal, threshold)
                     logger.info(f"Agent {self.run_id}: Goal finished successfully.")
-                    final_summary = response_msg.content or "Task completed successfully."
+                    msg_content = response_msg.get("content") if isinstance(response_msg, dict) else getattr(response_msg, "content", None)
+                    final_summary = msg_content or "Task completed successfully."
                     run_status = "completed"
                     try:
                         await self.update_run_status("completed", release_lease=False)
@@ -1303,7 +1380,7 @@ class ReActAgent:
                         await self.stop_run_lease()
                 else:
                     # Model provided text but no tool call; check if model flagged approval in prose
-                    text_content = response_msg.content or ""
+                    text_content = (response_msg.get("content") if isinstance(response_msg, dict) else getattr(response_msg, "content", None)) or ""
                     is_approval_statement = bool(
                         re.search(r"(?:needs|requires|awaiting|requesting|hold(?:ing)?\s+for)\s+approval", text_content, re.IGNORECASE)
                         or re.search(r"(?:exceeds|above|over)\s+(?:the\s+)?(?:approval\s+)?threshold", text_content, re.IGNORECASE)

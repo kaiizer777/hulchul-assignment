@@ -172,16 +172,15 @@ async def get_browser_session(
     viewport: Optional[Dict[str, int]] = None,
 ) -> AsyncGenerator[BrowserSession, None]:
     """
-    Establish a connection to Browserless / Steel.dev over Chrome DevTools Protocol (CDP).
-    
-    Lambda is stateless and cannot bundle full browser binaries; this context manager
-    connects to the remote WebSocket endpoint on demand and guarantees clean teardown
-    of pages, contexts, browser connections, and the Playwright driver.
+    Establish a browser session. If a remote WebSocket endpoint (CDP) is provided or configured in
+    BROWSER_WS_ENDPOINT, connects over CDP (e.g. Steel.dev or Browserless).
+    Otherwise (or if endpoint is 'local'), launches a local Playwright Chromium instance for local development.
     """
-    ws_endpoint = endpoint if endpoint is not None else settings.BROWSER_WS_ENDPOINT
+    raw_endpoint = endpoint if endpoint is not None else settings.BROWSER_WS_ENDPOINT
+    ws_endpoint = raw_endpoint.strip() if raw_endpoint else ""
     if not ws_endpoint:
         raise BrowserConnectionError("BROWSER_WS_ENDPOINT is not configured in environment or .env")
-
+    use_local = ws_endpoint.lower() in ("local", "none")
     timeout = timeout_ms if timeout_ms is not None else settings.BROWSER_CONNECT_TIMEOUT_MS
 
     p: Optional[Playwright] = None
@@ -190,8 +189,62 @@ async def get_browser_session(
     page: Optional[Page] = None
     steel_api_key: Optional[str] = None
     steel_session_id: Optional[str] = None
-    actual_ws_endpoint = ws_endpoint
 
+    context_opts: Dict[str, Any] = {}
+    if viewport:
+        context_opts["viewport"] = viewport
+    else:
+        context_opts["viewport"] = {"width": 1280, "height": 800}
+
+    if use_local:
+        logger.info("Starting local Playwright Chromium browser...")
+        try:
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(**context_opts)
+            page = await context.new_page()
+
+            session = BrowserSession(
+                playwright=p,
+                browser=browser,
+                context=context,
+                page=page,
+                session_id=None,
+            )
+            yield session
+        except PlaywrightError as pe:
+            logger.error(f"Playwright error launching local browser: {pe}")
+            raise BrowserConnectionError(f"Failed to launch local browser: {pe}") from pe
+        except Exception as e:
+            logger.error(f"Unexpected error in local browser session: {e}")
+            raise BrowserConnectionError(f"Unexpected error in local browser session: {e}") from e
+        finally:
+            if page:
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except Exception as e:
+                    logger.warning(f"Error closing page: {e}")
+            if context:
+                try:
+                    await context.close()
+                except Exception as e:
+                    logger.warning(f"Error closing context: {e}")
+            if browser:
+                try:
+                    if browser.is_connected():
+                        await browser.close()
+                except Exception as e:
+                    logger.warning(f"Error closing browser: {e}")
+            if p:
+                try:
+                    await p.stop()
+                except Exception as e:
+                    logger.warning(f"Error stopping Playwright runtime: {e}")
+        return
+
+    # Remote CDP path
+    actual_ws_endpoint = ws_endpoint
     if ws_endpoint and ("localhost:9222" in ws_endpoint or "127.0.0.1:9222" in ws_endpoint):
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
@@ -242,14 +295,6 @@ async def get_browser_session(
     try:
         p = await async_playwright().start()
         browser = await p.chromium.connect_over_cdp(actual_ws_endpoint, timeout=timeout)
-        
-        # Create an isolated browser context per session
-        context_opts: Dict[str, Any] = {}
-        if viewport:
-            context_opts["viewport"] = viewport
-        else:
-            context_opts["viewport"] = {"width": 1280, "height": 800}
-
         context = await browser.new_context(**context_opts)
         page = await context.new_page()
 
@@ -307,11 +352,12 @@ async def verify_cdp_connection(
     retries: int = 1,
 ) -> Dict[str, Any]:
     """
-    Connect to the remote browser over CDP, perform a probe navigation,
+    Connect to the remote browser over CDP or local browser, perform a probe navigation,
     and return diagnostic connectivity metrics. Includes retry for transient connection drops.
     """
     start_time = time.perf_counter()
     last_error: Optional[Exception] = None
+    configured_endpoint = endpoint if endpoint is not None else settings.BROWSER_WS_ENDPOINT
 
     for attempt in range(retries + 1):
         try:
@@ -326,20 +372,20 @@ async def verify_cdp_connection(
                     "browser_type": browser_name,
                     "blank_page_title": title,
                     "latency_ms": elapsed_ms,
-                    "endpoint_configured": bool(endpoint or settings.BROWSER_WS_ENDPOINT),
+                    "endpoint_configured": bool(configured_endpoint),
                 }
         except Exception as e:
             last_error = e
             if attempt < retries:
-                logger.warning(f"CDP probe attempt {attempt + 1} failed: {e}. Retrying after 2s...")
+                logger.warning(f"Browser probe attempt {attempt + 1} failed: {e}. Retrying after 2s...")
                 await asyncio.sleep(2.0)
 
     elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
-    logger.error(f"CDP verification probe failed: {last_error}")
+    logger.error(f"Browser verification probe failed: {last_error}")
     return {
         "connected": False,
         "error": str(last_error),
         "latency_ms": elapsed_ms,
-        "endpoint_configured": bool(endpoint or settings.BROWSER_WS_ENDPOINT),
+        "endpoint_configured": bool(configured_endpoint),
     }
 

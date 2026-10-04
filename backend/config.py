@@ -21,7 +21,11 @@ class Settings:
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
     BROWSER_WS_ENDPOINT: str = os.getenv("BROWSER_WS_ENDPOINT", "")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    OPENCODE_API_KEY: str = os.getenv("OPENCODE_API_KEY", "")
+    OPENCODE_BASE_URL: str = os.getenv("OPENCODE_BASE_URL", "https://opencode.ai/zen/v1")
+    OPENCODE_MODEL: str = os.getenv("OPENCODE_MODEL", "space-bunny-free")
     UPSTASH_REDIS_REST_URL: str = os.getenv("UPSTASH_REDIS_REST_URL", "")
+    UPSTASH_REDIS_REST_TOKEN: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
     ERP_BASE_URL: str = (
         os.getenv("ERP_BASE_URL")
         or os.getenv("FRONTEND_URL")

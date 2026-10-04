@@ -544,14 +544,17 @@ class TestPhase24Agent(unittest.IsolatedAsyncioTestCase):
         )
         await agent.ensure_run_record(goal="Approval gate test")
 
-        # Simulate async background approval decision injection after 0.5s
+        # Simulate async background approval decision injection once pending state is written
         async def background_approver():
-            await asyncio.sleep(0.5)
-            pending = await self.redis.get_approval_pending(test_run_id)
-            nonce = pending.get("nonce") if pending else None
-            await self.redis.set_approval_decision(test_run_id, "approved", nonce=nonce)
+            for _ in range(40):
+                await asyncio.sleep(0.1)
+                pending = await self.redis.get_approval_pending(test_run_id)
+                if pending and pending.get("status") == "awaiting_approval":
+                    nonce = pending.get("nonce")
+                    await self.redis.set_approval_decision(test_run_id, "approved", nonce=nonce)
+                    break
 
-        asyncio.create_task(background_approver())
+        approver_task = asyncio.create_task(background_approver())
 
         outcome = await agent.handle_approval_gate(
             vendor="High Value Vendor",

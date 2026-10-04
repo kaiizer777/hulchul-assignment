@@ -1,441 +1,67 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import { StatusBadge } from '../components/StatusBadge';
 import { LiveStepExecutionLog } from '../components/LiveStepExecutionLog';
-
-const AGENT_API_BASE = '/api/agent';
-
-const agentProxyUnreachableMessage = (): string =>
-  `Cannot read a response from the agent proxy at ${AGENT_API_BASE} on this origin. ` +
-  'The request may have reached the backend, so the run status may be unknown: ' +
-  'check it before retrying. This origin, its proxy, or the backend behind it may be down.';
-
-interface StepEvent {
-  type: string;
-  run_id: string;
-  step_id?: string;
-  step_index?: number;
-  action: string;
-  result?: string;
-  timestamp: string;
-  has_screenshot?: boolean;
-  error?: string;
-}
-
-interface ApprovalData {
-  run_id: string;
-  status: string;
-  invoice_id?: string;
-  vendor?: string;
-  amount?: number;
-  po_number?: string;
-  threshold?: number;
-  nonce?: string;
-}
-
-interface VerificationRow {
-  invoice_id: string;
-  vendor: string;
-  amount: number;
-  po_number?: string;
-  expected_status: string;
-  actual_status: string;
-  pass_fail: boolean;
-  reason: string;
-  classification: string;
-}
-
-interface IncompleteItem {
-  invoice_id: string;
-  vendor: string;
-  amount: number;
-  po_number?: string;
-  status: string;
-  reason: string;
-}
-
-interface FailedStepEvidence {
-  step_id: string;
-  action: string;
-  result?: string;
-  screenshot_b64?: string;
-  timestamp: string;
-}
-
-interface VerificationReport {
-  run_id: string;
-  total_invoices: number;
-  pass_count: number;
-  fail_count: number;
-  incomplete_count: number;
-  verification_table: VerificationRow[];
-  incomplete_items: IncompleteItem[];
-  failed_steps: FailedStepEvidence[];
-}
-
-const DEFAULT_GOALS = [
-  "Process all pending invoices",
-  "Process only invoices from Vendor Acme",
-  "Hold anything over ₹25,000 for approval"
-];
-
-class BackendUnreachableError extends Error {}
-
-const readJsonBody = async <T,>(res: Response): Promise<T> => {
-  try {
-    return (await res.json()) as T;
-  } catch {
-    throw new Error(
-      `Backend returned a response that could not be read as JSON (HTTP ${res.status}).`
-    );
-  }
-};
+import {
+  useAgentStore,
+  isTerminalStatus,
+  PRESET_GOALS,
+  type AgentExecutionStatus,
+} from '../store/useAgentStore';
 
 export default function AgentControlPage() {
-  const [goal, setGoal] = useState("Process all pending invoices");
-  const [runId, setRunId] = useState<string | null>(null);
-  const [status, setStatus] = useState<string>("idle");
-  const [steps, setSteps] = useState<StepEvent[]>([]);
-  const [isStarting, setIsStarting] = useState(false);
-  const [isPausingOrResuming, setIsPausingOrResuming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const goal = useAgentStore((s) => s.goal);
+  const selectedPresetId = useAgentStore((s) => s.selectedPresetId);
+  const runId = useAgentStore((s) => s.runId);
+  const status = useAgentStore((s) => s.status);
+  const connectionState = useAgentStore((s) => s.connectionState);
+  const steps = useAgentStore((s) => s.steps);
+  const approvalData = useAgentStore((s) => s.approvalData);
+  const verificationReport = useAgentStore((s) => s.verificationReport);
+  const selectedScreenshot = useAgentStore((s) => s.selectedScreenshot);
+  const autoScroll = useAgentStore((s) => s.autoScroll);
+  const isStarting = useAgentStore((s) => s.isStarting);
+  const isPausingOrResuming = useAgentStore((s) => s.isPausingOrResuming);
+  const isSubmittingApproval = useAgentStore((s) => s.isSubmittingApproval);
+  const isFetchingScreenshot = useAgentStore((s) => s.isFetchingScreenshot);
+  const isFetchingVerification = useAgentStore((s) => s.isFetchingVerification);
+  const error = useAgentStore((s) => s.error);
+  const verificationError = useAgentStore((s) => s.verificationError);
+
+  const setGoal = useAgentStore((s) => s.setGoal);
+  const selectPreset = useAgentStore((s) => s.selectPreset);
+  const startRun = useAgentStore((s) => s.startRun);
+  const togglePause = useAgentStore((s) => s.togglePause);
+  const submitApproval = useAgentStore((s) => s.submitApproval);
+  const fetchVerification = useAgentStore((s) => s.fetchVerification);
+  const viewScreenshot = useAgentStore((s) => s.viewScreenshot);
+  const closeScreenshot = useAgentStore((s) => s.closeScreenshot);
+  const clearError = useAgentStore((s) => s.clearError);
+  const setAutoScroll = useAgentStore((s) => s.setAutoScroll);
+  const toggleAutoScroll = useAgentStore((s) => s.toggleAutoScroll);
+
   const [copiedRunId, setCopiedRunId] = useState(false);
 
-  // Approval Modal State
-  const [approvalData, setApprovalData] = useState<ApprovalData | null>(null);
-  const [isSubmittingApproval, setIsSubmittingApproval] = useState(false);
-  const submittedNonceRef = useRef<string | null>(null);
-
-  // Screenshot Modal State
-  const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
-  const [isFetchingScreenshot, setIsFetchingScreenshot] = useState(false);
-
-  // Auto-scroll log state
-  const [autoScroll, setAutoScroll] = useState(true);
-
-  // Verification Report State
-  const [verificationReport, setVerificationReport] = useState<VerificationReport | null>(null);
-  const [isFetchingVerification, setIsFetchingVerification] = useState(false);
-  const [verificationError, setVerificationError] = useState<string | null>(null);
-
-  const handleFetchVerification = useCallback(async () => {
-    if (!runId) return;
-    setIsFetchingVerification(true);
-    setVerificationError(null);
-    try {
-      let res: Response;
-      try {
-        res = await fetch(
-          `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/verification`,
-          { credentials: 'include' }
-        );
-      } catch {
-        throw new BackendUnreachableError();
-      }
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || `Failed to fetch verification report (${res.status})`);
-      }
-      const data = await readJsonBody<VerificationReport>(res);
-      setVerificationReport(data);
-    } catch (err: unknown) {
-      setVerificationError(
-        err instanceof BackendUnreachableError
-          ? agentProxyUnreachableMessage()
-          : err instanceof Error
-            ? err.message
-            : 'Failed to fetch verification report'
-      );
-    } finally {
-      setIsFetchingVerification(false);
-    }
-  }, [runId]);
-
+  // Client hydration sync with URL search params and local storage
   useEffect(() => {
-    if (runId && (status === 'done' || status === 'failed' || status === 'session_lost')) {
-      handleFetchVerification();
-    }
-  }, [runId, status, handleFetchVerification]);
-
-  const handleRunAgent = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!goal.trim() || isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval') return;
-
-    setIsStarting(true);
-    setError(null);
-    setSteps([]);
-    setStatus("running");
-    setVerificationReport(null);
-    submittedNonceRef.current = null;
-
-    try {
-      let res: Response;
-      try {
-        res = await fetch(`${AGENT_API_BASE}/run`, {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ goal: goal.trim() }),
-        });
-      } catch {
-        throw new BackendUnreachableError();
-      }
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || `Failed to start agent run (${res.status})`);
-      }
-
-      const data = await readJsonBody<{ run_id: string; status?: string }>(res);
-      setRunId(data.run_id);
-      setStatus(data.status || "running");
-    } catch (err: unknown) {
-      setError(
-        err instanceof BackendUnreachableError
-          ? agentProxyUnreachableMessage()
-          : err instanceof Error
-            ? err.message
-            : 'Failed to start agent run'
-      );
-      setStatus("failed");
-    } finally {
-      setIsStarting(false);
-    }
-  };
-
-  const appendStep = useCallback((step: StepEvent) => {
-    setSteps((prev) => {
-      if (step.step_id && prev.some((existing) => existing.step_id === step.step_id)) {
-        return prev;
-      }
-      return [...prev, step];
-    });
+    useAgentStore.getState().syncFromStorageOrUrl();
+    return () => {
+      useAgentStore.getState().resetRun();
+    };
   }, []);
 
-  useEffect(() => {
-    if (!runId) return;
+  const isTerminal = isTerminalStatus(status);
+  const isBusy =
+    isStarting ||
+    status === 'running' ||
+    status === 'paused' ||
+    status === 'awaiting_approval';
 
-    let eventSource: EventSource | null = null;
-    let pollInterval: NodeJS.Timeout | null = null;
-    const abortController = new AbortController();
-
-    try {
-      eventSource = new EventSource(`${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/stream`);
-
-      eventSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.type === 'status_change') {
-            setStatus(data.status);
-          } else if (data.type === 'step_complete' || data.type === 'step_failed' || data.type === 'step_unknown') {
-            appendStep(data);
-          } else if (data.type === 'session_lost') {
-            appendStep({ ...data, action: data.action || 'session_lost' });
-            if (data.terminal === true) {
-              setStatus('session_lost');
-            }
-          } else if (data.type === 'session_reattached') {
-            appendStep({ ...data, action: data.action || 'session_reattached' });
-          } else if (data.type === 'done') {
-            setStatus('done');
-          }
-        } catch (e) {
-          console.error('Failed to parse SSE message', e);
-        }
-      };
-
-      eventSource.addEventListener('status_change', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.status) setStatus(data.status);
-        } catch (e) {
-          console.warn('Failed to parse status_change SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.addEventListener('step_complete', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          appendStep(data);
-        } catch (e) {
-          console.warn('Failed to parse step_complete SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.addEventListener('step_failed', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          appendStep(data);
-        } catch (e) {
-          console.warn('Failed to parse step_failed SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.addEventListener('step_unknown', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          appendStep(data);
-        } catch (e) {
-          console.warn('Failed to parse step_unknown SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.addEventListener('session_lost', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          appendStep({ ...data, action: data.action || 'session_lost' });
-          if (data.terminal === true || data.status === 'session_lost') {
-            setStatus('session_lost');
-          }
-        } catch (e) {
-          console.warn('Failed to parse session_lost SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.addEventListener('session_reattached', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          appendStep({ ...data, action: data.action || 'session_reattached' });
-        } catch (e) {
-          console.warn('Failed to parse session_reattached SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.addEventListener('done', () => {
-        setStatus('done');
-      });
-
-      eventSource.addEventListener('needs_approval', (event: MessageEvent) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.nonce && data.nonce === submittedNonceRef.current) {
-            return;
-          }
-          setStatus('awaiting_approval');
-          setApprovalData(data);
-        } catch (e) {
-          console.warn('Failed to parse needs_approval SSE frame, ignoring', e);
-        }
-      });
-
-      eventSource.onerror = (err) => {
-        console.warn('SSE connection error or closed', err);
-      };
-    } catch (e) {
-      console.error('Failed to establish EventSource connection', e);
-    }
-
-    pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(
-          `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/approval`,
-          {
-            signal: abortController.signal,
-            credentials: 'include',
-          }
-        );
-        if (res.ok) {
-          const data = await res.json();
-          if (data.pending && data.approval_data) {
-            const nonce = data.approval_data.nonce;
-            if (nonce && nonce === submittedNonceRef.current) {
-              return;
-            }
-            setStatus('awaiting_approval');
-            setApprovalData(data.approval_data);
-          }
-        }
-      } catch (e) {
-        if (!(e instanceof Error && e.name === 'AbortError')) {
-          console.warn('Approval status poll failed', e);
-        }
-      }
-    }, 2500);
-
-    return () => {
-      abortController.abort();
-      if (eventSource) eventSource.close();
-      if (pollInterval) clearInterval(pollInterval);
-    };
-  }, [runId, appendStep]);
-
-  const handleTogglePause = async () => {
-    if (!runId || isPausingOrResuming) return;
-    setIsPausingOrResuming(true);
-    const isCurrentlyPaused = status === 'paused';
-    const endpoint = isCurrentlyPaused ? 'resume' : 'pause';
-
-    try {
-      const res = await fetch(
-        `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/${endpoint}`,
-        {
-          method: 'POST',
-          credentials: 'include',
-        }
-      );
-      if (!res.ok) throw new Error(`Failed to ${endpoint} run`);
-      setStatus(isCurrentlyPaused ? 'running' : 'paused');
-    } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : `Failed to ${endpoint} agent run`);
-    } finally {
-      setIsPausingOrResuming(false);
-    }
-  };
-
-  const handleApprovalDecision = async (decision: 'approved' | 'rejected') => {
-    if (!runId || isSubmittingApproval || !approvalData?.nonce) return;
-    setIsSubmittingApproval(true);
-    submittedNonceRef.current = approvalData.nonce;
-
-    try {
-      const res = await fetch(
-        `${AGENT_API_BASE}/runs/${encodeURIComponent(runId)}/approval`,
-        {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            decision,
-            nonce: approvalData.nonce,
-          }),
-        }
-      );
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.detail || `Failed to submit decision: ${decision}`);
-      }
-
-      setApprovalData(null);
-      setStatus('running');
-    } catch (err: unknown) {
-      alert(err instanceof Error ? err.message : 'Failed to submit approval decision');
-    } finally {
-      setIsSubmittingApproval(false);
-    }
-  };
-
-  const handleViewScreenshot = async (stepIdentifier?: string) => {
-    if (!stepIdentifier) return;
-    setIsFetchingScreenshot(true);
-    try {
-      const res = await fetch(
-        `${AGENT_API_BASE}/steps/${encodeURIComponent(stepIdentifier)}`,
-        { credentials: 'include' }
-      );
-      if (!res.ok) throw new Error('Failed to load screenshot');
-      const data = await res.json();
-      if (data.screenshot_b64) {
-        setSelectedScreenshot(data.screenshot_b64);
-      } else {
-        alert('No screenshot captured for this step.');
-      }
-    } catch {
-      alert('Failed to retrieve step screenshot.');
-    } finally {
-      setIsFetchingScreenshot(false);
-    }
+  const handleFormSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isBusy || !goal.trim()) return;
+    await startRun();
   };
 
   const copyRunIdToClipboard = async () => {
@@ -459,6 +85,18 @@ export default function AgentControlPage() {
               Agent Control & Live Monitor
             </h1>
             <StatusBadge status={status} />
+            {connectionState === 'connecting' && (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-600 border border-zinc-200">
+                <span className="h-1.5 w-1.5 rounded-full bg-zinc-400 animate-pulse" />
+                Connecting stream...
+              </span>
+            )}
+            {connectionState === 'reconnecting' && (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700 border border-amber-200">
+                <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+                Reconnecting stream...
+              </span>
+            )}
           </div>
           <p className="mt-1 text-sm text-zinc-500">
             Dispatch autonomous browser agents to process accounts payable, evaluate purchase orders, and manage approvals.
@@ -466,8 +104,9 @@ export default function AgentControlPage() {
         </div>
 
         {runId && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
+              type="button"
               onClick={copyRunIdToClipboard}
               className="inline-flex items-center gap-1.5 rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-3 py-1.5 font-mono text-xs text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_2px_rgba(0,0,0,0.04)] transition-all hover:bg-zinc-50 active:translate-y-[0.5px]"
               title="Click to copy full Run ID"
@@ -484,15 +123,23 @@ export default function AgentControlPage() {
             </button>
 
             <button
-              onClick={handleTogglePause}
-              disabled={isPausingOrResuming || status === 'done' || status === 'failed' || status === 'session_lost'}
+              type="button"
+              onClick={togglePause}
+              disabled={isPausingOrResuming || isTerminal}
               className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-1.5 text-xs font-semibold shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition-all active:translate-y-[0.5px] disabled:opacity-50 ${
                 status === 'paused'
                   ? 'border-t-emerald-200 border-x-emerald-300 border-b-emerald-400 bg-gradient-to-b from-emerald-50 to-emerald-100/70 text-emerald-800 hover:from-emerald-100 hover:to-emerald-200/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]'
                   : 'border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-gradient-to-b from-amber-50 to-amber-100/70 text-amber-800 hover:from-amber-100 hover:to-amber-200/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]'
               }`}
             >
-              {status === 'paused' ? (
+              {isPausingOrResuming ? (
+                <>
+                  <svg className="h-3.5 w-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  <span>Updating...</span>
+                </>
+              ) : status === 'paused' ? (
                 <>
                   <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
@@ -515,7 +162,7 @@ export default function AgentControlPage() {
 
       {/* Goal Dispatch Section */}
       <div className="rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)] transition-all">
-        <form onSubmit={handleRunAgent} className="space-y-4">
+        <form onSubmit={handleFormSubmit} className="space-y-4">
           <div>
             <div className="flex items-center justify-between">
               <label htmlFor="goal-input" className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-zinc-700">
@@ -526,7 +173,9 @@ export default function AgentControlPage() {
                 </span>
                 Agent Goal & Instruction
               </label>
-              <span className="text-[11px] text-zinc-400 font-medium">Press <kbd className="rounded border border-zinc-200 bg-zinc-100 px-1 py-0.5 font-mono text-[10px] text-zinc-600">Ctrl + Enter</kbd> to run</span>
+              <span className="text-[11px] text-zinc-400 font-medium">
+                Press <kbd className="rounded border border-zinc-200 bg-zinc-100 px-1 py-0.5 font-mono text-[10px] text-zinc-600">Ctrl + Enter</kbd> to run
+              </span>
             </div>
             <div className="mt-2.5">
               <textarea
@@ -537,7 +186,7 @@ export default function AgentControlPage() {
                 onKeyDown={(e) => {
                   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
                     e.preventDefault();
-                    handleRunAgent(e);
+                    handleFormSubmit(e);
                   }
                 }}
                 placeholder="Enter natural language instruction for the autonomous browser agent..."
@@ -549,20 +198,24 @@ export default function AgentControlPage() {
           {/* Preset Goal Suggestions */}
           <div className="flex flex-wrap items-center gap-2 pt-1">
             <span className="text-xs font-semibold text-zinc-400">Suggestions:</span>
-            {DEFAULT_GOALS.map((suggestion, idx) => (
-              <button
-                key={idx}
-                type="button"
-                onClick={() => setGoal(suggestion)}
-                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-all active:translate-y-[0.5px] ${
-                  goal === suggestion
-                    ? 'border-t-zinc-700 border-x-zinc-800 border-b-black bg-zinc-900 text-white shadow-xs'
-                    : 'border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 text-zinc-700 hover:border-zinc-300 hover:bg-zinc-100/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.02)]'
-                }`}
-              >
-                {suggestion}
-              </button>
-            ))}
+            {PRESET_GOALS.map((preset) => {
+              const isSelected =
+                goal.trim() === preset.goal.trim() || selectedPresetId === preset.id;
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => selectPreset(preset.id)}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-all active:translate-y-[0.5px] ${
+                    isSelected
+                      ? 'border-t-zinc-700 border-x-zinc-800 border-b-black bg-zinc-900 text-white shadow-xs font-semibold'
+                      : 'border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 text-zinc-700 hover:border-zinc-300 hover:bg-zinc-100/80 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.02)]'
+                  }`}
+                >
+                  {preset.goal}
+                </button>
+              );
+            })}
           </div>
 
           <div className="flex flex-col gap-3 pt-3 sm:flex-row sm:items-center sm:justify-between border-t border-zinc-100">
@@ -576,7 +229,7 @@ export default function AgentControlPage() {
 
             <button
               type="submit"
-              disabled={isStarting || status === 'running' || status === 'paused' || status === 'awaiting_approval'}
+              disabled={isBusy}
               className="inline-flex items-center justify-center gap-2 rounded-xl border-t border-t-zinc-700 border-x border-x-zinc-800 border-b border-b-black bg-gradient-to-b from-zinc-800 via-zinc-900 to-zinc-950 px-6 py-2.5 text-sm font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_6px_rgba(0,0,0,0.25)] transition-all hover:from-zinc-750 hover:to-zinc-900 active:translate-y-[0.5px] disabled:opacity-50"
             >
               {isStarting ? (
@@ -605,8 +258,15 @@ export default function AgentControlPage() {
         </form>
 
         {error && (
-          <div className="mt-4 rounded-xl border border-red-200 bg-red-50/90 p-4 text-xs text-red-800 shadow-2xs">
-            {error}
+          <div className="mt-4 flex items-center justify-between rounded-xl border border-red-200 bg-red-50/90 p-4 text-xs text-red-800 shadow-2xs">
+            <span>{error}</span>
+            <button
+              type="button"
+              onClick={clearError}
+              className="text-red-700 font-semibold underline underline-offset-2 ml-3 shrink-0"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
@@ -623,14 +283,17 @@ export default function AgentControlPage() {
         steps={steps}
         status={status}
         autoScroll={autoScroll}
-        onToggleAutoScroll={() => setAutoScroll((prev) => !prev)}
+        onToggleAutoScroll={toggleAutoScroll}
         onSetAutoScroll={setAutoScroll}
-        onViewScreenshot={handleViewScreenshot}
+        onViewScreenshot={viewScreenshot}
         isFetchingScreenshot={isFetchingScreenshot}
       />
 
       {/* Verification Report Section (Phase 4) */}
-      {(verificationReport || isFetchingVerification || verificationError || (runId && (status === 'done' || status === 'failed' || status === 'session_lost'))) && (
+      {(verificationReport ||
+        isFetchingVerification ||
+        verificationError ||
+        (runId && isTerminal)) && (
         <div className="rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)] space-y-6">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between pb-4 border-b border-zinc-200/80">
             <div>
@@ -647,7 +310,8 @@ export default function AgentControlPage() {
               </p>
             </div>
             <button
-              onClick={handleFetchVerification}
+              type="button"
+              onClick={() => fetchVerification()}
               disabled={isFetchingVerification || !runId}
               className="inline-flex items-center gap-2 rounded-xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 px-3.5 py-2 text-xs font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)] hover:bg-zinc-100 active:translate-y-[0.5px] disabled:opacity-50"
             >
@@ -756,13 +420,15 @@ export default function AgentControlPage() {
                           </span>
                         </td>
                         <td className="p-3">
-                          <span className={`rounded px-2 py-0.5 text-[10px] font-medium ${
-                            row.actual_status === 'completed'
-                              ? 'bg-emerald-100 text-emerald-800'
-                              : row.actual_status === 'flagged'
-                              ? 'bg-amber-100 text-amber-800'
-                              : 'bg-rose-100 text-rose-800'
-                          }`}>
+                          <span
+                            className={`rounded px-2 py-0.5 text-[10px] font-medium ${
+                              row.actual_status === 'completed'
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : row.actual_status === 'flagged'
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-rose-100 text-rose-800'
+                            }`}
+                          >
                             {row.actual_status}
                           </span>
                         </td>
@@ -779,7 +445,9 @@ export default function AgentControlPage() {
                         </td>
                         <td className="p-3 text-zinc-600">
                           <div>{row.reason}</div>
-                          <div className="text-[10px] text-zinc-400 mt-0.5 font-sans">Class: {row.classification}</div>
+                          <div className="text-[10px] text-zinc-400 mt-0.5 font-sans">
+                            Class: {row.classification}
+                          </div>
                         </td>
                       </tr>
                     ))}
@@ -805,7 +473,7 @@ export default function AgentControlPage() {
                         </div>
                         {step.screenshot_b64 ? (
                           <div
-                            onClick={() => setSelectedScreenshot(step.screenshot_b64 || null)}
+                            onClick={() => viewScreenshot(step.step_id)}
                             className="cursor-pointer overflow-hidden rounded-lg border border-red-200 bg-black group relative"
                           >
                             {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -836,7 +504,7 @@ export default function AgentControlPage() {
       )}
 
       {/* Approval Modal */}
-      {status === 'awaiting_approval' && (
+      {status === 'awaiting_approval' && approvalData && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/50 backdrop-blur-sm p-4">
           <div className="w-full max-w-lg rounded-2xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white p-6 shadow-2xl space-y-4">
             <div className="flex items-center gap-3">
@@ -858,22 +526,22 @@ export default function AgentControlPage() {
             <div className="my-5 rounded-xl border border-zinc-200 bg-zinc-50/70 p-4 space-y-2.5 font-mono text-xs shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
               <div className="flex justify-between">
                 <span className="text-zinc-500">Vendor:</span>
-                <span className="font-bold text-zinc-900">{approvalData?.vendor || '—'}</span>
+                <span className="font-bold text-zinc-900">{approvalData.vendor || '—'}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500">Invoice Amount:</span>
                 <span className="font-bold text-emerald-600">
-                  {approvalData?.amount != null ? `₹${approvalData.amount.toLocaleString()}` : '—'}
+                  {approvalData.amount != null ? `₹${approvalData.amount.toLocaleString()}` : '—'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500">PO Number:</span>
-                <span className="text-zinc-900">{approvalData?.po_number || '—'}</span>
+                <span className="text-zinc-900">{approvalData.po_number || '—'}</span>
               </div>
               <div className="flex justify-between">
                 <span className="text-zinc-500">Threshold:</span>
                 <span className="text-zinc-900">
-                  {approvalData?.threshold != null ? `₹${approvalData.threshold.toLocaleString()}` : '—'}
+                  {approvalData.threshold != null ? `₹${approvalData.threshold.toLocaleString()}` : '—'}
                 </span>
               </div>
             </div>
@@ -881,17 +549,17 @@ export default function AgentControlPage() {
             <div className="flex items-center justify-end gap-3 pt-2">
               <button
                 type="button"
-                disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
-                onClick={() => handleApprovalDecision('rejected')}
+                disabled={isSubmittingApproval || !approvalData.nonce}
+                onClick={() => submitApproval('rejected')}
                 className="rounded-xl border border-t-rose-200 border-x-rose-300 border-b-rose-400 bg-gradient-to-b from-rose-50 to-rose-100 px-4 py-2.5 text-xs font-semibold text-rose-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)] hover:bg-rose-100 active:translate-y-[0.5px] disabled:opacity-50"
               >
-                Reject Invoice
+                {isSubmittingApproval ? 'Processing...' : 'Reject Invoice'}
               </button>
 
               <button
                 type="button"
-                disabled={isSubmittingApproval || !approvalData || !approvalData.nonce}
-                onClick={() => handleApprovalDecision('approved')}
+                disabled={isSubmittingApproval || !approvalData.nonce}
+                onClick={() => submitApproval('approved')}
                 className="rounded-xl border-t border-t-emerald-400 border-x border-x-emerald-600 border-b border-b-emerald-800 bg-gradient-to-b from-emerald-600 to-emerald-700 px-5 py-2.5 text-xs font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_2px_4px_rgba(0,0,0,0.15)] hover:from-emerald-550 hover:to-emerald-650 active:translate-y-[0.5px] disabled:opacity-50"
               >
                 {isSubmittingApproval ? 'Processing...' : 'Approve & Continue'}
@@ -913,7 +581,8 @@ export default function AgentControlPage() {
                 Step Screenshot Preview
               </h3>
               <button
-                onClick={() => setSelectedScreenshot(null)}
+                type="button"
+                onClick={closeScreenshot}
                 className="rounded-lg bg-zinc-100 p-1.5 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800 transition-colors"
               >
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">

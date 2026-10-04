@@ -87,8 +87,9 @@ export function StatusBadge({ status, className = '' }: StatusBadgeProps) {
       break;
 
     case 'flagged':
+    case 'stalled':
       config = {
-        label: 'Flagged',
+        label: normalizedStatus === 'stalled' ? 'Stalled' : 'Flagged',
         badgeClass: 'bg-gradient-to-b from-orange-500/15 via-orange-500/10 to-orange-500/5 text-orange-800 border-t-orange-300/80 border-x-orange-400/50 border-b-orange-600/60 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]',
         dotClass: 'bg-orange-500 shadow-[0_0_6px_rgba(249,115,22,0.5)]',
       };
