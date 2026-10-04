@@ -44,6 +44,17 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 3b. agent_runs lease columns (issue #56).
+-- These MUST be added with ALTER TABLE ... ADD COLUMN IF NOT EXISTS, not inline in
+-- the CREATE TABLE above: agent_runs already exists in every deployed environment,
+-- so CREATE TABLE IF NOT EXISTS is a no-op there and an inline column would be
+-- silently absent in production, failing every lease query at runtime. There is no
+-- migration framework in this repo -- init_db.py IS the migration surface -- so this
+-- block has to stay decoupled from, and ordered independently of, the CREATE TABLE.
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS owner_id TEXT;
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE agent_runs ADD COLUMN IF NOT EXISTS attempt INT NOT NULL DEFAULT 0;
+
 -- 4. agent_steps
 CREATE TABLE IF NOT EXISTS agent_steps (
     step_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -71,6 +82,10 @@ DROP INDEX IF EXISTS idx_agent_steps_run_timestamp;
 CREATE INDEX IF NOT EXISTS idx_agent_steps_run_timestamp ON agent_steps(run_id, timestamp ASC, step_id ASC);
 CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
 CREATE INDEX IF NOT EXISTS idx_invoices_po_number ON invoices(po_number);
+
+-- Drives the startup orphan sweep, which only ever looks at status = 'running' with
+-- a NULL or expired lease.
+CREATE INDEX IF NOT EXISTS idx_agent_runs_status_lease ON agent_runs(status, lease_expires_at);
 """
 
 VERIFY_TABLES_SQL = """

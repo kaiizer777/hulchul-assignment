@@ -15,6 +15,7 @@ from sse_starlette.sse import EventSourceResponse
 from backend.config import settings
 from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
 from backend.browser import verify_cdp_connection
+from backend.run_lease import affected_rows, reconcile_orphaned_agent_runs
 from backend.verification import VerificationReport, generate_verification_report
 from backend.auth import (
     AUTH_UNAVAILABLE_DETAIL,
@@ -110,45 +111,114 @@ _reserved_agent_runs: Set[str] = set()
 # httpx.AsyncClient(timeout=10.0).
 TERMINAL_WRITE_IO_TIMEOUT_SECONDS: float = 5.0
 
+# Ceiling for the startup orphan sweep (issue #56). The asyncpg pool is built
+# without a command_timeout and acquire() is called without one (backend/db.py),
+# so a connection that is accepted and then never answers parks the sweep
+# indefinitely -- and `except` cannot catch a hang. The sweep runs before
+# `yield`, so that would stop the app serving requests at all, which is strictly
+# worse than an incomplete sweep. Bounding it lets the cold start proceed and
+# leaves the remainder to the next one.
+#
+# Exceeding it abandons the sweep mid-flight, which is safe: every candidate is
+# reclaimed by its own conditional UPDATE, so the runs already processed stay
+# reclaimed and only the rest are deferred.
+STARTUP_RECONCILE_TIMEOUT_SECONDS: float = 15.0
 
-async def _mark_agent_run_terminal(run_id_str: str, status: str) -> None:
+
+async def _mark_agent_run_terminal(
+    run_id_str: str,
+    status: str,
+    owner_id: Optional[str] = None,
+) -> None:
     """Record a terminal run status in the database, Redis, and the event hub.
 
     Each target is written in its own try/except so a failure in one cannot
     prevent the others from recording the terminal status.
 
+    ``owner_id`` fences the database write on the run lease (issue #56). This helper is
+    the fallback terminal write for an execution that never produced a result of its
+    own -- a cancellation, or an exception raised out of ``ReActAgent.run`` -- and an
+    expired lease does not stop its former holder. Without the fence a superseded
+    execution stamps ``failed`` over the run its replacement is executing, which is
+    the same overwrite the owner-scoped write in ``update_run_status`` exists to
+    prevent, and that fence is only load-bearing while every other terminal write
+    carries one too.
+
+    A NULL owner stays writable, so a cancellation landing before ``ensure_run_record``
+    claimed anything still records ``failed`` rather than stranding the run as
+    ``running`` until the next cold start. A *different* owner is not writable, and
+    neither is a live lease held by someone else: passing ``owner_id=None`` means no
+    agent was ever built for this run, so this request never claimed a lease and must
+    not touch a run somebody else holds.
+
+    A landed write also hands the lease back, in the same statement so the write stays
+    a single round trip. Leaving ``owner_id`` set on a ``failed`` row keeps the run
+    unclaimable for up to ``RUN_LEASE_SECONDS``, refusing a legitimate retry for the
+    whole window.
+
     The hub publication is gated on the database write succeeding. The stream
     reconciles `agent_runs.status` on every poll, so announcing a status the
     durable store never accepted would make the next poll re-emit the older one
     as a fresh transition and walk the client backwards from `failed` to
-    `running`. Redis is a separate read model and is still written
-    best-effort.
+    `running`. That gate now covers a fenced-out write as well: zero affected rows
+    means this execution does not own the run, so it has no status to announce.
+    Redis is a separate read model and is still written best-effort.
     """
     db_updated = False
+    # Distinct from db_updated: the database could not be reached or answered, which
+    # says nothing about who owns the run, as opposed to a fence that refused the write.
+    db_errored = False
     try:
         pool = await asyncio.wait_for(get_db_pool(), TERMINAL_WRITE_IO_TIMEOUT_SECONDS)
         async with pool.acquire(timeout=TERMINAL_WRITE_IO_TIMEOUT_SECONDS) as conn:
-            await asyncio.wait_for(
-                conn.execute(
-                    "UPDATE agent_runs SET status = $1 WHERE run_id = $2;",
-                    status,
-                    uuid.UUID(run_id_str),
-                ),
+            if owner_id is None:
+                statement = (
+                    "UPDATE agent_runs SET status = $1 WHERE run_id = $2 "
+                    "AND (agent_runs.owner_id IS NULL "
+                    "OR agent_runs.lease_expires_at <= now());"
+                )
+                params: Tuple[Any, ...] = (status, uuid.UUID(run_id_str))
+            else:
+                statement = (
+                    "UPDATE agent_runs "
+                    "SET status = $1, owner_id = NULL, lease_expires_at = NULL "
+                    "WHERE run_id = $2 "
+                    "AND (agent_runs.owner_id IS NULL OR agent_runs.owner_id = $3);"
+                )
+                params = (status, uuid.UUID(run_id_str), owner_id)
+            command_tag = await asyncio.wait_for(
+                conn.execute(statement, *params),
                 TERMINAL_WRITE_IO_TIMEOUT_SECONDS,
             )
-        db_updated = True
+        db_updated = affected_rows(command_tag) > 0
+        if not db_updated:
+            logger.warning(
+                f"Did not mark run {run_id_str} as {status}: this execution no longer "
+                "owns the run lease, so the newer owner's state stands."
+            )
     except Exception as db_err:
+        db_errored = True
         logger.warning(f"Could not mark run {run_id_str} as {status} in the database: {db_err}")
 
-    try:
-        from backend.redis_client import get_redis_client
-        redis = get_redis_client()
-        state = await redis.get_session_state(run_id_str)
-        if state is not None:
-            state["status"] = status
-            await redis.set_session_state(run_id_str, state)
-    except Exception as redis_err:
-        logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
+    # Only a fenced-out write is skipped. A database error still falls through to
+    # Redis: nothing is known about the durable row in that case, so the read model
+    # gets the best information available rather than none, and
+    # test_issue29_nonblocking pins that contract for a stalled database. A fenced-out
+    # write is the opposite case -- the newer owner's state is known to be correct and
+    # this execution has no claim on the run -- so writing `failed` into the shared
+    # snapshot would hand clients exactly the status the database and the hub just
+    # refused to accept. set_session_state replaces the snapshot's status outright, so
+    # the clobber is not limited to the field.
+    if db_updated or db_errored:
+        try:
+            from backend.redis_client import get_redis_client
+            redis = get_redis_client()
+            state = await redis.get_session_state(run_id_str)
+            if state is not None:
+                state["status"] = status
+                await redis.set_session_state(run_id_str, state)
+        except Exception as redis_err:
+            logger.warning(f"Could not mark run {run_id_str} as {status} in Redis: {redis_err}")
 
     if not db_updated:
         return
@@ -195,6 +265,13 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
     # 'completed', and writing 'failed' over it would contradict the durable
     # record the SSE poll reads on every pass.
     agent_finished = False
+
+    # Retained past the block that builds it so the two terminal-status arms below can
+    # fence on the run lease (issue #56). Without a reference to the agent those arms
+    # have only _mark_agent_run_terminal to fall back on, which is why it now needs an
+    # owner id. None means no agent was ever constructed -- the CDP session or the
+    # ReActAgent constructor failed first -- so this request never claimed a lease.
+    agent: Optional["ReActAgent"] = None
 
     async def _enter_cdp_session():
         """Enter a browser session context manager and track it for later release."""
@@ -270,7 +347,11 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         # bounded (TERMINAL_WRITE_IO_TIMEOUT_SECONDS), so the shield is never
         # waiting on an unbounded database await. Lifespan never awaits these
         # tasks, so there is no drain to stall either way.
-        terminal_write = asyncio.ensure_future(_mark_agent_run_terminal(run_id_str, "failed"))
+        terminal_write = asyncio.ensure_future(
+            _mark_agent_run_terminal(
+                run_id_str, "failed", agent.run_owner_id if agent is not None else None
+            )
+        )
         # Registered before the shield, not only on the cancellation path below,
         # so the fallback log also covers a cancellation landing between creating
         # the task and awaiting it.
@@ -281,7 +362,12 @@ async def _execute_agent_run_background(run_id_str: str, goal: str) -> None:
         raise
     except Exception as e:
         logger.exception(f"Background agent run {run_id_str} failed: {e}")
-        await _mark_agent_run_terminal(run_id_str, "failed")
+        # Fenced on the lease owner for the same reason as the cancellation arm: a
+        # run() that raised because it lost the lease must not stamp 'failed' over
+        # the run its replacement is executing.
+        await _mark_agent_run_terminal(
+            run_id_str, "failed", agent.run_owner_id if agent is not None else None
+        )
     finally:
         current = asyncio.current_task()
         if current is not None and _active_agent_tasks.get(run_id_str) is current:
@@ -305,6 +391,29 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to initialize database pool on startup: {e}")
         # Allow app to start even if DB is momentarily unreachable, health checks will report degraded
+
+    # Reclaim runs abandoned by a previous execution environment (issue #56). Separate
+    # try/except from pool init: a failed sweep must never be able to stop the app from
+    # starting, and adding DB round trips to every cold start is the one thing a
+    # serverless invocation cannot afford.
+    try:
+        pool = await get_db_pool()
+        reclaimed = await asyncio.wait_for(
+            reconcile_orphaned_agent_runs(pool),
+            timeout=STARTUP_RECONCILE_TIMEOUT_SECONDS,
+        )
+        if reclaimed:
+            logger.error(
+                f"Reconciled {len(reclaimed)} orphaned agent run(s) on startup: {reclaimed}"
+            )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Startup orphan sweep exceeded {STARTUP_RECONCILE_TIMEOUT_SECONDS}s and was "
+            "abandoned; any runs it did not reach stay 'running' and are retried on the "
+            "next cold start."
+        )
+    except Exception as e:
+        logger.error(f"Failed to reconcile orphaned agent runs on startup: {e}")
     yield
     logger.info("FastAPI shutting down: closing asyncpg database pool...")
     await close_db_pool()
@@ -661,31 +770,57 @@ async def run_agent_endpoint(
     try:
         pool = await get_db_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
+            # DO NOTHING, not DO UPDATE SET status = 'running' (issue #56). This runs
+            # before the background task claims the run lease, so it cannot know whether
+            # this request will be accepted. An unconditional update therefore wrote
+            # 'running' for a run whose claim was about to be refused, leaving a row the
+            # client was told was running with no executor behind it, and reset a live
+            # owner's 'paused' / 'awaiting_approval' back to 'running' on every duplicate
+            # request -- which that owner never re-reads, so nothing noticed.
+            #
+            # Creating the row is still this statement's job: the SSE stream replays
+            # agent_runs on connect, so the run has to exist before the client opens it.
+            # Status and goal transitions on an existing row belong to
+            # ReActAgent.ensure_run_record, which is the lease-aware statement and can
+            # make them only once it actually holds the lease.
+            #
+            # RETURNING is not needed to tell the two outcomes apart: with DO NOTHING the
+            # command tag already carries it -- "INSERT 0 1" when this request created
+            # the row, "INSERT 0 0" when it already existed. execute() rather than
+            # fetchval() keeps this a single round trip and leaves the statement's shape
+            # unchanged for anything asserting on it.
+            insert_tag = await conn.execute(
                 """
                 INSERT INTO agent_runs (run_id, goal, status, created_at)
                 VALUES ($1, $2, 'running', now())
-                ON CONFLICT (run_id) DO UPDATE SET status = 'running';
+                ON CONFLICT (run_id) DO NOTHING;
                 """,
                 uuid.UUID(run_id_str),
                 goal,
             )
 
-        try:
-            from backend.redis_client import get_redis_client
-            redis = get_redis_client()
-            await redis.set_session_state(
-                run_id_str,
-                {
-                    "run_id": run_id_str,
-                    "goal": goal,
-                    "threshold": threshold,
-                    "current_step": 0,
-                    "status": "running",
-                },
-            )
-        except Exception as redis_err:
-            logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
+        # Only for a row this request actually created. set_session_state is a plain
+        # SET, so it replaces the whole snapshot: seeding it unconditionally would
+        # rewrite a live run's 'paused' / 'awaiting_approval' state and its step index
+        # back to running/0 on every duplicate request, from any process, while the
+        # Postgres row -- which the agent and the SSE poll both read -- correctly kept
+        # its status. run() seeds the snapshot itself once it holds the lease.
+        if affected_rows(insert_tag) > 0:
+            try:
+                from backend.redis_client import get_redis_client
+                redis = get_redis_client()
+                await redis.set_session_state(
+                    run_id_str,
+                    {
+                        "run_id": run_id_str,
+                        "goal": goal,
+                        "threshold": threshold,
+                        "current_step": 0,
+                        "status": "running",
+                    },
+                )
+            except Exception as redis_err:
+                logger.warning(f"Best-effort session state init failed for run {run_id_str}: {redis_err}")
 
         task = asyncio.create_task(_execute_agent_run_background(run_id_str, goal))
         _active_agent_tasks[run_id_str] = task

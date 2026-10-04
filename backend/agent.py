@@ -15,6 +15,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.config import settings
 from backend.db import get_db_pool
 from backend.redis_client import UpstashRedisClient, get_redis_client
+from backend.run_lease import (
+    TERMINAL_RUN_STATUSES,
+    affected_rows,
+    release_run_lease,
+    run_lease_heartbeat,
+)
 from backend.tools import (
     PlaywrightTools,
     TOOL_DEFINITIONS,
@@ -271,6 +277,16 @@ class ReActAgent:
         # Track idempotency checks performed during this run (cache key: entity_type:identifier -> check_result)
         self._checked_entities: Dict[str, Dict[str, Any]] = {}
 
+        # Identity this execution holds its run lease under (issue #56). Per-instance,
+        # so two concurrent executions of the same run_id are always distinct owners
+        # and the second one is refused rather than silently joining the first.
+        self._run_owner_id: str = uuid.uuid4().hex
+        self._run_heartbeat_task: Optional[asyncio.Task] = None
+        # Set by the heartbeat once a renewal matches zero rows, i.e. this execution
+        # no longer owns the run. Checked by run() at each point where it would
+        # otherwise execute a tool or write state (issue #56).
+        self._lease_ownership_lost: bool = False
+
         # Approval threshold extracted from goal or default
         self.approval_threshold: float = settings.DEFAULT_APPROVAL_THRESHOLD
 
@@ -314,37 +330,230 @@ class ReActAgent:
         except Exception:
             pass
 
-    async def ensure_run_record(self, goal: str = "Agent Execution Run") -> None:
-        """Ensure an agent_runs row exists in Neon database."""
+    async def ensure_run_record(
+        self,
+        goal: str = "Agent Execution Run",
+        start_heartbeat: bool = False,
+    ) -> bool:
+        """Ensure an agent_runs row exists and is owned by this execution.
+
+        Single atomic upsert: the row is created as ``running`` under this
+        execution's lease, or an existing row is taken over only when no live owner
+        holds it. Returns ``False`` when the claim is refused because another owner
+        holds an unexpired lease, which is the caller's signal not to execute --
+        that is what stops a duplicate request or a retry from driving the same
+        run_id twice.
+
+        The lease is established by this statement rather than by a follow-up claim
+        call because a fresh run has no row to claim yet, and splitting the accept into
+        "upsert" then "claim" would leave a window where a second request could upsert
+        the row between the two.
+
+        This is the only claim decision in the codebase. An earlier draft also carried a
+        standalone ``claim_run_lease`` helper, which nothing called: it was a second
+        implementation of the same decision and it had already drifted, since it refused
+        a terminal row outright where this statement deliberately resurrects one.
+
+        Concurrency is handled by the conditional ``ON CONFLICT DO UPDATE`` alone, not
+        by a preceding ``SELECT ... FOR UPDATE SKIP LOCKED``. ``pool.acquire()`` is not a
+        transaction, so such a ``SELECT`` autocommits and drops its row lock before the
+        upsert runs, which makes the two statements non-atomic -- the lock is released
+        before it can exclude anyone. What actually serialises concurrent claimants is
+        that the second statement blocks on the row lock the first one holds and then
+        re-evaluates its ``WHERE`` against the committed row, finding a live lease and
+        taking no branch.
+
+        Resurrection of a terminal run (no live lease) is preserved deliberately: that
+        is the resume/recovery path for a run that previously stalled or failed, and
+        existing recovery flows depend on it.
+
+        ``start_heartbeat`` is only set by ``run``. ``persist_step`` also calls this
+        as foreign-key recovery when a row is missing, and a bookkeeping write must
+        not spawn a lease heartbeat.
+        """
         pool = await self.get_db()
         async with pool.acquire() as conn:
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
-                INSERT INTO agent_runs (run_id, goal, status, created_at)
-                VALUES ($1, $2, 'running', now())
-                ON CONFLICT (run_id) DO UPDATE SET status = 'running';
+                INSERT INTO agent_runs
+                    (run_id, goal, status, owner_id, lease_expires_at, attempt, created_at)
+                VALUES
+                    ($1, $2, 'running', $3, now() + make_interval(secs => $4::double precision), 1, now())
+                ON CONFLICT (run_id) DO UPDATE SET
+                    goal = EXCLUDED.goal,
+                    status = 'running',
+                    owner_id = EXCLUDED.owner_id,
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    attempt = agent_runs.attempt + 1
+                WHERE agent_runs.lease_expires_at IS NULL
+                   OR agent_runs.lease_expires_at <= now()
+                   OR agent_runs.owner_id = EXCLUDED.owner_id
+                RETURNING run_id, status, owner_id, attempt, lease_expires_at
                 """,
                 uuid.UUID(self.run_id),
                 goal,
+                self._run_owner_id,
+                float(settings.RUN_LEASE_SECONDS),
             )
 
-    async def update_run_status(self, status: str) -> None:
-        """Update agent_runs record status in Neon database and emit status_change event."""
+        if row is None:
+            logger.error(
+                f"Run {self.run_id} is leased by another live owner; refusing to execute."
+            )
+            return False
+
+        if start_heartbeat:
+            self._start_run_lease_heartbeat(pool)
+        return True
+
+    @property
+    def run_owner_id(self) -> str:
+        """Lease identity this execution holds its run under.
+
+        Read by ``backend/main.py`` so the background task's fallback terminal-status
+        write can be fenced on ownership the same way ``update_run_status`` is
+        (issue #56). That write is reached when this execution produced no result of
+        its own -- a cancellation, or an exception out of ``run()`` -- and an expired
+        lease does not stop its former holder, so without the fence it stamps a
+        terminal status over the run its replacement is executing.
+        """
+        return self._run_owner_id
+
+    def _mark_run_lease_lost(self) -> None:
+        """Record that the heartbeat lost this run's lease.
+
+        Invoked from the heartbeat task, so it must stay synchronous and must never
+        raise: an exception here would surface as an unhandled task exception. Idempotent
+        because the heartbeat reports the loss once but ``run()`` reads the flag at
+        several checkpoints.
+        """
+        if self._lease_ownership_lost:
+            return
+        self._lease_ownership_lost = True
+        logger.error(
+            f"Agent {self.run_id} lost its run lease to another execution; "
+            "this execution will stop acting on the run."
+        )
+
+    def _lease_lost_result(self, iteration: int, goal: str, threshold: float) -> Dict[str, Any]:
+        """Terminal result returned by ``run()`` when ownership of the run was lost.
+
+        Reported as ``failed`` for the same reason the lease-refused branch of ``run()``
+        does: this execution produced no outcome of its own, and a status the durable
+        store does not hold would only be contradicted by the owner's next write. The
+        distinction lives in the summary, which is what a log reader needs.
+
+        Returned rather than raised on purpose. Raising would unwind into the caller's
+        cancellation/exception handler, whose terminal-status write is not owner-scoped
+        and would then stamp ``failed`` over the run the newer owner is executing.
+        """
+        return {
+            "run_id": self.run_id,
+            "status": "failed",
+            "iterations": iteration,
+            "goal": goal,
+            "threshold": threshold,
+            "summary": (
+                "Run lease was lost to another execution; this execution stopped "
+                "without executing further steps."
+            ),
+        }
+
+    def _start_run_lease_heartbeat(self, pool: asyncpg.Pool) -> None:
+        """Start the out-of-band lease renewal task for this run, if not already running."""
+        if self._run_heartbeat_task is not None and not self._run_heartbeat_task.done():
+            return
+        try:
+            self._run_heartbeat_task = asyncio.create_task(
+                run_lease_heartbeat(
+                    pool=pool,
+                    run_id=self.run_id,
+                    owner_id=self._run_owner_id,
+                    interval_seconds=settings.RUN_HEARTBEAT_SECONDS,
+                    lease_seconds=settings.RUN_LEASE_SECONDS,
+                    owner_task=asyncio.current_task(),
+                    on_ownership_lost=self._mark_run_lease_lost,
+                )
+            )
+        except RuntimeError as e:
+            # No running loop: the lease still exists, it just will not be renewed,
+            # so it lapses and reconciliation can reclaim the run.
+            logger.warning(f"Could not start run lease heartbeat for {self.run_id}: {e}")
+
+    async def stop_run_lease(self) -> None:
+        """Cancel the heartbeat and hand the lease back. Safe to call more than once."""
+        task = self._run_heartbeat_task
+        self._run_heartbeat_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        try:
+            pool = await self.get_db()
+            await release_run_lease(pool, self.run_id, self._run_owner_id)
+        except Exception as e:
+            # Never raise from here: this runs in the cleanup path of a run that is
+            # already finishing or unwinding. A lease we cannot release simply lapses,
+            # and a lapsed lease on a terminal run is inert.
+            logger.warning(f"Failed to release run lease for {self.run_id}: {e}")
+
+    async def update_run_status(self, status: str, release_lease: bool = True) -> None:
+        """Update agent_runs record status in Neon database and emit status_change event.
+
+        The write is fenced on the lease owner (issue #56). A lease expiring does not
+        stop the old holder: a frozen-then-thawed execution can wake up mid-run and
+        write `completed` straight over a newer owner's state, including a run that
+        reconciliation already failed. A NULL owner is *not* writable either -- NULL
+        means the lease was released or the run was reclaimed, and in both cases this
+        execution is not the owner. ``run()`` always claims the lease via
+        ``ensure_run_record`` before any status write, so the legitimate writer is
+        always fenced in.
+
+        A fenced-out write emits no ``status_change``: announcing a status that never
+        reached the database would be a lie the SSE stream would then broadcast.
+
+        The lease is released only when the write actually landed. Releasing on the
+        failure path would clear ``owner_id`` / ``lease_expires_at`` while
+        ``agent_runs.status`` is still ``running``, which is exactly the orphan
+        predicate: the row becomes claimable by a duplicate request and by the next
+        startup sweep while this execution is still running, and nothing renews or
+        fences it any more. Leaving the lease in place is the safe direction -- it
+        lapses on its own and the run stays owned until it does.
+
+        Callers which publish more durable state after the status write must pass
+        ``release_lease=False`` and release explicitly once the final publish lands,
+        otherwise the run is claimable mid-publish.
+        """
+        landed = False
         try:
             pool = await self.get_db()
             async with pool.acquire() as conn:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE agent_runs
                     SET status = $1
-                    WHERE run_id = $2;
+                    WHERE run_id = $2
+                      AND owner_id = $3;
                     """,
                     status,
                     uuid.UUID(self.run_id),
+                    self._run_owner_id,
                 )
+            if affected_rows(result) == 0:
+                logger.warning(
+                    f"Dropped '{status}' for run {self.run_id}: ownership was lost to "
+                    "another execution."
+                )
+                return
+            landed = True
             await self.emit_event("status_change", {"status": status})
         except Exception as e:
             logger.error(f"Failed to update agent_runs status for {self.run_id}: {e}")
+        finally:
+            # Every terminal transition is the last thing this execution does, so this
+            # is the one place guaranteed to run on each exit path. Non-terminal
+            # transitions (running, paused, awaiting_approval) keep the lease: the run
+            # is still the caller's to renew.
+            if status in TERMINAL_RUN_STATUSES and landed and release_lease:
+                await self.stop_run_lease()
 
     async def persist_step(
         self,
@@ -552,9 +761,20 @@ class ReActAgent:
         Pauses the agent loop and waits for human approval via Upstash Redis (Phase 2.7).
         Emits 'needs_approval' SSE event, writes awaiting state to Redis, polls every 2 seconds,
         and on rejection marks the invoice as 'skipped' in Neon before moving to the next invoice.
-        Returns 'approved', 'rejected', or 'stalled'.
+        Returns 'approved', 'rejected', 'stalled', or 'lease_lost'.
+
+        'lease_lost' is not a decision about the invoice: it means the run's lease was
+        taken over while this gate was polling, so this execution no longer owns the
+        run and must not clear the approval keys, mark the invoice skipped, or publish
+        a gate outcome. ``run()`` maps it to the lease-lost terminal result.
         """
         logger.info(f"Agent {self.run_id}: Triggering approval gate for invoice {invoice_id or po_number} (Amount: {amount})")
+
+        if self._lease_ownership_lost:
+            logger.error(
+                f"Agent {self.run_id}: run lease already lost; not opening the approval gate."
+            )
+            return "lease_lost"
 
         redis = await self.get_redis()
         # Fail fast if Redis is not configured
@@ -632,11 +852,34 @@ class ReActAgent:
 
         while asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(2.0)
+            # The gate blocks for up to APPROVAL_TIMEOUT_SECONDS, which is long enough
+            # for the lease to be reclaimed underneath it. Everything below this point
+            # writes durable state (approval keys, agent_steps, invoices.status) and
+            # publishes a gate outcome, so the check belongs here rather than at the
+            # gate's entry only.
+            if self._lease_ownership_lost:
+                logger.error(
+                    f"Agent {self.run_id}: run lease lost while awaiting approval; "
+                    "abandoning the gate without touching its state."
+                )
+                return "lease_lost"
             try:
                 dec_record = await redis.get_approval_decision_record(self.run_id)
             except Exception as poll_err:
                 logger.warning(f"Agent {self.run_id}: Error polling approval decision from Redis: {poll_err}")
                 continue
+
+            # Re-checked after the read, not only before it: the read is an await, so
+            # ownership can be reported lost while it is in flight. Consuming the
+            # decision anyway would clear the approval keys and, on the rejection
+            # path, mark the invoice skipped in Neon for a run this execution no
+            # longer owns.
+            if self._lease_ownership_lost:
+                logger.error(
+                    f"Agent {self.run_id}: run lease lost while reading the approval "
+                    "decision; abandoning the gate without applying it."
+                )
+                return "lease_lost"
 
             if dec_record:
                 dec_nonce = dec_record.get("nonce")
@@ -785,6 +1028,11 @@ class ReActAgent:
 
     async def _abort_session_lost(self, iteration: int, error: str, threshold: float, clean_goal: str) -> Dict[str, Any]:
         """Persist and broadcast terminal session_lost distinct from step_failed."""
+        # Reached from deep inside an iteration (after OBSERVE or after ACT), so the
+        # top-of-loop guard has already passed. Losing the lease must not turn into a
+        # second, competing terminal announcement.
+        if self._lease_ownership_lost:
+            return self._lease_lost_result(iteration, clean_goal, threshold)
         session_lost_step_id = await self.persist_step(
             action="session_lost",
             result=f"session_lost: {error} after {self._reattach_attempts} reattach attempt(s)",
@@ -824,8 +1072,22 @@ class ReActAgent:
         logger.info(f"Starting ReAct agent run {self.run_id} with goal: '{clean_goal}'")
         self._reattach_attempts = 0
 
-        # 1. Ensure run record in database
-        await self.ensure_run_record(clean_goal)
+        # 1. Ensure run record in database, taking the run lease. A refusal means
+        # another live owner is already executing this run_id; bail out instead of
+        # racing it, so a duplicate request cannot double-run an ERP workflow.
+        accepted = await self.ensure_run_record(clean_goal, start_heartbeat=True)
+        if not accepted:
+            return {
+                "run_id": self.run_id,
+                "status": "failed",
+                "iterations": 0,
+                "goal": clean_goal,
+                "threshold": settings.DEFAULT_APPROVAL_THRESHOLD,
+                "summary": (
+                    "Run is already leased by another active execution; "
+                    "this request did not start it."
+                ),
+            }
 
         # 2. Extract constraints from goal
         threshold = extract_approval_threshold(clean_goal, default=settings.DEFAULT_APPROVAL_THRESHOLD)
@@ -876,6 +1138,14 @@ class ReActAgent:
             self._current_iteration = iteration
             logger.info(f"Agent {self.run_id}: Iteration {iteration}/{self.max_iterations}")
 
+            # Ownership check at the iteration boundary. This is the guard that stops a
+            # superseded execution from resuming anything the heartbeat observed while
+            # the previous iteration was running, including the pause wait below --
+            # a pause polls Redis once a second for up to PAUSE_TIMEOUT_SECONDS, which
+            # is more than enough time for the lease to be reclaimed.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
+
             # Check pause flag in Redis (Phase 2.9 & Phase 3)
             if redis.is_configured:
                 is_paused = await redis.get_pause_flag(self.run_id)
@@ -885,22 +1155,31 @@ class ReActAgent:
                     await self.emit_event("paused", {"step": iteration})
                     pause_deadline = asyncio.get_running_loop().time() + settings.PAUSE_TIMEOUT_SECONDS
                     while await redis.get_pause_flag(self.run_id):
+                        # Re-checked on every poll rather than only at the iteration
+                        # boundary: the wait below runs up to PAUSE_TIMEOUT_SECONDS, and
+                        # a superseded execution must not sit there holding the pause
+                        # open while a newer owner drives the same run.
+                        if self._lease_ownership_lost:
+                            return self._lease_lost_result(iteration, clean_goal, threshold)
                         if asyncio.get_running_loop().time() > pause_deadline:
                             logger.warning(f"Agent {self.run_id}: Pause wait timed out after {settings.PAUSE_TIMEOUT_SECONDS}s. Stalling run.")
-                            await self.update_run_status("stalled")
-                            await self.persist_step(
-                                action="stalled",
-                                result=f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
-                            )
-                            await self.emit_event("stalled", {"step": iteration, "reason": "pause_timeout"})
-                            return {
-                                "run_id": self.run_id,
-                                "status": "stalled",
-                                "iterations": iteration,
-                                "goal": clean_goal,
-                                "threshold": threshold,
-                                "summary": f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
-                            }
+                            try:
+                                await self.update_run_status("stalled", release_lease=False)
+                                await self.persist_step(
+                                    action="stalled",
+                                    result=f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
+                                )
+                                await self.emit_event("stalled", {"step": iteration, "reason": "pause_timeout"})
+                                return {
+                                    "run_id": self.run_id,
+                                    "status": "stalled",
+                                    "iterations": iteration,
+                                    "goal": clean_goal,
+                                    "threshold": threshold,
+                                    "summary": f"Run paused and timed out after {settings.PAUSE_TIMEOUT_SECONDS}s.",
+                                }
+                            finally:
+                                await self.stop_run_lease()
                         await asyncio.sleep(1.0)
                     logger.info(f"Agent {self.run_id} resumed.")
                     await self.update_run_status("running")
@@ -994,25 +1273,34 @@ class ReActAgent:
             if parsed_call is None:
                 # No tool call returned; inspect if model says 'done'
                 if is_goal_done(response_msg):
+                    # The model saying "done" is not this execution's to publish once
+                    # the run belongs to somebody else: the durable status write below
+                    # is fenced, but the step row, the Redis snapshot and the `done`
+                    # event are not, and a client would read them as this run's outcome.
+                    if self._lease_ownership_lost:
+                        return self._lease_lost_result(iteration, clean_goal, threshold)
                     logger.info(f"Agent {self.run_id}: Goal finished successfully.")
                     final_summary = response_msg.content or "Task completed successfully."
                     run_status = "completed"
-                    await self.update_run_status("completed")
-                    await self.persist_step(
-                        action="done",
-                        result=final_summary,
-                    )
-                    await redis.set_session_state(
-                        self.run_id,
-                        {
-                            "run_id": self.run_id,
-                            "status": "completed",
-                            "current_step": iteration,
-                            "summary": final_summary,
-                        },
-                    )
-                    await self.emit_event("done", {"summary": final_summary, "total_steps": iteration})
-                    break
+                    try:
+                        await self.update_run_status("completed", release_lease=False)
+                        await self.persist_step(
+                            action="done",
+                            result=final_summary,
+                        )
+                        await redis.set_session_state(
+                            self.run_id,
+                            {
+                                "run_id": self.run_id,
+                                "status": "completed",
+                                "current_step": iteration,
+                                "summary": final_summary,
+                            },
+                        )
+                        await self.emit_event("done", {"summary": final_summary, "total_steps": iteration})
+                        break
+                    finally:
+                        await self.stop_run_lease()
                 else:
                     # Model provided text but no tool call; check if model flagged approval in prose
                     text_content = response_msg.content or ""
@@ -1044,6 +1332,8 @@ class ReActAgent:
                                 "threshold": threshold,
                                 "summary": "Approval gate did not receive a decision or timed out.",
                             }
+                        if gate_outcome == "lease_lost":
+                            return self._lease_lost_result(iteration, clean_goal, threshold)
                         messages.append({"role": "assistant", "content": text_content})
                         if gate_outcome == "approved":
                             messages.append({
@@ -1421,6 +1711,12 @@ class ReActAgent:
                                 "threshold": threshold,
                                 "summary": "Approval gate did not receive a decision or timed out.",
                             }
+                        if gate_outcome == "lease_lost":
+                            # Checked before the `!= "approved"` arm below, which treats
+                            # any other outcome as a rejection and marks the invoice
+                            # skipped in Neon -- a durable ERP write by an execution
+                            # that no longer owns the run.
+                            return self._lease_lost_result(iteration, clean_goal, threshold)
                         if gate_outcome != "approved":
                             # Rejection: skip submission, reset active form, inform LLM (Phase 2.7)
                             tool_result = {
@@ -1455,6 +1751,15 @@ class ReActAgent:
                             })
                             continue
 
+            # The load-bearing guard. Everything above this point in the iteration
+            # (OBSERVE, the Groq THINK call, the approval gate) can take long enough
+            # for the heartbeat to observe that the lease is gone, and
+            # `tools.execute` on click/fill/select is the side-effecting ERP action the
+            # lease exists to keep single-owner. It also runs ahead of the `step_start`
+            # event so the stream never shows a step that was not taken.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
+
             step_id = str(uuid.uuid4())
             # Execute Tool with recovery wrap (Phase 2.8)
             await self.emit_event(
@@ -1466,6 +1771,33 @@ class ReActAgent:
                     "arguments": tool_args,
                 },
             )
+
+            # Re-checked after step_start, which awaits the on_event callback and the
+            # hub publish. A single check cannot cover a window it does not span: the
+            # heartbeat reports ownership loss on its own schedule, and the action
+            # itself must not begin on a lease this execution has already lost.
+            if self._lease_ownership_lost:
+                # step_start is already published for this step_id, so returning here
+                # would leave it dangling: the frontend opens a step row on step_start
+                # and only resolves it on step_complete / step_failed / step_unknown,
+                # so the row would spin for the life of the stream. Close it under the
+                # same step_id.
+                #
+                # Emitted live only, with no persist_step. Persisting here would mean a
+                # superseded execution writing a durable row after losing ownership,
+                # which is the rule every other lease-loss return here observes. Nothing
+                # is lost by not persisting: the action never ran, so there is no step
+                # to replay, and the run's terminal status belongs to the new owner.
+                await self.emit_event(
+                    "step_failed",
+                    {
+                        "step_id": step_id,
+                        "step_index": iteration,
+                        "action": tool_name,
+                        "error": "aborted: run lease was lost before this action executed",
+                    },
+                )
+                return self._lease_lost_result(iteration, clean_goal, threshold)
 
             screenshot_on_fail: Optional[str] = None
             try:
@@ -1678,23 +2010,31 @@ class ReActAgent:
 
         # Check if hard cap was reached
         if iteration >= self.max_iterations and run_status != "completed":
+            # Outside the loop, so the iteration-boundary guard cannot cover it. A
+            # `stalled` written here over a run another owner now holds would end that
+            # owner's run, and the Redis snapshot and `stalled` event would announce it.
+            if self._lease_ownership_lost:
+                return self._lease_lost_result(iteration, clean_goal, threshold)
             logger.warning(f"Agent {self.run_id} hit hard cap of {self.max_iterations} iterations. Marking as stalled.")
             run_status = "stalled"
-            await self.update_run_status("stalled")
-            await self.persist_step(
-                action="stalled",
-                result=f"Exceeded maximum iteration cap of {self.max_iterations} steps.",
-            )
-            await redis.set_session_state(
-                self.run_id,
-                {
-                    "run_id": self.run_id,
-                    "status": "stalled",
-                    "current_step": iteration,
-                    "error": "Exceeded maximum iteration cap of 30 steps.",
-                },
-            )
-            await self.emit_event("stalled", {"iterations": iteration, "max_iterations": self.max_iterations})
+            try:
+                await self.update_run_status("stalled", release_lease=False)
+                await self.persist_step(
+                    action="stalled",
+                    result=f"Exceeded maximum iteration cap of {self.max_iterations} steps.",
+                )
+                await redis.set_session_state(
+                    self.run_id,
+                    {
+                        "run_id": self.run_id,
+                        "status": "stalled",
+                        "current_step": iteration,
+                        "error": "Exceeded maximum iteration cap of 30 steps.",
+                    },
+                )
+                await self.emit_event("stalled", {"iterations": iteration, "max_iterations": self.max_iterations})
+            finally:
+                await self.stop_run_lease()
 
         return {
             "run_id": self.run_id,
