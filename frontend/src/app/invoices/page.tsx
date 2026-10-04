@@ -328,46 +328,46 @@ export default function InvoicesPage() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {/* Total Invoices */}
-          <div className="relative overflow-hidden rounded-2xl border border-t-white border-x-zinc-200/90 border-b-zinc-300/80 bg-white p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_4px_12px_rgba(0,0,0,0.02)] transition-all">
+          <div className="relative overflow-hidden rounded-2xl border border-t-amber-100 border-x-amber-200/70 border-b-amber-300/80 bg-gradient-to-b from-amber-50/40 to-white p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_4px_12px_rgba(0,0,0,0.02)] transition-all">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-zinc-500">
+              <span className="text-xs font-bold uppercase tracking-wider text-amber-800">
                 Total Invoices
               </span>
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-zinc-50 text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]">
-                <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-t-amber-200 border-x-amber-300/80 border-b-amber-400/80 bg-amber-50 text-amber-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]">
+                <svg className="h-4 w-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
               </div>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-zinc-900 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-amber-800 tabular-nums">
                 {metrics.totalInvoices}
               </span>
-              <span className="text-xs font-medium text-zinc-400">records</span>
+              <span className="text-xs font-medium text-amber-600">records</span>
             </div>
-            <p className="mt-1 text-[11px] text-zinc-400">
+            <p className="mt-1 text-[11px] text-amber-700/80">
               Total recorded in AP ledger
             </p>
           </div>
 
           {/* Total Value */}
-          <div className="relative overflow-hidden rounded-2xl border border-t-white border-x-zinc-200/90 border-b-zinc-300/80 bg-white p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_4px_12px_rgba(0,0,0,0.02)] transition-all">
+          <div className="relative overflow-hidden rounded-2xl border border-t-emerald-100 border-x-emerald-200/70 border-b-emerald-300/80 bg-gradient-to-b from-emerald-50/40 to-white p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_4px_12px_rgba(0,0,0,0.02)] transition-all">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-zinc-500">
+              <span className="text-xs font-bold uppercase tracking-wider text-emerald-800">
                 Total Ledger Value
               </span>
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-zinc-50 text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]">
-                <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-t-emerald-200 border-x-emerald-300/80 border-b-emerald-400/80 bg-emerald-50 text-emerald-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]">
+                <svg className="h-4 w-4 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </div>
             </div>
             <div className="mt-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-zinc-900 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-emerald-800 tabular-nums">
                 {formatCurrency(metrics.totalValue)}
               </span>
             </div>
-            <p className="mt-1 text-[11px] text-zinc-400">
+            <p className="mt-1 text-[11px] text-emerald-700/80">
               Cumulative dollar commitment
             </p>
           </div>
@@ -396,36 +396,24 @@ export default function InvoicesPage() {
           </div>
 
           {/* Flagged / Failed */}
-          <div className="relative overflow-hidden rounded-2xl border border-t-white border-x-zinc-200/90 border-b-zinc-300/80 bg-white p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_4px_12px_rgba(0,0,0,0.02)] transition-all">
+          <div className="relative overflow-hidden rounded-2xl border border-t-amber-100 border-x-amber-200/70 border-b-amber-300/80 bg-gradient-to-b from-amber-50/40 to-white p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.02),0_4px_12px_rgba(0,0,0,0.02)] transition-all">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-zinc-500">
+              <span className="text-xs font-bold uppercase tracking-wider text-amber-800">
                 Discrepancies
               </span>
-              <div
-                className={`flex h-8 w-8 items-center justify-center rounded-xl border ${
-                  metrics.flaggedOrFailedCount > 0
-                    ? 'border-t-rose-200 border-x-rose-300/80 border-b-rose-400/80 bg-rose-50 text-rose-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]'
-                    : 'border-t-white border-x-zinc-200 border-b-zinc-300 bg-zinc-50 text-zinc-500 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]'
-                }`}
-              >
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-t-amber-200 border-x-amber-300/80 border-b-amber-400/80 bg-amber-50 text-amber-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.04)]">
+                <svg className="h-4 w-4 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
                 </svg>
               </div>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span
-                className={`font-mono text-2xl font-bold tracking-tight tabular-nums ${
-                  metrics.flaggedOrFailedCount > 0
-                    ? 'text-rose-600'
-                    : 'text-zinc-900'
-                }`}
-              >
+              <span className="font-mono text-2xl font-bold tracking-tight text-amber-800 tabular-nums">
                 {metrics.flaggedOrFailedCount}
               </span>
-              <span className="text-xs font-medium text-zinc-400">flagged/failed</span>
+              <span className="text-xs font-medium text-amber-600">flagged/failed</span>
             </div>
-            <p className="mt-1 text-[11px] text-zinc-400">
+            <p className="mt-1 text-[11px] text-amber-700/80">
               Exceptions requiring manual action
             </p>
           </div>

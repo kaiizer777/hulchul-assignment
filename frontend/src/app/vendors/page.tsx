@@ -497,19 +497,19 @@ export default function VendorsPage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <div className="rounded-xl border border-t-white border-x-zinc-200/90 border-b-zinc-300 bg-gradient-to-b from-white via-white to-zinc-50/70 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.03)]">
+          <div className="rounded-xl border border-t-amber-200 border-x-amber-300/80 border-b-amber-400 bg-gradient-to-b from-amber-50/60 via-white to-amber-50/20 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.03)]">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              <span className="text-xs font-semibold uppercase tracking-wider text-amber-800">
                 Vendors
               </span>
-              <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 text-zinc-600 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-t-amber-200 border-x-amber-300/80 border-b-amber-400 bg-gradient-to-b from-amber-100 to-amber-200/60 text-amber-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
                 </svg>
               </span>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-zinc-900 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-amber-800 tabular-nums">
                 {metrics.totalVendors}
               </span>
               <span className="text-xs text-zinc-500">registered</span>
@@ -521,19 +521,19 @@ export default function VendorsPage() {
             </p>
           </div>
 
-          <div className="rounded-xl border border-t-white border-x-zinc-200/90 border-b-zinc-300 bg-gradient-to-b from-white via-white to-zinc-50/70 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.03)]">
+          <div className="rounded-xl border border-t-emerald-200 border-x-emerald-300/80 border-b-emerald-400 bg-gradient-to-b from-emerald-50/60 via-white to-emerald-50/20 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.03)]">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+              <span className="text-xs font-semibold uppercase tracking-wider text-emerald-800">
                 Invoiced Volume
               </span>
-              <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 text-zinc-600 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)]">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-t-emerald-200 border-x-emerald-300/80 border-b-emerald-400 bg-gradient-to-b from-emerald-100 to-emerald-200/60 text-emerald-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
               </span>
             </div>
             <div className="mt-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-zinc-900 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-emerald-800 tabular-nums">
                 {ledgerAvailable ? formatCurrency(metrics.invoicedTotal) : '—'}
               </span>
             </div>
@@ -566,19 +566,19 @@ export default function VendorsPage() {
             <p className="mt-1 text-xs text-zinc-400">Pending, approved, or flagged</p>
           </div>
 
-          <div className="rounded-xl border border-t-emerald-200 border-x-emerald-300/80 border-b-emerald-400 bg-gradient-to-b from-emerald-50/60 via-white to-emerald-50/20 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.03)]">
+          <div className="rounded-xl border border-t-amber-200 border-x-amber-300/80 border-b-amber-400 bg-gradient-to-b from-amber-50/60 via-white to-amber-50/20 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_3px_rgba(0,0,0,0.03)]">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase tracking-wider text-emerald-800">
+              <span className="text-xs font-semibold uppercase tracking-wider text-amber-800">
                 PO Commitments
               </span>
-              <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-t-emerald-200 border-x-emerald-300/80 border-b-emerald-400 bg-gradient-to-b from-emerald-100 to-emerald-200/60 text-emerald-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-t-amber-200 border-x-amber-300/80 border-b-amber-400 bg-gradient-to-b from-amber-100 to-amber-200/60 text-amber-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
                 <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
               </span>
             </div>
             <div className="mt-2 flex items-baseline gap-2">
-              <span className="font-mono text-2xl font-bold tracking-tight text-emerald-800 tabular-nums">
+              <span className="font-mono text-2xl font-bold tracking-tight text-amber-800 tabular-nums">
                 {ledgerAvailable ? formatCurrency(metrics.poApprovedTotal) : '—'}
               </span>
             </div>

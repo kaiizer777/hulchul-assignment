@@ -842,42 +842,29 @@ function NewInvoiceForm() {
         </div>
 
         {/* Section 3: Itemized Line-Item Calculation Grid */}
-        <div className="rounded-2xl border border-zinc-200/90 bg-white p-7 sm:p-8 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)] transition-all space-y-6">
-          <div className="flex flex-col gap-3.5 sm:flex-row sm:items-center sm:justify-between pb-5 border-b border-zinc-100">
-            <div className="flex items-center gap-3">
-              <span className="flex h-7 w-7 items-center justify-center rounded-xl bg-zinc-100 text-zinc-700 border border-zinc-200/80 shadow-2xs">
-                <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                </svg>
-              </span>
-              <div>
-                <h2 className="text-[15px] sm:text-base font-bold uppercase tracking-wider text-zinc-800">
+        <div className="rounded-2xl border border-zinc-200/90 bg-white p-5 sm:p-8 shadow-[0_1px_3px_rgba(0,0,0,0.02),0_6px_16px_rgba(0,0,0,0.03)] transition-all space-y-6">
+          <div className="flex items-start gap-3 pb-5 border-b border-zinc-100">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-zinc-100 text-zinc-700 border border-zinc-200/80 shadow-2xs">
+              <svg className="h-4 w-4 text-zinc-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+              </svg>
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+                <h2 className="text-[15px] sm:text-base font-bold uppercase tracking-wider text-zinc-800 leading-none">
                   3. Amount Estimate Grid
                 </h2>
-                <p className="text-xs sm:text-sm text-zinc-400">
-                  Working estimate only — subtotal, tax and total are calculated live and feed the
-                  Form Amount below.
-                </p>
+                <span className="rounded-full border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-amber-50 px-2.5 py-0.5 font-mono text-[11px] font-bold uppercase tracking-wider text-amber-800 whitespace-nowrap">
+                  Estimate — not stored
+                </span>
+                <span className="rounded-full border border-zinc-200 bg-zinc-50 px-2.5 py-0.5 font-mono text-[11px] text-zinc-500 tabular-nums whitespace-nowrap">
+                  {lineItems.length} {lineItems.length === 1 ? 'Line Item' : 'Line Items'}
+                </span>
               </div>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2.5">
-              <span className="rounded-lg border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-amber-50 px-3 py-1 font-mono text-[11px] font-bold uppercase tracking-wider text-amber-800">
-                Estimate — not stored
-              </span>
-              <span className="font-mono text-xs sm:text-sm text-zinc-500 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-1">
-                {lineItems.length} {lineItems.length === 1 ? 'Line Item' : 'Line Items'}
-              </span>
-              <button
-                type="button"
-                onClick={handleAddLineItem}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-50 px-3.5 py-1.5 text-xs sm:text-sm font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.03)] hover:bg-zinc-100 active:translate-y-[0.5px] transition-all"
-              >
-                <svg className="h-4 w-4 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                </svg>
-                <span>Add Row</span>
-              </button>
+              <p className="mt-1.5 text-xs sm:text-sm text-zinc-400 leading-relaxed">
+                Working estimate only — subtotal, tax and total are calculated live and feed the
+                Form Amount below.
+              </p>
             </div>
           </div>
 
@@ -904,7 +891,7 @@ function NewInvoiceForm() {
 
                   return (
                     <tr key={item.id} className="hover:bg-zinc-50/80 transition-colors">
-                      <td className="py-3.5 pl-4 pr-2 text-center font-mono text-zinc-400 font-semibold text-sm">
+                      <td className="py-3.5 pl-4 pr-2 text-center font-mono text-xs font-medium text-zinc-400 tabular-nums">
                         {index + 1}
                       </td>
                       <td className="py-2.5 px-3.5">
@@ -913,7 +900,7 @@ function NewInvoiceForm() {
                           placeholder="e.g. Database replication compute instance"
                           value={item.description}
                           onChange={(e) => handleUpdateLineItem(item.id, 'description', e.target.value)}
-                          className="w-full rounded-lg border border-zinc-300/80 bg-white px-3.5 py-2 text-sm text-zinc-900 placeholder-zinc-400 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-900"
+                          className="h-10 w-full rounded-lg border border-zinc-300/80 bg-white px-3 text-sm text-zinc-900 placeholder-zinc-400 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900"
                         />
                       </td>
                       <td className="py-2.5 px-2.5">
@@ -923,12 +910,12 @@ function NewInvoiceForm() {
                           step="1"
                           value={item.quantity}
                           onChange={(e) => handleUpdateLineItem(item.id, 'quantity', parseFloat(e.target.value) || 0)}
-                          className="w-full rounded-lg border border-zinc-300/80 bg-white px-3 py-2 text-sm font-mono text-zinc-900 text-right shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-900"
+                          className="h-10 w-full rounded-lg border border-zinc-300/80 bg-white px-3 text-sm font-mono text-zinc-900 tabular-nums text-right shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900"
                         />
                       </td>
                       <td className="py-2.5 px-2.5">
                         <div className="relative">
-                          <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-2.5 text-zinc-400 font-mono text-sm">
+                          <span className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 font-mono text-[13px] font-medium text-zinc-400">
                             $
                           </span>
                           <input
@@ -937,7 +924,7 @@ function NewInvoiceForm() {
                             step="0.01"
                             value={item.unitPrice}
                             onChange={(e) => handleUpdateLineItem(item.id, 'unitPrice', parseFloat(e.target.value) || 0)}
-                            className="w-full rounded-lg border border-zinc-300/80 bg-white pl-6 pr-3 py-2 text-sm font-mono text-zinc-900 text-right shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-900"
+                            className="h-10 w-full rounded-lg border border-zinc-300/80 bg-white pl-7 pr-3 text-sm font-mono text-zinc-900 tabular-nums text-right shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900"
                           />
                         </div>
                       </td>
@@ -945,7 +932,7 @@ function NewInvoiceForm() {
                         <select
                           value={item.taxRate}
                           onChange={(e) => handleUpdateLineItem(item.id, 'taxRate', parseFloat(e.target.value) || 0)}
-                          className="w-full rounded-lg border border-zinc-300/80 bg-white px-2.5 py-2 text-sm font-mono text-zinc-900 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-900 cursor-pointer"
+                          className="h-10 w-full truncate rounded-lg border border-zinc-300/80 bg-white px-2.5 text-sm font-mono text-zinc-900 tabular-nums shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)] focus:border-zinc-900 focus:outline-none focus:ring-1 focus:ring-zinc-900 cursor-pointer"
                         >
                           <option value="0">0% (None)</option>
                           <option value="5">5.0%</option>
@@ -962,10 +949,11 @@ function NewInvoiceForm() {
                           type="button"
                           onClick={() => handleRemoveLineItem(item.id)}
                           disabled={lineItems.length <= 1}
-                          className="inline-flex items-center justify-center rounded-lg p-1.5 text-zinc-400 hover:text-rose-600 hover:bg-rose-50 disabled:opacity-30 disabled:pointer-events-none transition-colors"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-transparent text-zinc-400 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-900 disabled:opacity-30 disabled:pointer-events-none"
                           title="Delete line item"
+                          aria-label={`Delete line item ${index + 1}`}
                         >
-                          <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                             <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                           </svg>
                         </button>
@@ -978,58 +966,60 @@ function NewInvoiceForm() {
           </div>
 
           {/* Breakdown & Grand Total Calculation Section */}
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-5 pt-2">
+          <div className="flex flex-col gap-5 pt-2 md:flex-row md:items-start md:justify-between">
             <button
               type="button"
               onClick={handleAddLineItem}
-              className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-xs sm:text-sm font-semibold text-zinc-700 shadow-2xs hover:bg-zinc-50 active:translate-y-[0.5px] transition-all"
+              className="inline-flex shrink-0 self-start items-center gap-2 whitespace-nowrap rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-xs sm:text-sm font-semibold text-zinc-700 shadow-2xs hover:bg-zinc-50 hover:border-zinc-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-900 active:translate-y-[0.5px] transition-all"
             >
-              <svg className="h-4 w-4 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+              <svg className="h-4 w-4 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
               </svg>
               <span>Add Line Item</span>
             </button>
 
             {/* Financial Summary Card */}
-            <div className="w-full sm:w-96 rounded-2xl border border-zinc-200/90 bg-zinc-50/70 p-5 space-y-3 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
-              <div className="flex justify-between text-xs sm:text-sm text-zinc-500 font-medium">
-                <span>Subtotal</span>
-                <span className="font-mono text-zinc-800 tabular-nums">{formatCurrency(totals.subtotal)}</span>
+            <div className="w-full md:w-80 md:shrink-0 lg:w-96 rounded-2xl border border-zinc-200/90 bg-zinc-50/70 p-5 shadow-[inset_0_1px_2px_rgba(0,0,0,0.02)]">
+              <div className="space-y-1.5">
+                <div className="flex items-baseline justify-between text-xs sm:text-sm text-zinc-500 font-medium">
+                  <span>Subtotal</span>
+                  <span className="font-mono text-zinc-800 tabular-nums">{formatCurrency(totals.subtotal)}</span>
+                </div>
+                <div className="flex items-baseline justify-between text-xs sm:text-sm text-zinc-500 font-medium">
+                  <span>Estimated Tax</span>
+                  <span className="font-mono text-zinc-800 tabular-nums">{formatCurrency(totals.taxTotal)}</span>
+                </div>
               </div>
-              <div className="flex justify-between text-xs sm:text-sm text-zinc-500 font-medium">
-                <span>Estimated Tax</span>
-                <span className="font-mono text-zinc-800 tabular-nums">{formatCurrency(totals.taxTotal)}</span>
-              </div>
-              <div className="border-t border-zinc-200 pt-2.5 flex items-center justify-between">
-                <div>
-                  <span className="text-xs sm:text-[13px] font-bold uppercase tracking-wider text-zinc-900">
+              <div className="mt-3 border-t border-zinc-200 pt-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <span className="block text-xs sm:text-[13px] font-bold uppercase tracking-wider text-zinc-500 leading-none">
                     Estimated Total
                   </span>
-                  <div className="text-[11px] text-zinc-400">USD — feeds Form Amount</div>
+                  <div className="mt-1 text-[11px] leading-none text-zinc-400">USD — feeds Form Amount</div>
                 </div>
-                <div className="text-right">
-                  <span className="font-mono text-xl sm:text-2xl font-extrabold text-zinc-900 tabular-nums">
+                <div className="shrink-0 text-right">
+                  <span className="font-mono text-xl sm:text-2xl font-extrabold tracking-tight leading-none text-zinc-900 tabular-nums">
                     {formatCurrency(totals.total)}
                   </span>
                 </div>
               </div>
 
-              <p className="text-[11px] leading-relaxed text-zinc-500">
+              <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">
                 Vendor, date and PO number are submitted along with the Form Amount above. The
                 descriptions, quantities, unit prices and tax rates entered in this grid are not
                 stored with the invoice.
               </p>
 
               {/* Amount Sync / Override Toggle */}
-              <div className="border-t border-zinc-200/60 pt-2.5">
-                <div className="flex items-center justify-between text-xs sm:text-[13px]">
+              <div className="mt-3 border-t border-zinc-200/60 pt-3">
+                <div className="flex items-center justify-between gap-2 text-xs sm:text-[13px]">
                   <label htmlFor="amount-input" className="font-bold text-zinc-700">
                     Form Amount (USD) <span className="text-rose-500">*</span>
                   </label>
                   <button
                     type="button"
                     onClick={() => setIsManualAmountOverride(!isManualAmountOverride)}
-                    className="text-[11px] text-zinc-500 hover:text-zinc-800 underline"
+                    className="rounded-md text-[11px] text-zinc-500 underline underline-offset-2 hover:text-zinc-800 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-zinc-900"
                   >
                     {isManualAmountOverride ? 'Auto-sync from items' : 'Manual override'}
                   </button>
@@ -1037,7 +1027,7 @@ function NewInvoiceForm() {
 
                 <div className="relative mt-2">
                   <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3.5">
-                    <span className="font-mono text-sm font-bold text-zinc-400">$</span>
+                    <span className="font-mono text-sm font-bold tabular-nums text-zinc-400">$</span>
                   </div>
                   <input
                     id="amount-input"
@@ -1052,10 +1042,10 @@ function NewInvoiceForm() {
                     }}
                     aria-invalid={!!fieldErrors.amount}
                     aria-describedby={fieldErrors.amount ? 'amount-error' : undefined}
-                    className={`block w-full rounded-xl border py-3 pl-8 pr-4 font-mono text-[15px] sm:text-base font-bold text-zinc-900 text-right shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] focus:outline-none ${
+                    className={`block h-12 w-full rounded-xl border pl-9 pr-4 font-mono text-[15px] sm:text-base font-bold tabular-nums text-zinc-900 text-right shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] focus:outline-none focus:ring-1 focus:ring-zinc-900 ${
                       isManualAmountOverride
-                        ? 'border-zinc-400 bg-white focus:border-zinc-800 focus:ring-1 focus:ring-zinc-800'
-                        : 'border-zinc-200 bg-zinc-100/80 cursor-default text-zinc-800'
+                        ? 'border-zinc-300/80 bg-white focus:border-zinc-900'
+                        : 'border-zinc-200 bg-zinc-100/80 cursor-default text-zinc-800 focus:border-zinc-300'
                     }`}
                   />
                 </div>

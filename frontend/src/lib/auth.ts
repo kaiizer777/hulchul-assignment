@@ -70,10 +70,14 @@ const isHttpsRequest = (request: Request): boolean => {
  * empty, or malformed.
  */
 export function getSessionToken(request: Request): string | null {
-  const cookieName = isHttpsRequest(request) ? SESSION_COOKIE_HTTPS : SESSION_COOKIE_HTTP;
-  const token = readCookie(request, cookieName);
-  if (!token) return null;
-  return RAW_TOKEN_PATTERN.test(token) ? token : null;
+  const hostToken = readCookie(request, SESSION_COOKIE_HTTPS);
+  if (hostToken && RAW_TOKEN_PATTERN.test(hostToken)) return hostToken;
+  // Never accept the non-Secure name over HTTPS: it would let a cookie set by
+  // a downgraded origin authenticate.
+  if (isHttpsRequest(request)) return null;
+  const httpToken = readCookie(request, SESSION_COOKIE_HTTP);
+  if (!httpToken) return null;
+  return RAW_TOKEN_PATTERN.test(httpToken) ? httpToken : null;
 }
 
 /**

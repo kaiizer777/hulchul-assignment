@@ -82,10 +82,10 @@ function LoginForm() {
       });
 
       if (response.status === 200) {
+        // Navigation re-renders the destination from the server with the fresh
+        // session cookie, so no refresh() here: issued after push() it
+        // revalidates /login and supersedes the pending navigation.
         router.push(resolveReturnTo(searchParams.get('returnTo')));
-        // The cookie was just set, so server-rendered pages must re-render
-        // against the new session.
-        router.refresh();
         return;
       }
 
@@ -211,17 +211,19 @@ function LoginForm() {
                     autoComplete="current-password"
                     required
                     autoFocus
+                    suppressHydrationWarning
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
                     placeholder="Enter operator password"
                     aria-invalid={!!error}
                     aria-describedby={error ? 'auth-error' : undefined}
-                    className="block h-12 w-full rounded-xl border border-zinc-300/90 bg-zinc-50/70 pl-3.5 pr-12 text-sm text-zinc-900 placeholder-zinc-400 shadow-[inset_0_1px_2px_rgba(0,0,0,0.04)] transition-all duration-150 ease-out focus:border-zinc-900 focus:bg-white focus:outline-none focus:ring-[3px] focus:ring-zinc-900/25"
+                    className="block h-12 w-full rounded-xl border border-zinc-300/90 bg-zinc-50/70 pl-3.5 pr-12 text-sm text-zinc-900 placeholder-zinc-400 shadow-[inset_0_1px_2px_rgba(0,0,0,0.04)] transition-all duration-150 ease-out focus:border-zinc-900 focus:bg-white focus:outline-none"
                   />
                   <button
                     type="button"
                     onClick={() => setShowPassword(!showPassword)}
-                    className="absolute inset-y-1 right-1 flex w-9 items-center justify-center rounded-lg text-zinc-400 transition-colors duration-150 ease-out hover:text-zinc-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-900/40"
+                    suppressHydrationWarning
+                    className="absolute inset-y-1 right-1 flex w-9 items-center justify-center rounded-lg text-zinc-400 transition-colors duration-150 ease-out hover:text-zinc-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-900"
                     title={showPassword ? 'Hide password' : 'Show password'}
                     aria-label={showPassword ? 'Hide password' : 'Show password'}
                     aria-pressed={showPassword}
@@ -264,7 +266,7 @@ function LoginForm() {
                     type="checkbox"
                     checked={rememberSession}
                     onChange={(e) => setRememberSession(e.target.checked)}
-                    className="h-4 w-4 shrink-0 cursor-pointer rounded-[4px] border-zinc-300 accent-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-900/30 focus-visible:ring-offset-1"
+                    className="h-4 w-4 shrink-0 cursor-pointer rounded-[4px] border-zinc-300 accent-zinc-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-zinc-900"
                   />
                   <span className="text-[12px] font-medium text-zinc-600 transition-colors duration-150 ease-out group-hover/checkbox:text-zinc-900">
                     Remember session in browser
