@@ -805,15 +805,19 @@ function NewInvoiceForm() {
               </span>
               <div>
                 <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-800">
-                  3. Line Items & Ledger Calculation Grid
+                  3. Amount Estimate Grid
                 </h2>
                 <p className="text-xs text-zinc-400">
-                  Itemize goods and services; subtotals and tax calculate dynamically in real-time.
+                  Working estimate only — subtotal, tax and total are calculated live and feed the
+                  Form Amount below.
                 </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
+              <span className="rounded-lg border border-t-amber-200 border-x-amber-300 border-b-amber-400 bg-amber-50 px-2.5 py-1 font-mono text-[10px] font-bold uppercase tracking-wider text-amber-800">
+                Estimate — not stored
+              </span>
               <span className="font-mono text-xs text-zinc-500 rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-1">
                 {lineItems.length} {lineItems.length === 1 ? 'Line Item' : 'Line Items'}
               </span>
@@ -952,9 +956,9 @@ function NewInvoiceForm() {
               <div className="border-t border-zinc-200 pt-2 flex items-center justify-between">
                 <div>
                   <span className="text-xs font-bold uppercase tracking-wider text-zinc-900">
-                    Grand Total
+                    Estimated Total
                   </span>
-                  <div className="text-[10px] text-zinc-400">USD Currency</div>
+                  <div className="text-[10px] text-zinc-400">USD — feeds Form Amount</div>
                 </div>
                 <div className="text-right">
                   <span className="font-mono text-lg font-extrabold text-zinc-900 tabular-nums">
@@ -962,6 +966,11 @@ function NewInvoiceForm() {
                   </span>
                 </div>
               </div>
+
+              <p className="text-[10px] leading-relaxed text-zinc-500">
+                Only the Form Amount below is sent to the ERP. Line-item descriptions, quantities,
+                unit prices and tax rates are not stored with the invoice.
+              </p>
 
               {/* Amount Sync / Override Toggle */}
               <div className="border-t border-zinc-200/60 pt-2">
