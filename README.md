@@ -17,10 +17,10 @@ A production-grade, resilient autonomous AI browser agent engineered for enterpr
 ## 🎬 Demo
 
 <p align="center">
-  <a href="frontend/public/demo-1-small.mp4"><img src="frontend/public/demo-poster.jpg" alt="Watch the demo" width="720" /></a>
+  <a href="https://raw.githubusercontent.com/kaiizer777/hulchul-assignment/main/frontend/public/demo-1-small.mp4"><img src="frontend/public/demo-poster.jpg" alt="Watch the demo" width="720" /></a>
 </p>
 
-<p align="center">▶️ <a href="frontend/public/demo-1-small.mp4"><strong>Watch the demo</strong></a> — end-to-end autonomous run: operator sets a goal in the control UI, the agent executes across the mock ERP, and finishes with a deterministic verification report.</p>
+<p align="center">▶️ <a href="https://raw.githubusercontent.com/kaiizer777/hulchul-assignment/main/frontend/public/demo-1-small.mp4"><strong>Watch the demo</strong></a> — end-to-end autonomous run: operator sets a goal in the control UI, the agent executes across the mock ERP, and finishes with a deterministic verification report.</p>
 
 | Beat | What to watch |
 | :--- | :--- |
