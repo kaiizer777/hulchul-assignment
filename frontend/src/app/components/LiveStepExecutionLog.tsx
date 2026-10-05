@@ -528,6 +528,19 @@ export function LiveStepExecutionLog({
   const logContainerRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isProgrammaticScrollRef = useRef(false);
+  // True while a verification-report "View in log" jump is animating — the
+  // follow-tail effect and manual-scroll detection both stand down so the
+  // smooth center-scroll + ring flash is never fought.
+  const isJumpingRef = useRef(false);
+  // Pinned mirrors "container is at the bottom" without waiting for React
+  // state propagation, so the follow effect never acts on a stale value.
+  const pinnedRef = useRef(true);
+  const prevStepsLengthRef = useRef(steps.length);
+  const programmaticTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const jumpReleaseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
+  const [pendingNewCount, setPendingNewCount] = useState(0);
+  const prevAutoScrollRef = useRef(autoScroll);
 
   // Parse all steps for high-performance rendering & filtering
   const parsedStepsWithMeta = useMemo(() => {
@@ -590,29 +603,81 @@ export function LiveStepExecutionLog({
     });
   }, [parsedStepsWithMeta, filterCategory, searchQuery]);
 
-  // Auto-scroll handler
-  useEffect(() => {
-    if (!autoScroll) return;
-
-    const rafId = requestAnimationFrame(() => {
-      isProgrammaticScrollRef.current = true;
-      if (bottomRef.current && typeof bottomRef.current.scrollIntoView === 'function') {
-        bottomRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
-      }
-      if (logContainerRef.current) {
-        logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-      }
-      setTimeout(() => {
+  // Scroll the log container only (never the page): a single container-local
+  // mechanism replaces the old dual `bottomRef.scrollIntoView + scrollTop`
+  // pair, which scrolled outer ancestors and fought its own smooth animation.
+  const scrollContainerToBottom = (behavior: ScrollBehavior = 'auto') => {
+    const el = logContainerRef.current;
+    if (!el) return;
+    isProgrammaticScrollRef.current = true;
+    try {
+      el.scrollTo({ top: el.scrollHeight, behavior });
+    } catch {
+      el.scrollTop = el.scrollHeight;
+    }
+    if (programmaticTimeoutRef.current) clearTimeout(programmaticTimeoutRef.current);
+    programmaticTimeoutRef.current = setTimeout(
+      () => {
         isProgrammaticScrollRef.current = false;
-      }, 200);
-    });
+      },
+      behavior === 'smooth' ? 350 : 120
+    );
+  };
 
-    return () => cancelAnimationFrame(rafId);
-  }, [steps.length, filteredSteps.length, filterCategory, searchQuery, expandedStepIds, autoScroll]);
+  // Follow-tail: new arrivals scroll ONLY while pinned to bottom and the
+  // toggle is ON. Expand/collapse, filters, and search intentionally do NOT
+  // trigger scrolling — they are reading actions, not arrivals.
+  useEffect(() => {
+    const prev = prevStepsLengthRef.current;
+    const cur = steps.length;
+    prevStepsLengthRef.current = cur;
+    if (cur === 0) {
+      // Fresh run / reset: clear any stale backlog and re-pin to the tail.
+      setPendingNewCount(0);
+      pinnedRef.current = true;
+      setIsPinnedToBottom(true);
+      return;
+    }
+    if (cur <= prev) return;
+    const delta = cur - prev;
+    if (isJumpingRef.current) {
+      setPendingNewCount((c) => c + delta);
+      return;
+    }
+    if (autoScroll && pinnedRef.current) {
+      scrollContainerToBottom('auto');
+    } else {
+      setPendingNewCount((c) => c + delta);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [steps.length, autoScroll]);
+
+  // Resume path: flipping the toggle back ON clears the backlog count,
+  // re-pins, and glides (container-local smooth) to the tail.
+  useEffect(() => {
+    const was = prevAutoScrollRef.current;
+    prevAutoScrollRef.current = autoScroll;
+    if (autoScroll && !was) {
+      setPendingNewCount(0);
+      pinnedRef.current = true;
+      setIsPinnedToBottom(true);
+      scrollContainerToBottom('smooth');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoScroll]);
+
+  // Release transient scroll guards on unmount.
+  useEffect(() => {
+    return () => {
+      if (programmaticTimeoutRef.current) clearTimeout(programmaticTimeoutRef.current);
+      if (jumpReleaseTimeoutRef.current) clearTimeout(jumpReleaseTimeoutRef.current);
+    };
+  }, []);
 
   // Deep-link handler: jump to a step card from the verification report.
   // Resets filters so the target renders, stops auto-scroll so the view
   // stays put, expands the card, then scrolls + flashes a highlight ring.
+  // The follow-tail effect stands down for the whole animation window.
   useEffect(() => {
     const handler = (e: Event) => {
       const stepId = (e as CustomEvent<{ stepId?: string }>).detail?.stepId;
@@ -620,9 +685,12 @@ export function LiveStepExecutionLog({
       const matchIdx = steps.findIndex((s) => s.step_id === stepId);
       if (matchIdx === -1) return;
       const key = steps[matchIdx].step_id || `step-${matchIdx}`;
+      isJumpingRef.current = true;
       setFilterCategory('all');
       setSearchQuery('');
       if (onSetAutoScroll) onSetAutoScroll(false);
+      pinnedRef.current = false;
+      setIsPinnedToBottom(false);
       setExpandedStepIds((prev) => new Set(prev).add(key));
       // Wait a tick for the filtered list to re-render, then scroll + flash.
       setTimeout(() => {
@@ -633,6 +701,10 @@ export function LiveStepExecutionLog({
         setHighlightedStepKey(key);
         if (highlightTimeoutRef.current) clearTimeout(highlightTimeoutRef.current);
         highlightTimeoutRef.current = setTimeout(() => setHighlightedStepKey(null), 2200);
+        if (jumpReleaseTimeoutRef.current) clearTimeout(jumpReleaseTimeoutRef.current);
+        jumpReleaseTimeoutRef.current = setTimeout(() => {
+          isJumpingRef.current = false;
+        }, 700);
       }, 60);
     };
     window.addEventListener(AGENT_SCROLL_TO_STEP_EVENT, handler);
@@ -642,13 +714,21 @@ export function LiveStepExecutionLog({
     };
   }, [steps, onSetAutoScroll]);
 
-  // Handle manual scroll in log container
+  // Manual scroll: leaving the bottom pauses the toggle (no yank while
+  // reading); scrolling back to the bottom resumes it and clears the pill.
+  // Programmatic and jump-driven scrolls are ignored via guards.
   const handleScroll = () => {
-    if (!logContainerRef.current || isProgrammaticScrollRef.current) return;
+    if (!logContainerRef.current) return;
+    if (isProgrammaticScrollRef.current || isJumpingRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
-    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 45;
-    if (onSetAutoScroll && isAtBottom !== autoScroll) {
-      onSetAutoScroll(isAtBottom);
+    const isAtBottom = scrollHeight - scrollTop - clientHeight <= 32;
+    pinnedRef.current = isAtBottom;
+    setIsPinnedToBottom((prev) => (prev === isAtBottom ? prev : isAtBottom));
+    if (isAtBottom) {
+      setPendingNewCount(0);
+      if (!autoScroll && onSetAutoScroll) onSetAutoScroll(true);
+    } else if (autoScroll && onSetAutoScroll) {
+      onSetAutoScroll(false);
     }
   };
 
@@ -658,19 +738,19 @@ export function LiveStepExecutionLog({
     } else if (onSetAutoScroll) {
       onSetAutoScroll(!autoScroll);
     }
-    if (!autoScroll) {
-      requestAnimationFrame(() => {
-        isProgrammaticScrollRef.current = true;
-        if (bottomRef.current) {
-          bottomRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
-        }
-        if (logContainerRef.current) {
-          logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-        }
-        setTimeout(() => {
-          isProgrammaticScrollRef.current = false;
-        }, 200);
-      });
+    // Scroll-on-resume is handled by the autoScroll effect above.
+  };
+
+  // Pill affordance: jump back to the live tail from a paused/unpinned view.
+  const handleJumpToLatest = () => {
+    setPendingNewCount(0);
+    pinnedRef.current = true;
+    setIsPinnedToBottom(true);
+    if (!autoScroll && onSetAutoScroll) {
+      onSetAutoScroll(true);
+      // The autoScroll effect performs the smooth scroll on state flip.
+    } else {
+      scrollContainerToBottom('smooth');
     }
   };
 
@@ -899,7 +979,7 @@ export function LiveStepExecutionLog({
           {/* Action Toolbar */}
           <div className="flex flex-wrap items-center gap-2">
             {/* Step Counter Badge */}
-            <span className="inline-flex items-center gap-1.5 font-mono text-xs text-zinc-700 rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-3 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_2px_rgba(0,0,0,0.02)]">
+            <span aria-live="polite" className="inline-flex items-center gap-1.5 font-mono text-xs tabular-nums text-zinc-700 rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-3 py-1.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_1px_2px_rgba(0,0,0,0.02)]">
               <span
                 className={`h-2 w-2 rounded-full ${
                   status === 'running'
@@ -910,6 +990,12 @@ export function LiveStepExecutionLog({
                     ? 'bg-rose-500'
                     : status === 'stalled'
                     ? 'bg-orange-500'
+                    : status === 'paused'
+                    ? 'bg-amber-500'
+                    : status === 'awaiting_approval'
+                    ? 'bg-purple-500 animate-pulse'
+                    : status === 'session_lost'
+                    ? 'bg-amber-500 animate-pulse'
                     : 'bg-zinc-400'
                 }`}
               />
@@ -920,7 +1006,8 @@ export function LiveStepExecutionLog({
             <button
               type="button"
               onClick={handleToggleAutoScroll}
-              title={autoScroll ? 'Auto-scroll is active' : 'Click to resume auto-scrolling'}
+              aria-pressed={autoScroll}
+              title={autoScroll ? 'Auto-scroll is active — click to pause' : 'Click to resume auto-scrolling'}
               className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-all active:translate-y-[0.5px] ${
                 autoScroll
                   ? 'border-t-emerald-200 border-x-emerald-300 border-b-emerald-400 bg-gradient-to-b from-emerald-50 to-emerald-100/70 text-emerald-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.8),0_1px_2px_rgba(0,0,0,0.02)]'
@@ -1054,6 +1141,7 @@ export function LiveStepExecutionLog({
       </div>
 
       {/* Log Step Stream Container */}
+      <div className="relative">
       <div
         ref={logContainerRef}
         onScroll={handleScroll}
@@ -1070,19 +1158,27 @@ export function LiveStepExecutionLog({
             <span className="text-xs text-zinc-400 max-w-sm mt-1 font-sans">
               Enter a goal in the prompt above and dispatch the agent to stream live browser actions and telemetry.
             </span>
+            {status === 'running' && (
+              <span className="mt-3 inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-200/70 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                Waiting for the first step…
+              </span>
+            )}
           </div>
         ) : filteredSteps.length === 0 ? (
           <div className="flex h-40 flex-col items-center justify-center text-center text-zinc-400 border border-dashed border-zinc-200/80 rounded-xl bg-white p-6">
-            <span className="font-semibold text-zinc-700">No steps match &quot;{searchQuery || filterCategory}&quot;</span>
+            <span className="font-semibold text-zinc-700 text-xs">
+              No steps match {searchQuery.trim() ? <>&ldquo;{searchQuery.trim()}&rdquo;</> : <>{filterCategory}</>} — {steps.length} {steps.length === 1 ? 'step' : 'steps'} hidden by filters
+            </span>
             <button
               type="button"
               onClick={() => {
                 setFilterCategory('all');
                 setSearchQuery('');
               }}
-              className="mt-2 text-xs font-semibold text-zinc-800 underline underline-offset-2"
+              className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg border border-t-white border-x-zinc-200 border-b-zinc-300 bg-white px-2.5 py-1 text-xs font-semibold text-zinc-700 hover:bg-zinc-100 shadow-2xs active:translate-y-[0.5px]"
             >
-              Reset Filters
+              Reset filters
             </button>
           </div>
         ) : (
@@ -1144,10 +1240,11 @@ export function LiveStepExecutionLog({
                 {/* Step Header Row */}
                 <div
                   onClick={() => toggleStep(stepKey)}
-                  className="flex cursor-pointer select-none items-center justify-between p-3 sm:px-4 hover:bg-zinc-50/60 transition-colors rounded-t-xl"
+                  className="flex cursor-pointer select-none items-center justify-between gap-2 p-3 sm:px-4 hover:bg-zinc-50/60 transition-colors rounded-t-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:ring-inset"
                   role="button"
                   tabIndex={0}
                   aria-expanded={isExpanded}
+                  aria-label={`Toggle step ${stepNum} details`}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
@@ -1156,8 +1253,8 @@ export function LiveStepExecutionLog({
                   }}
                 >
                   {/* Left Column: Number, Icon, Badge, Clean Title & One-Liner Summary */}
-                  <div className="flex items-center gap-2.5 min-w-0 pr-2">
-                    <span className="flex h-6 min-w-6 px-1.5 items-center justify-center rounded-md border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-100 font-mono text-[11px] font-bold text-zinc-700 shadow-2xs shrink-0">
+                  <div className="flex items-center gap-2.5 min-w-0 flex-1 pr-2">
+                    <span className="flex h-6 min-w-6 px-1.5 items-center justify-center rounded-md border border-t-white border-x-zinc-200 border-b-zinc-300 bg-gradient-to-b from-white to-zinc-100 font-mono text-[11px] tabular-nums font-bold text-zinc-700 shadow-2xs shrink-0">
                       #{stepNum}
                     </span>
 
@@ -1208,7 +1305,7 @@ export function LiveStepExecutionLog({
                       </button>
                     )}
 
-                    <span className="text-[11px] text-zinc-400 font-mono hidden lg:inline" title={st.timestamp}>
+                    <span className="text-[11px] tabular-nums text-zinc-400 font-mono hidden lg:inline" title={st.timestamp}>
                       {timeFormatted}
                     </span>
 
@@ -1261,12 +1358,12 @@ export function LiveStepExecutionLog({
                           </span>
                         )}
                         {st.duration_ms !== undefined && (
-                          <span className="font-mono text-zinc-600 bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-200 text-[10px]">
+                          <span className="font-mono tabular-nums text-zinc-600 bg-zinc-100 px-1.5 py-0.5 rounded border border-zinc-200 text-[10px]">
                             {st.duration_ms}ms
                           </span>
                         )}
                       </div>
-                      <span className="font-mono text-zinc-400 text-[10px]">
+                      <span className="font-mono tabular-nums text-zinc-400 text-[10px]">
                         {st.timestamp ? new Date(st.timestamp).toISOString() : ''}
                       </span>
                     </div>
@@ -1313,6 +1410,25 @@ export function LiveStepExecutionLog({
           })
         )}
         <div ref={bottomRef} className="h-px w-full shrink-0" aria-hidden="true" />
+      </div>
+      {steps.length > 0 && (!autoScroll || !isPinnedToBottom) && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center px-4">
+          <button
+            type="button"
+            onClick={handleJumpToLatest}
+            className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-t-zinc-700 border-x-zinc-800 border-b-black bg-zinc-900 px-3.5 py-1.5 text-xs font-semibold text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.2),0_4px_12px_rgba(0,0,0,0.25)] transition-all hover:bg-zinc-800 active:translate-y-[0.5px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-900/40"
+          >
+            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.2">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 14l-7 7m0 0l-7-7m7 7V3" />
+            </svg>
+            <span aria-live="polite" className="tabular-nums">
+              {pendingNewCount > 0
+                ? `${pendingNewCount} new ${pendingNewCount === 1 ? 'step' : 'steps'} below — Jump to latest`
+                : 'Jump to latest'}
+            </span>
+          </button>
+        </div>
+      )}
       </div>
     </div>
   );

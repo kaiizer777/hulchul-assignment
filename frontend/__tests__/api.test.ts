@@ -332,7 +332,7 @@ describe('API Route Unit Tests', () => {
       expect(customVendor?.id).toBe('custom-supplier-inc');
     });
 
-    it('returns status 500 with error body when the database fails', async () => {
+    it('returns canonical fallback list with marker header when the database fails', async () => {
       const dbModule = await import('@/lib/db');
       vi.spyOn(dbModule, 'getDb').mockImplementationOnce(() => {
         throw new Error('DATABASE_URL environment variable is missing.');
@@ -341,11 +341,24 @@ describe('API Route Unit Tests', () => {
       const { GET } = await import('@/app/api/vendors/route');
       const response = await GET(request('/api/vendors'));
 
-      expect(response.status).toBe(500);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('X-Vendors-Fallback')).toBe('true');
 
-      const data = await response.json();
-      expect(Array.isArray(data)).toBe(false);
-      expect(data.error).toBeDefined();
+      const data: VendorDTO[] = await response.json();
+      expect(Array.isArray(data)).toBe(true);
+      expect(data.length).toBeGreaterThan(0);
+
+      data.forEach((v) => {
+        expect(typeof v.id).toBe('string');
+        expect(typeof v.name).toBe('string');
+        expect(v.id.length).toBeGreaterThan(0);
+        expect(v.name.length).toBeGreaterThan(0);
+      });
+
+      // Canonical vendors stay available without a database.
+      const acme = data.find((v) => v.name === 'Acme Corp');
+      expect(acme).toBeDefined();
+      expect(acme?.id).toBe('acme-corp');
     });
   });
 });
