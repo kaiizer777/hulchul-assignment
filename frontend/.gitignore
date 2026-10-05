@@ -46,3 +46,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Dev-only visitor logs for the local /logs page (never commit log data)
+/.dev-logs/
+
+# Dev-only /logs page (independent files, no app logic — local only, never commit)
+/src/app/logs/page.tsx
+/src/app/logs/LogsTable.tsx
+/src/lib/dev-logs.ts
+/src/app/api/dev-logs/route.ts
+/src/app/components/DevVisitTracker.tsx
+/__tests__/dev-logs.test.ts

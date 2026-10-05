@@ -39,4 +39,17 @@ terraform.tfvars
 terraform.tfvars.json
 !**/.terraform.lock.hcl
 
+# Dev-only visitor logs for the local /logs page (never commit log data)
+.dev-logs/
+**/.dev-logs/
+dev-logs*.json
+
+# Dev-only /logs page (independent files, no app logic — local only, never commit)
+frontend/src/app/logs/page.tsx
+frontend/src/app/logs/LogsTable.tsx
+frontend/src/lib/dev-logs.ts
+frontend/src/app/api/dev-logs/route.ts
+frontend/src/app/components/DevVisitTracker.tsx
+frontend/__tests__/dev-logs.test.ts
+
 

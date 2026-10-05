@@ -5,6 +5,60 @@ import { useRouter, useSearchParams } from 'next/navigation';
 
 import { resolveReturnTo } from '@/lib/return-to';
 
+type DevLogEvent = 'landing' | 'invoice_created' | 'agent_run';
+
+/**
+ * Dev-only log hook (inline stub). The shared `@/lib/dev-logs` module is a
+ * gitignored local-only file, so a static import would break fresh clones.
+ * Same contract: dev-only, never throws, warns on failure.
+ */
+async function trackDevLog(
+  event: DevLogEvent,
+  metadata?: Record<string, string | number>,
+): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  if (process.env.NODE_ENV !== 'development') return false;
+  try {
+    const res = await fetch('/api/dev-logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, metadata: metadata ?? {} }),
+    });
+    if (!res.ok) {
+      console.warn(`[dev-logs] track ${event} failed: HTTP ${res.status}`);
+      return false;
+    }
+    return true;
+  } catch (err: unknown) {
+    console.warn(`[dev-logs] track ${event} failed:`, err instanceof Error ? err.message : err);
+    return false;
+  }
+}
+
+/** Session flag so one tab reports its landing once; the API dedupes by IP anyway. */
+const DEV_VISIT_SESSION_KEY = 'hulchul_dev_visit_tracked';
+
+/**
+ * Null-rendering client hook (inline stub of gitignored `DevVisitTracker`).
+ * Mounted on the login landing surface; reports a `landing` event once per
+ * tab session. No-op in production and when the local `/api/dev-logs` route
+ * is absent.
+ */
+function DevVisitTracker() {
+  useEffect(() => {
+    try {
+      if (window.sessionStorage.getItem(DEV_VISIT_SESSION_KEY)) return;
+      window.sessionStorage.setItem(DEV_VISIT_SESSION_KEY, '1');
+    } catch {
+      // Storage unavailable (e.g. private mode): fall through and rely on
+      // server-side IP dedupe instead of skipping the report.
+    }
+    void trackDevLog('landing', { path: window.location.pathname });
+  }, []);
+
+  return null;
+}
+
 /**
  * `Retry-After` is either a delay in seconds or an HTTP date. Only the numeric
  * form is rendered; anything else falls back to a generic message rather than
@@ -120,6 +174,7 @@ function LoginForm() {
 
   return (
     <div className="relative flex h-dvh w-full flex-col overflow-hidden">
+      <DevVisitTracker />
       {/*
         Ambient surface wash. Neutral on purpose: a tinted radiance behind the
         card competes with the card's own lift, so this stays a near-white to
