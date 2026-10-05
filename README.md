@@ -16,15 +16,19 @@ A production-grade, resilient autonomous AI browser agent engineered for enterpr
 
 ## 🎬 Demo
 
-![Demo](frontend/public/demo-1-small.mp4)
+<p align="center">
+  <a href="frontend/public/demo-1-small.mp4"><img src="frontend/public/demo-poster.jpg" alt="Watch the demo" width="720" /></a>
+</p>
 
-End-to-end autonomous run: operator sets a goal in the control UI, the agent executes across the mock ERP, and finishes with a deterministic verification report. ([Watch raw video](https://raw.githubusercontent.com/kaiizer777/hulchul-assignment/main/frontend/public/demo-1-small.mp4))
+<p align="center">▶️ <a href="frontend/public/demo-1-small.mp4"><strong>Watch the demo</strong></a> — end-to-end autonomous run: operator sets a goal in the control UI, the agent executes across the mock ERP, and finishes with a deterministic verification report.</p>
 
-- **Working execution** → Autonomous multi-page navigation across `/invoices`, `/purchase-orders`, and `/vendors`, reconciling line items with audit logs.
-- **Adaptability** → A custom goal prompt (e.g. *"Hold anything over ₹25,000 for approval"*) dynamically reconfigures execution boundaries mid-run.
-- **Recovery** → Pre-mutation `check_exists` guards and resumption from the last successful step survive simulated failures.
-- **Verified completion** → Deterministic post-execution SQL sweep compares ERP mutations against ground truth with a pass/fail receipt.
-- **Human control** → High-value invoices pause at an approval modal, resolved via SSE and atomic Redis nonces.
+| Beat | What to watch |
+| :--- | :--- |
+| **Working execution** | Autonomous multi-page navigation across `/invoices`, `/purchase-orders`, and `/vendors`, reconciling line items with audit logs. |
+| **Adaptability** | A custom goal prompt (e.g. *"Hold anything over ₹25,000 for approval"*) dynamically reconfigures execution boundaries mid-run. |
+| **Recovery** | Pre-mutation `check_exists` guards and resumption from the last successful step survive simulated failures. |
+| **Verified completion** | Deterministic post-execution SQL sweep compares ERP mutations against ground truth with a pass/fail receipt. |
+| **Human control** | High-value invoices pause at an approval modal, resolved via SSE and atomic Redis nonces. |
 
 ---
 
