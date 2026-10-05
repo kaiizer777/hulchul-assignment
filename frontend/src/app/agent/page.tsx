@@ -9,37 +9,6 @@ import {
   PRESET_GOALS,
 } from '../store/useAgentStore';
 
-type DevLogEvent = 'landing' | 'invoice_created' | 'agent_run';
-
-/**
- * Dev-only log hook (inline stub). The shared `@/lib/dev-logs` module is a
- * gitignored local-only file, so a static import would break fresh clones.
- * This stub keeps the same contract (dev-only, never throws, warns on
- * failure) and POSTs to `/api/dev-logs` when that local route exists.
- */
-async function trackDevLog(
-  event: DevLogEvent,
-  metadata?: Record<string, string | number>,
-): Promise<boolean> {
-  if (typeof window === 'undefined') return false;
-  if (process.env.NODE_ENV !== 'development') return false;
-  try {
-    const res = await fetch('/api/dev-logs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event, metadata: metadata ?? {} }),
-    });
-    if (!res.ok) {
-      console.warn(`[dev-logs] track ${event} failed: HTTP ${res.status}`);
-      return false;
-    }
-    return true;
-  } catch (err: unknown) {
-    console.warn(`[dev-logs] track ${event} failed:`, err instanceof Error ? err.message : err);
-    return false;
-  }
-}
-
 const TERMINAL_FAILURE_COPY: Record<
   'failed' | 'stalled' | 'session_lost',
   { banner: string; message: string }
@@ -112,8 +81,6 @@ export default function AgentControlPage() {
   const handleFormSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isBusy || !goal.trim()) return;
-    // Dev-only click event (fire-and-forget; must never block the run).
-    void trackDevLog('agent_run', { goal: goal.trim().slice(0, 120) });
     await startRun();
   };
 
@@ -121,7 +88,6 @@ export default function AgentControlPage() {
   // cleared steps — no replayed or duplicated actions).
   const handleStartNewRun = () => {
     if (isBusy || isStarting || !goal.trim()) return;
-    void trackDevLog('agent_run', { goal: goal.trim().slice(0, 120) });
     void startRun();
   };
 
