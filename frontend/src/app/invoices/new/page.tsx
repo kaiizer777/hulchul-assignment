@@ -6,6 +6,37 @@ import Link from 'next/link';
 import { StatusBadge } from '../../components/StatusBadge';
 import type { VendorDTO, PurchaseOrderDTO } from '@/lib/types';
 
+type DevLogEvent = 'landing' | 'invoice_created' | 'agent_run';
+
+/**
+ * Dev-only log hook (inline stub). The shared `@/lib/dev-logs` module is a
+ * gitignored local-only file, so a static import would break fresh clones.
+ * This stub keeps the same contract (dev-only, never throws, warns on
+ * failure) and POSTs to `/api/dev-logs` when that local route exists.
+ */
+async function trackDevLog(
+  event: DevLogEvent,
+  metadata?: Record<string, string | number>,
+): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  if (process.env.NODE_ENV !== 'development') return false;
+  try {
+    const res = await fetch('/api/dev-logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, metadata: metadata ?? {} }),
+    });
+    if (!res.ok) {
+      console.warn(`[dev-logs] track ${event} failed: HTTP ${res.status}`);
+      return false;
+    }
+    return true;
+  } catch (err: unknown) {
+    console.warn(`[dev-logs] track ${event} failed:`, err instanceof Error ? err.message : err);
+    return false;
+  }
+}
+
 interface LineItem {
   id: string;
   description: string;
@@ -405,7 +436,9 @@ function NewInvoiceForm() {
         return;
       }
 
-      // Success: redirect to invoices ledger
+      // Success: record a dev-only event (fire-and-forget; must never
+      // fail the invoice creation) then redirect to invoices ledger
+      void trackDevLog('invoice_created', { vendor: effectiveVendor, amount: numAmount });
       router.push('/invoices');
       router.refresh();
     } catch (err: unknown) {
