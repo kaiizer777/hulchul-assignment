@@ -28,6 +28,12 @@ variable "auth_password_hash" {
   sensitive = true
 }
 
+variable "auth_agent_password" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
 variable "cors_origins" {
   type    = string
   default = "http://localhost:3051,http://127.0.0.1:3051"

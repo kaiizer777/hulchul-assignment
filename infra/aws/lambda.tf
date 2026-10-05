@@ -25,6 +25,7 @@ resource "aws_lambda_function" "backend" {
       UPSTASH_REDIS_REST_TOKEN   = var.upstash_redis_rest_token
       BROWSER_WS_ENDPOINT        = var.browser_ws_endpoint
       AUTH_PASSWORD_HASH         = var.auth_password_hash
+      AUTH_AGENT_PASSWORD        = var.auth_agent_password
       ERP_BASE_URL               = var.erp_base_url
       FRONTEND_URL               = var.frontend_url
       NEXT_PUBLIC_API_URL        = var.frontend_url

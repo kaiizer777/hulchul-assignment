@@ -167,6 +167,7 @@ $tfvarsObj = @{
     upstash_redis_rest_token = $envDict["upstash_redis_rest_token"]
     browser_ws_endpoint      = $envDict["browser_ws_endpoint"]
     auth_password_hash       = $envDict["auth_password_hash"]
+    auth_agent_password      = if ($envDict.ContainsKey("auth_agent_password")) { $envDict["auth_agent_password"] } else { "" }
     erp_base_url             = $frontendUrl
     frontend_url             = $frontendUrl
     cors_origins             = $corsOrigins
