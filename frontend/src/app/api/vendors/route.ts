@@ -22,9 +22,10 @@ function toVendorId(name: string): string {
 }
 
 export async function GET(request: Request) {
-  // Checked before the query: the catch block below degrades to a hardcoded
-  // vendor list on failure, so a guard placed after it would be bypassable by
-  // anything that could make the database error out.
+  // Checked before the query: the catch block below degrades to the
+  // hardcoded CANONICAL_VENDORS array (same VendorDTO[] shape, 200 + an
+  // `X-Vendors-Fallback: true` header), so a guard placed after it would be
+  // bypassable by anything that could make the database error out.
   const denied = await unauthorizedIfNoSession(request);
   if (denied) return denied;
 
@@ -66,10 +67,18 @@ export async function GET(request: Request) {
 
     return NextResponse.json(vendors);
   } catch (err: unknown) {
-    console.error('GET /api/vendors error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    // DB down must not take down the vendors directory or the invoice form
+    // dropdown: both consumers already accept a plain VendorDTO[] (vendors
+    // page guards with Array.isArray; invoices/new only uses res.ok arrays),
+    // so serve the canonical list in-shape with a header marker, no client
+    // changes required.
+    console.error('GET /api/vendors error, serving canonical fallback:', err);
+    const vendors: VendorDTO[] = CANONICAL_VENDORS.map((name) => ({
+      id: toVendorId(name),
+      name,
+    }));
+    return NextResponse.json(vendors, {
+      headers: { 'X-Vendors-Fallback': 'true' },
+    });
   }
 }
