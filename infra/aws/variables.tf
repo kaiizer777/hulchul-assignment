@@ -70,3 +70,77 @@ variable "erp_base_url" {
   default = "https://hulchul-frontend.sufiyanx.workers.dev"
 }
 
+# Optional tuning/threshold/pool overrides. Every one defaults to "" (unset):
+# lambda.tf only forwards non-empty values, so the container's code defaults
+# in backend/config.py keep applying unless an operator sets these explicitly.
+# No values are declared here -- names only.
+variable "auth_session_ttl_seconds" {
+  type    = string
+  default = ""
+}
+
+variable "simulate_failure_after" {
+  type    = string
+  default = ""
+}
+
+variable "browser_connect_timeout_ms" {
+  type    = string
+  default = ""
+}
+
+variable "db_pool_min_size" {
+  type    = string
+  default = ""
+}
+
+variable "db_pool_max_size" {
+  type    = string
+  default = ""
+}
+
+variable "db_pool_max_inactive_lifetime" {
+  type    = string
+  default = ""
+}
+
+variable "groq_model" {
+  type    = string
+  default = ""
+}
+
+variable "max_agent_iterations" {
+  type    = string
+  default = ""
+}
+
+variable "default_approval_threshold" {
+  type    = string
+  default = ""
+}
+
+variable "approval_timeout_seconds" {
+  type    = string
+  default = ""
+}
+
+variable "pause_timeout_seconds" {
+  type    = string
+  default = ""
+}
+
+variable "run_lease_seconds" {
+  type    = string
+  default = ""
+}
+
+variable "run_heartbeat_seconds" {
+  type    = string
+  default = ""
+}
+
+variable "enable_api_docs" {
+  type    = string
+  default = ""
+}
+
