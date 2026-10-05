@@ -286,6 +286,22 @@ class ReActAgent:
         # Track active form state during multi-step invoice creation to detect approval needs
         self._active_form_state: Dict[str, Any] = {}
 
+        # Per-invoice dispositions observed by this run, flushed to terminal
+        # invoice statuses by the run-completion path (G1). Keyed by invoice
+        # UUID string, falling back to "po:<PO_NUMBER>" when no id is known.
+        # Values carry {invoice_id, po_number, vendor, amount, disposition}
+        # where disposition is one of "submitted" (submit click succeeded),
+        # "approved" (gate approved, submission not yet observed), "rejected"
+        # (gate rejected; skipped is written at the gate), or "duplicate"
+        # (idempotency abort; the existing row is left alone).
+        self._processed_invoices: Dict[str, Dict[str, Any]] = {}
+
+        # Snapshot of the invoice a submit click is about to act on, taken
+        # exactly where the run has decided the submit will execute. Consumed
+        # (and cleared) by the post-execution success/failure handling, which
+        # records the "submitted" disposition only on observed success.
+        self._pending_submit_ref: Optional[Dict[str, Any]] = None
+
         # Track current execution iteration index
         self._current_iteration: int = 0
 
@@ -824,6 +840,237 @@ class ReActAgent:
             self._checked_entities[cache_key] = result
         return result
 
+    def record_invoice_disposition(
+        self,
+        disposition: str,
+        invoice_id: Optional[str] = None,
+        po_number: Optional[str] = None,
+        vendor: Optional[str] = None,
+        amount: Optional[Any] = None,
+    ) -> Optional[str]:
+        """Track how this run disposed of one invoice for the completion flush.
+
+        Returns the tracking key, or None when there is nothing to key on
+        (no invoice id and no PO number). Overwrites any earlier entry for the
+        same invoice: the latest observed disposition wins.
+        """
+        inv = (str(invoice_id).strip() if invoice_id else "")
+        po = (str(po_number).strip() if po_number else "")
+        if inv:
+            try:
+                key = str(uuid.UUID(inv))
+            except (ValueError, TypeError, AttributeError):
+                key = f"po:{po}" if po else ""
+                if not key:
+                    # A non-UUID invoice ref with no PO cannot be resolved back
+                    # to a row later; keep it visible under its raw value so it
+                    # is at least auditable, and let the flush skip it.
+                    key = f"ref:{inv}"
+        elif po:
+            key = f"po:{po}"
+        else:
+            return None
+        self._processed_invoices[key] = {
+            "invoice_id": inv or None,
+            "po_number": po or None,
+            "vendor": vendor,
+            "amount": amount,
+            "disposition": disposition,
+        }
+        return key
+
+    async def mark_invoice_terminal_status(
+        self,
+        status: str,
+        invoice_id: Optional[str] = None,
+        po_number: Optional[str] = None,
+    ) -> bool:
+        """Set one invoice's terminal status, transitioning from pending only.
+
+        The pending-only guard is deliberate: a human can settle an invoice
+        through PATCH /api/invoices/[id] at any time, and the agent must never
+        blindly overwrite such a settled state (nor 'approved', 'rejected', or
+        any other non-pending value). The guard is enforced twice -- a Python
+        pre-check that skips the write, and an `AND status = 'pending'`
+        predicate on the UPDATE itself so a settlement landing between the
+        read and the write still wins. Never raises: callers treat a False as
+        "not settled by this run" and move on.
+        """
+        if self._lease_ownership_lost:
+            logger.warning(
+                f"Agent {self.run_id}: not marking invoice status '{status}': "
+                "run lease was lost."
+            )
+            return False
+        try:
+            pool = await self.get_db()
+            async with pool.acquire() as conn:
+                row = None
+                if invoice_id:
+                    try:
+                        inv_uuid = uuid.UUID(str(invoice_id))
+                    except (ValueError, TypeError, AttributeError):
+                        inv_uuid = None
+                    if inv_uuid is not None:
+                        row = await conn.fetchrow(
+                            "SELECT id, status FROM invoices WHERE id = $1;",
+                            inv_uuid,
+                        )
+                if row is None and po_number:
+                    row = await conn.fetchrow(
+                        "SELECT id, status FROM invoices WHERE po_number = $1 "
+                        "ORDER BY created_at DESC LIMIT 1;",
+                        str(po_number).strip(),
+                    )
+                if row is None:
+                    logger.info(
+                        f"Agent {self.run_id}: no invoice row for "
+                        f"(id={invoice_id}, po={po_number}); leaving status unset."
+                    )
+                    return False
+                if (row["status"] or "") != "pending":
+                    logger.info(
+                        f"Agent {self.run_id}: invoice {row['id']} already "
+                        f"settled as '{row['status']}'; not overwriting with '{status}'."
+                    )
+                    return False
+                res = await conn.execute(
+                    "UPDATE invoices SET status = $1 WHERE id = $2 AND status = 'pending';",
+                    status,
+                    row["id"],
+                )
+                landed = affected_rows(res) > 0
+                logger.info(
+                    f"Agent {self.run_id}: marked invoice {row['id']} "
+                    f"status='{status}': {landed}"
+                )
+                return landed
+        except Exception as e:
+            logger.warning(f"Agent {self.run_id}: could not mark invoice status '{status}': {e}")
+            return False
+
+    async def _classify_processed_invoice(
+        self,
+        conn: Any,
+        po_number: Optional[str],
+        amount: Any,
+    ) -> Optional[str]:
+        """Derive the terminal status for a submitted invoice, or None to skip.
+
+        Mirrors the deterministic seed rules in backend/verification.py: a PO
+        number with no purchase_orders row means the invoice can never be
+        reconciled (failed); an amount more than 10% off the PO's approved
+        amount is a mismatch for a human to review (flagged); anything else
+        the run submitted counts as processed (completed, including
+        human-approved over-threshold invoices, which verification likewise
+        expects as completed). The rule text lives here rather than importing
+        verification.py because the agent loop must not depend on the audit
+        module it is audited by; any rule change must update both places.
+        """
+        if not po_number:
+            return None
+        try:
+            po_row = await conn.fetchrow(
+                "SELECT approved_amount FROM purchase_orders WHERE po_number = $1;",
+                str(po_number).strip(),
+            )
+        except Exception as e:
+            logger.warning(f"Agent {self.run_id}: PO lookup failed for {po_number}: {e}")
+            return None
+        if po_row is None or po_row["approved_amount"] is None:
+            return "failed"
+        try:
+            approved = float(po_row["approved_amount"])
+            actual = float(amount)
+        except (TypeError, ValueError):
+            return None
+        if approved > 0 and (abs(actual - approved) / approved) * 100.0 > 10.0:
+            return "flagged"
+        return "completed"
+
+    async def _finalize_processed_invoices(self) -> Dict[str, int]:
+        """Flush tracked dispositions to terminal invoice statuses. Best-effort.
+
+        Runs once on the run-completion path. Only invoices this run actually
+        processed are touched: "submitted" entries are classified (completed /
+        flagged / failed) and written; "rejected" entries are ensured skipped
+        in case the gate's immediate write failed; "approved"-without-submit
+        and "duplicate" entries are left alone (no observed ERP submission).
+        Every write goes through mark_invoice_terminal_status, so the
+        pending-only guard applies throughout. Returns per-status counts and
+        never raises.
+        """
+        counts = {"completed": 0, "flagged": 0, "failed": 0, "skipped": 0, "untouched": 0}
+        if self._lease_ownership_lost:
+            return counts
+        if not self._processed_invoices:
+            return counts
+        try:
+            pool = await self.get_db()
+        except Exception as e:
+            logger.warning(f"Agent {self.run_id}: invoice finalize skipped, no DB pool: {e}")
+            return counts
+        try:
+            async with pool.acquire() as conn:
+                for key, entry in list(self._processed_invoices.items()):
+                    try:
+                        disposition = entry.get("disposition")
+                        inv_id = entry.get("invoice_id")
+                        po = entry.get("po_number")
+                        target: Optional[str] = None
+                        if disposition == "submitted":
+                            inv_row = None
+                            if inv_id:
+                                try:
+                                    inv_row = await conn.fetchrow(
+                                        "SELECT id, status, amount, po_number FROM invoices WHERE id = $1;",
+                                        uuid.UUID(str(inv_id)),
+                                    )
+                                except (ValueError, TypeError, AttributeError):
+                                    inv_row = None
+                            if inv_row is None and po:
+                                inv_row = await conn.fetchrow(
+                                    "SELECT id, status, amount, po_number FROM invoices "
+                                    "WHERE po_number = $1 ORDER BY created_at DESC LIMIT 1;",
+                                    str(po).strip(),
+                                )
+                            if inv_row is None:
+                                logger.info(
+                                    f"Agent {self.run_id}: finalize skipping {key}: no invoice row."
+                                )
+                                counts["untouched"] += 1
+                                continue
+                            if (inv_row["status"] or "") != "pending":
+                                logger.info(
+                                    f"Agent {self.run_id}: finalize skipping {inv_row['id']}: "
+                                    f"already '{inv_row['status']}'."
+                                )
+                                counts["untouched"] += 1
+                                continue
+                            target = await self._classify_processed_invoice(
+                                conn, inv_row["po_number"], inv_row["amount"]
+                            )
+                            if target is None:
+                                counts["untouched"] += 1
+                                continue
+                        elif disposition == "rejected":
+                            target = "skipped"
+                        else:
+                            counts["untouched"] += 1
+                            continue
+                        if await self.mark_invoice_terminal_status(
+                            target, invoice_id=inv_id, po_number=po
+                        ):
+                            counts[target] += 1
+                        else:
+                            counts["untouched"] += 1
+                    except Exception as e:
+                        logger.warning(f"Agent {self.run_id}: finalize failed for {key}: {e}")
+                        counts["untouched"] += 1
+        except Exception as e:
+            logger.warning(f"Agent {self.run_id}: invoice finalize aborted: {e}")
+        return counts
+
     def check_amount_exceeds_threshold(self, amount: Union[float, int, str], threshold: float) -> bool:
         """Check if an invoice amount strictly exceeds the approval threshold."""
         try:
@@ -1014,44 +1261,34 @@ class ReActAgent:
                 action="approval_gate",
                 result=f"approved: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={resolved_invoice_id}",
             )
+            self.record_invoice_disposition(
+                "approved",
+                invoice_id=resolved_invoice_id,
+                po_number=po_number,
+                vendor=vendor,
+                amount=amount,
+            )
             return "approved"
         else:
             await self.persist_step(
                 action="approval_gate",
                 result=f"rejected_and_skipped: vendor={vendor}, amount={amount}, po={po_number or 'None'}, invoice_id={resolved_invoice_id}",
             )
-            # Mark invoice as skipped in Neon (Phase 2.7)
-            try:
-                pool = await self.get_db()
-                async with pool.acquire() as conn:
-                    marked = False
-                    if resolved_invoice_id:
-                        try:
-                            inv_uuid = uuid.UUID(str(resolved_invoice_id))
-                            res = await conn.execute(
-                                "UPDATE invoices SET status = 'skipped' WHERE id = $1;",
-                                inv_uuid,
-                            )
-                            if "UPDATE 1" in res:
-                                marked = True
-                        except (ValueError, TypeError):
-                            pass
-                    if not marked and po_number:
-                        res = await conn.execute(
-                            "UPDATE invoices SET status = 'skipped' WHERE id IN (SELECT id FROM invoices WHERE po_number = $1 AND status NOT IN ('completed', 'skipped') ORDER BY created_at DESC LIMIT 1);",
-                            str(po_number).strip(),
-                        )
-                        parts = res.split()
-                        if len(parts) >= 2:
-                            try:
-                                count = int(parts[1])
-                                if count > 0:
-                                    marked = True
-                            except ValueError:
-                                pass
-                    logger.info(f"Marked invoice (id={resolved_invoice_id}, po={po_number}) status='skipped' in Neon: {marked}")
-            except Exception as dbe:
-                logger.warning(f"Could not mark invoice as skipped in Neon: {dbe}")
+            # Mark invoice as skipped in Neon. Pending-only: a human may have
+            # settled the invoice through PATCH /api/invoices/[id] while the
+            # gate was polling, and that settlement must stand.
+            self.record_invoice_disposition(
+                "rejected",
+                invoice_id=resolved_invoice_id,
+                po_number=po_number,
+                vendor=vendor,
+                amount=amount,
+            )
+            await self.mark_invoice_terminal_status(
+                "skipped",
+                invoice_id=resolved_invoice_id,
+                po_number=po_number,
+            )
             return "rejected"
 
     def _result_is_session_lost(self, result: Optional[Dict[str, Any]]) -> bool:
@@ -1217,6 +1454,10 @@ class ReActAgent:
         while iteration < self.max_iterations:
             iteration += 1
             self._current_iteration = iteration
+            # A snapshot not consumed last iteration (lease-lost and abort
+            # returns skip post-execution) must not leak into this one and
+            # attribute a later click to the wrong invoice.
+            self._pending_submit_ref = None
             logger.info(f"Agent {self.run_id}: Iteration {iteration}/{self.max_iterations}")
 
             # Ownership check at the iteration boundary. This is the guard that stops a
@@ -1361,6 +1602,45 @@ class ReActAgent:
                     run_status = "completed"
                     try:
                         await self.update_run_status("completed", release_lease=False)
+                        # Settle every invoice this run processed to its terminal
+                        # state (completed / flagged / failed; rejected ones were
+                        # already marked skipped at the gate). Pending-only, so a
+                        # human settlement always wins. Best-effort: a finalize
+                        # failure must never break completion. Emits nothing when
+                        # the run tracked no invoices, keeping this path
+                        # byte-identical for runs that never touched invoices.
+                        try:
+                            settle_counts = await self._finalize_processed_invoices()
+                        except Exception as fin_err:
+                            logger.warning(
+                                f"Agent {self.run_id}: invoice finalize failed: {fin_err}"
+                            )
+                            settle_counts = {}
+                        settled_total = sum(
+                            settle_counts.get(k, 0)
+                            for k in ("completed", "flagged", "failed", "skipped")
+                        )
+                        if settled_total:
+                            settle_result = (
+                                f"settled {settled_total} invoice(s): "
+                                + ", ".join(
+                                    f"{k}={settle_counts.get(k, 0)}"
+                                    for k in ("completed", "flagged", "failed", "skipped")
+                                )
+                            )
+                            try:
+                                await self.persist_step(
+                                    action="finalize_invoices",
+                                    result=settle_result,
+                                )
+                                await self.emit_event(
+                                    "invoices_finalized",
+                                    {"settled": settled_total, "counts": settle_counts},
+                                )
+                            except Exception as obs_err:
+                                logger.warning(
+                                    f"Agent {self.run_id}: finalize observability failed: {obs_err}"
+                                )
                         await self.persist_step(
                             action="done",
                             result=final_summary,
@@ -1828,6 +2108,12 @@ class ReActAgent:
                             })
                             continue
 
+                    # Reaching here means the submit will execute (every abort
+                    # above continued): snapshot which invoice it is for, so a
+                    # successful click records the "submitted" disposition the
+                    # run-completion path settles to a terminal status.
+                    self._pending_submit_ref = dict(self._active_form_state)
+
             # The load-bearing guard. Everything above this point in the iteration
             # (OBSERVE, the Groq THINK call, the approval gate) can take long enough
             # for the heartbeat to observe that the lease is gone, and
@@ -1947,6 +2233,8 @@ class ReActAgent:
                 # Mutating action reattached without replay: outcome is unknown,
                 # not failed. Persist distinctly; skip the failure screenshot
                 # (the fresh page would mislead) and step_failed emission.
+                # The submit did not observably succeed, so drop its snapshot.
+                self._pending_submit_ref = None
                 unknown_step_id = await self.persist_step(
                     action=tool_name,
                     result=f"outcome unknown after CDP reattach (not replayed): {tool_result.get('error')}",
@@ -1965,6 +2253,8 @@ class ReActAgent:
                 )
             elif not tool_success:
                 # Capture diagnostic screenshot on failure without creating duplicate rows (Phase 2.8)
+                # A failed submit is not an observed submission: drop its snapshot.
+                self._pending_submit_ref = None
                 failed_step_id = await self.persist_step(
                     action=tool_name,
                     result=f"failed: {tool_result.get('error')}",
@@ -2002,6 +2292,19 @@ class ReActAgent:
                 )
             else:
                 # Persist successful step to Neon (Phase 2.6)
+                # A successful submit click is this run's observed submission
+                # of the snapshotted invoice: record it for the completion
+                # flush, then drop the snapshot.
+                if tool_name == "click" and self._pending_submit_ref:
+                    ref = self._pending_submit_ref
+                    self._pending_submit_ref = None
+                    self.record_invoice_disposition(
+                        "submitted",
+                        invoice_id=ref.get("invoice_id"),
+                        po_number=ref.get("po_number"),
+                        vendor=ref.get("vendor"),
+                        amount=ref.get("amount"),
+                    )
                 result_summary = "success"
                 sc_b64 = None
                 if tool_name == "read_page":

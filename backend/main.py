@@ -13,7 +13,7 @@ import asyncpg
 from sse_starlette.sse import EventSourceResponse
 
 from backend.config import settings
-from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_connection, get_db_pool
+from backend.db import init_db_pool, close_db_pool, check_db_health, get_db_pool
 from backend.browser import verify_cdp_connection
 from backend.run_lease import affected_rows, reconcile_orphaned_agent_runs
 from backend.verification import VerificationReport, generate_verification_report

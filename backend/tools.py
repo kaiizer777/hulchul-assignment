@@ -559,12 +559,25 @@ async def take_screenshot(
             try:
                 db_pool = pool if pool is not None else await get_db_pool()
                 async with db_pool.acquire() as conn:
-                    # Ensure agent_run exists so foreign key references are valid
+                    # Ensure agent_run exists so foreign key references are valid.
+                    # The row is written in the form the lease scheme owns
+                    # (attempt >= 1, no live lease) rather than as a bare
+                    # leaseless 'running' row: the startup orphan sweep only
+                    # reclaims status = 'running' rows with attempt > 0, so a
+                    # bare row would sit 'running' forever, invisible to both
+                    # the sweep and the owner-fenced status writes. With
+                    # attempt = 1 and a NULL lease the sweep can reclaim it as
+                    # failed (with an 'orphaned' step explaining why), and a
+                    # real execution's ensure_run_record can still claim it,
+                    # since that upsert takes over exactly NULL/expired leases.
+                    # Existing rows are never touched (DO NOTHING): a live
+                    # owner holding this run must not lose its lease to a
+                    # screenshot.
                     run_uuid = uuid.UUID(str(run_id))
                     await conn.execute(
                         """
-                        INSERT INTO agent_runs (run_id, goal, status)
-                        VALUES ($1, 'Agent Execution Run', 'running')
+                        INSERT INTO agent_runs (run_id, goal, status, owner_id, lease_expires_at, attempt, created_at)
+                        VALUES ($1, 'Agent Execution Run', 'running', NULL, NULL, 1, now())
                         ON CONFLICT (run_id) DO NOTHING;
                         """,
                         run_uuid,
