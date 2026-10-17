@@ -930,13 +930,23 @@ async def stream_agent_run_endpoint(
                 )
                 tail_rows = []
             for r in tail_rows:
+                # Advance the read cursor before the fallible classify/emit
+                # step: otherwise a row that raises keeps the cursor behind
+                # it and is re-fetched (and re-logged) on every poll.
                 cursor = (r["timestamp"], r["step_id"])
-                step_id = str(r["step_id"])
-                if step_id in seen_step_ids:
+                try:
+                    step_id = str(r["step_id"])
+                    if step_id in seen_step_ids:
+                        continue
+                    seen_step_ids.add(step_id)
+                    step_index += 1
+                    yield _step_row_to_event(r, run_id_str, step_index)
+                except Exception as row_err:
+                    logger.warning(
+                        f"Skipping malformed agent_steps row for SSE stream "
+                        f"{run_id_str}: {row_err}"
+                    )
                     continue
-                seen_step_ids.add(step_id)
-                step_index += 1
-                yield _step_row_to_event(r, run_id_str, step_index)
 
         last_tail = time.monotonic()
         try:
