@@ -403,7 +403,7 @@ class TestIssue33StreamCursor(unittest.IsolatedAsyncioTestCase):
         db = _FakeStreamDB(
             rows=[
                 _step_row(first, T0),
-                _step_row(second, T0 + timedelta(seconds=1)),
+                _step_row(second, T0 + timedelta(seconds=1), result="failed"),
             ],
             # Fault injection: the tail ignores its window and replays the run, so
             # the dedupe is exercised by construction rather than by luck.
@@ -418,9 +418,9 @@ class TestIssue33StreamCursor(unittest.IsolatedAsyncioTestCase):
             try:
                 delivered: List[str] = []
                 replayed_indices: List[int] = []
-                for _ in range(2):
+                for expected_name in ("step_complete", "step_failed"):
                     name, payload = await _next_frame(frames)
-                    self.assertIn(name, ("step_complete", "step_failed"))
+                    self.assertEqual(name, expected_name)
                     delivered.append(payload["step_id"])
                     replayed_indices.append(payload["step_index"])
                 self.assertEqual(delivered, [first, second])
